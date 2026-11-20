@@ -44,7 +44,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     if app.group_by != GroupBy::None {
         info.push_str(&format!(" · group: {}", app.group_by.label()));
     }
-    if app.show_overrides != Overrides::Compact {
+    if app.show_overrides != Overrides::Off {
         info.push_str(&format!(" · overrides: {}", app.show_overrides.label()));
     }
     if !app.show_uptodate {

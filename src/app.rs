@@ -257,7 +257,7 @@ impl App {
             pm,
             rows: Vec::new(),
             table: ListState::default(),
-            show_overrides: Overrides::Compact,
+            show_overrides: Overrides::Off,
             show_uptodate: true,
             show_vulns: true,
             snyk_status: SnykStatus::NotRun,
