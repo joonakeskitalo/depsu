@@ -5,6 +5,7 @@ mod overrides;
 mod package;
 mod pm;
 mod registry;
+mod tree;
 mod ui;
 mod view;
 

@@ -43,19 +43,14 @@ impl Override {
         self.path.is_empty()
     }
 
-    /// True if the override applies to dependencies of `pkg`: it applies everywhere, or it is
-    /// limited to children of `pkg`.
-    fn applies_under(&self, pkg: &str) -> bool {
-        self.global() || self.path.last().is_some_and(|p| split_name(p).0 == pkg)
+    /// True if the override applies below the dependency chain `chain` (outermost first):
+    /// it applies everywhere, or every parent it is limited to appears in the chain in order.
+    pub fn path_applies(&self, chain: &[String]) -> bool {
+        let mut rest = chain.iter();
+        self.path
+            .iter()
+            .all(|p| rest.any(|c| *c == split_name(p).0))
     }
-}
-
-/// Overrides affecting the dependencies `deps` of package `pkg`.
-pub fn affecting_dependencies(all: &[Override], pkg: &str, deps: &[String]) -> Vec<Override> {
-    all.iter()
-        .filter(|o| deps.contains(&o.name) && o.applies_under(pkg))
-        .cloned()
-        .collect()
 }
 
 /// Ordered by severity.
@@ -333,21 +328,14 @@ mod tests {
     }
 
     #[test]
-    fn dependency_overrides_of_a_package() {
-        let m = json!({"overrides": {
-            "shared": "1.0.0",
-            "pkg": {"inner": "2.0.0"},
-            "other": {"inner": "3.0.0", "shared": "4.0.0"},
-            "unrelated": "5.0.0"
-        }});
-        let all = collect(&m, Pm::Npm);
-        let deps = ["shared".to_string(), "inner".to_string()];
-        let mut got: Vec<_> = affecting_dependencies(&all, "pkg", &deps)
-            .into_iter()
-            .map(|o| o.value)
-            .collect();
-        got.sort();
-        assert_eq!(got, ["1.0.0", "2.0.0"]); // not the ones limited to `other`
+    fn path_applies_in_order() {
+        let chain = |c: &[&str]| c.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let mut o = ovr("1.0.0").remove(0);
+        assert!(o.path_applies(&chain(&["x"])));
+        o.path = vec!["a".into(), "b@^1".into()];
+        assert!(o.path_applies(&chain(&["x", "a", "m", "b"])));
+        assert!(!o.path_applies(&chain(&["x", "b", "a"])));
+        assert!(!o.path_applies(&chain(&["x", "a"])));
     }
 
     fn ovr(value: &str) -> Vec<Override> {

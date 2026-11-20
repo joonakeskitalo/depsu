@@ -154,7 +154,7 @@ mod tests {
             status: Status::Idle,
             overrides: Vec::new(),
             compat: Compat::Ok,
-            dep_overrides: Vec::new(),
+            tree_hits: Vec::new(),
         }
     }
 

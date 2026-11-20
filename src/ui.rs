@@ -178,9 +178,12 @@ fn override_marker(r: &AppRow) -> Cell<'static> {
         };
         spans.push(Span::styled(sym, Style::new().fg(compat_color(r.compat))));
     }
-    // ↳: a dependency of the package itself is overridden.
-    if !r.dep_overrides.is_empty() {
-        spans.push(Span::styled("↳", Style::new().fg(Color::Cyan)));
+    // ↳: an override applies somewhere in the package's dependency tree. Yellow when one
+    // forces a version outside what the parent package declared.
+    if !r.tree_hits.is_empty() {
+        let risky = r.tree_hits.iter().any(|h| h.risk == Compat::Conflict);
+        let color = if risky { Color::Yellow } else { Color::Cyan };
+        spans.push(Span::styled("↳", Style::new().fg(color)));
     }
     Cell::from(Line::from(spans))
 }
@@ -207,17 +210,40 @@ fn detail_line(app: &App) -> Line<'static> {
         };
         spans.push(Span::styled(text, Style::new().fg(compat_color(r.compat))));
     }
-    if !r.dep_overrides.is_empty() {
+    if !r.tree_hits.is_empty() {
         let sep = if spans.is_empty() { " " } else { "  │  " };
-        spans.push(Span::styled(
-            format!(
-                "{sep}↳ its dependencies are overridden: {}",
-                join(&r.dep_overrides)
-            ),
-            Style::new().fg(Color::Cyan),
-        ));
+        // Risky hits first, so they survive truncation of the line.
+        let mut hits: Vec<_> = r.tree_hits.iter().collect();
+        hits.sort_by_key(|h| std::cmp::Reverse(h.risk));
+        let shown: Vec<String> = hits.iter().take(3).map(|h| hit_text(h)).collect();
+        let more = hits.len().saturating_sub(3);
+        let mut text = format!("{sep}↳ overrides in dependency tree: {}", shown.join(", "));
+        if more > 0 {
+            text.push_str(&format!(", +{more} more"));
+        }
+        let color = if hits.iter().any(|h| h.risk == Compat::Conflict) {
+            Color::Yellow
+        } else {
+            Color::Cyan
+        };
+        spans.push(Span::styled(text, Style::new().fg(color)));
     }
     Line::from(spans)
+}
+
+fn hit_text(h: &crate::tree::Hit) -> String {
+    let mut t = format!("{} → {}", h.over.name, h.over.value);
+    if h.via.len() > 1 {
+        t.push_str(&format!(" via {}", h.via.join(" > ")));
+    }
+    if h.risk == Compat::Conflict {
+        t.push_str(&format!(" (wants {}", h.requested));
+        if let Some(v) = &h.installed {
+            t.push_str(&format!(", installed {v}"));
+        }
+        t.push(')');
+    }
+    t
 }
 
 fn join(overrides: &[crate::overrides::Override]) -> String {
