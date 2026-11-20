@@ -140,6 +140,7 @@ pub fn build(rows: &[Row], mode: GroupBy, filter: &str) -> Vec<Item> {
 mod tests {
     use super::*;
     use crate::app::Status;
+    use crate::overrides::Compat;
     use crate::package::Kind;
 
     fn row(name: &str, cur: &str, latest: &str) -> Row {
@@ -151,6 +152,8 @@ mod tests {
             latest: Version::parse(latest).unwrap(),
             selected: false,
             status: Status::Idle,
+            overrides: Vec::new(),
+            compat: Compat::Ok,
         }
     }
 

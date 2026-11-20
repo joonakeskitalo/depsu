@@ -1,4 +1,6 @@
-use crate::app::{App, Status};
+use crate::app::{App, Row as AppRow, Status};
+use crate::overrides::Compat;
+use crate::pm::Pm;
 use crate::view::{GroupBy, Item, Release};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout};
@@ -8,9 +10,10 @@ use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table};
 
 pub fn draw(f: &mut Frame, app: &mut App) {
     let log_h = 7.min(app.log.len() as u16 + 2).max(3);
-    let [header, body, log, help] = Layout::vertical([
+    let [header, body, detail, log, help] = Layout::vertical([
         Constraint::Length(1),
         Constraint::Min(3),
+        Constraint::Length(1),
         Constraint::Length(log_h),
         Constraint::Length(1),
     ])
@@ -86,6 +89,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
                 Row::new(vec![
                     Cell::from(mark),
                     Cell::from(name),
+                    override_marker(r),
                     Cell::from(r.kind.label()).style(Style::new().fg(Color::DarkGray)),
                     Cell::from(format!("{}{}", r.prefix, r.current)),
                     Cell::from("→"),
@@ -100,6 +104,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         [
             Constraint::Length(2),
             Constraint::Min(20),
+            Constraint::Length(2),
             Constraint::Length(4),
             Constraint::Length(14),
             Constraint::Length(2),
@@ -110,6 +115,8 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     .row_highlight_style(Style::new().add_modifier(Modifier::REVERSED));
     f.render_stateful_widget(table, body, &mut app.table);
 
+    f.render_widget(detail_line(app), detail);
+
     let lines: Vec<Line> = app
         .log
         .iter()
@@ -119,6 +126,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         .map(|l| {
             let color = match l.chars().next() {
                 Some('✘') | Some('!') => Color::Red,
+                Some('⚠') => Color::Yellow,
                 Some('✔') => Color::Green,
                 _ => Color::Gray,
             };
@@ -149,4 +157,54 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         )
     };
     f.render_widget(footer, help);
+}
+
+fn compat_color(c: Compat) -> Color {
+    match c {
+        Compat::Ok => Color::Cyan,
+        Compat::Unknown => Color::Yellow,
+        Compat::Conflict => Color::Red,
+    }
+}
+
+/// Marker column: ⚑ overridden and compatible, ? cannot verify, ⚠ conflicts with the override.
+fn override_marker(r: &AppRow) -> Cell<'static> {
+    if r.overrides.is_empty() {
+        return Cell::from("");
+    }
+    let sym = match r.compat {
+        Compat::Ok => "⚑",
+        Compat::Unknown => "?",
+        Compat::Conflict => "⚠",
+    };
+    Cell::from(sym).style(Style::new().fg(compat_color(r.compat)))
+}
+
+/// One-line explanation of the overrides affecting the highlighted package.
+fn detail_line(app: &App) -> Line<'static> {
+    let Some(Item::Row { idx, .. }) = app.cursor_item() else {
+        return Line::default();
+    };
+    let r = &app.rows[*idx];
+    if r.overrides.is_empty() {
+        return Line::default();
+    }
+    let list = r
+        .overrides
+        .iter()
+        .map(|o| o.describe())
+        .collect::<Vec<_>>()
+        .join("; ");
+    let text = match r.compat {
+        Compat::Ok => format!(" overridden ({list}), compatible with {}", r.latest),
+        Compat::Unknown => format!(" overridden ({list}), cannot verify compatibility"),
+        Compat::Conflict if app.pm == Pm::Npm => format!(
+            " {list}: must equal the dependency spec (EOVERRIDE). Use \"$name\" or update it."
+        ),
+        Compat::Conflict => format!(
+            " {list}: {} is outside the override, so the update would have no effect",
+            r.latest
+        ),
+    };
+    Line::from(Span::styled(text, Style::new().fg(compat_color(r.compat))))
 }

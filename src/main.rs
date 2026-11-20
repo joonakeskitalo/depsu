@@ -1,6 +1,7 @@
 mod app;
 mod bunfig;
 mod npmrc;
+mod overrides;
 mod package;
 mod pm;
 mod registry;
@@ -66,6 +67,7 @@ fn main() -> Result<()> {
     let dir = dir.canonicalize()?;
     let manifest = package::read_manifest(&dir.join("package.json"))?;
     let pm = forced_pm.unwrap_or_else(|| pm::Pm::detect(&dir, manifest.package_manager.as_deref()));
+    let overrides = overrides::collect(&manifest.raw, pm);
     let mut rc = npmrc::Npmrc::load(&dir);
     // Bun reads bunfig.toml (taking precedence over .npmrc), so honour it for bun projects.
     let warnings = if pm == pm::Pm::Bun {
@@ -74,7 +76,7 @@ fn main() -> Result<()> {
         Vec::new()
     };
 
-    let mut app = app::App::start(dir, pm, manifest.deps, rc);
+    let mut app = app::App::start(dir, pm, manifest.deps, rc, overrides);
     for w in warnings {
         app.push_log(w);
     }

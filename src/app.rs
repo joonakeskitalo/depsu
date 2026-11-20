@@ -1,6 +1,7 @@
 //! Application state, background workers and key handling.
 
 use crate::npmrc::Npmrc;
+use crate::overrides::{self, Compat, Override};
 use crate::package::{Dep, Kind, parse_spec};
 use crate::pm::Pm;
 use crate::registry;
@@ -43,6 +44,9 @@ pub struct Row {
     pub latest: Version,
     pub selected: bool,
     pub status: Status,
+    /// Overrides targeting this package, and whether the update is compatible with them.
+    pub overrides: Vec<Override>,
+    pub compat: Compat,
 }
 
 impl Row {
@@ -76,13 +80,15 @@ pub struct App {
     pub registry: String,
     pub quit: bool,
     current: HashMap<String, (Kind, &'static str, Version)>,
+    overrides: Vec<Override>,
+    confirm_conflicts: bool,
     quit_warned: bool,
     rx: Receiver<Event>,
     jobs: Sender<Job>,
 }
 
 impl App {
-    pub fn start(dir: PathBuf, pm: Pm, deps: Vec<Dep>, rc: Npmrc) -> App {
+    pub fn start(dir: PathBuf, pm: Pm, deps: Vec<Dep>, rc: Npmrc, overrides: Vec<Override>) -> App {
         let (tx, rx) = mpsc::channel();
         let (jobs, job_rx) = mpsc::channel::<Job>();
 
@@ -129,6 +135,8 @@ impl App {
             registry,
             quit: false,
             current,
+            overrides,
+            confirm_conflicts: false,
             quit_warned: false,
             rx,
             jobs,
@@ -162,6 +170,18 @@ impl App {
                                 && latest > cur
                                 && latest.pre.is_empty()
                             {
+                                let overrides: Vec<Override> = self
+                                    .overrides
+                                    .iter()
+                                    .filter(|o| o.name == name)
+                                    .cloned()
+                                    .collect();
+                                let compat = overrides::check(
+                                    &overrides,
+                                    self.pm,
+                                    &format!("{prefix}{latest}"),
+                                    &latest,
+                                );
                                 self.insert_row(Row {
                                     name,
                                     kind,
@@ -170,6 +190,8 @@ impl App {
                                     latest,
                                     selected: false,
                                     status: Status::Idle,
+                                    overrides,
+                                    compat,
                                 });
                             }
                         }
@@ -227,7 +249,7 @@ impl App {
         self.table.select((!self.view.is_empty()).then_some(sel));
     }
 
-    fn cursor_item(&self) -> Option<&Item> {
+    pub fn cursor_item(&self) -> Option<&Item> {
         self.table.selected().and_then(|i| self.view.get(i))
     }
 
@@ -250,6 +272,9 @@ impl App {
         }
         if !matches!(key.code, KeyCode::Char('q') | KeyCode::Esc) {
             self.quit_warned = false;
+        }
+        if !matches!(key.code, KeyCode::Char('i') | KeyCode::Enter) {
+            self.confirm_conflicts = false;
         }
         match key.code {
             KeyCode::Esc if !self.filter.is_empty() => {
@@ -377,6 +402,22 @@ impl App {
         if idx.is_empty() {
             return;
         }
+        // Updates that clash with an override need an explicit second press.
+        let conflicts: Vec<&str> = idx
+            .iter()
+            .filter(|&&i| self.rows[i].compat == Compat::Conflict)
+            .map(|&i| self.rows[i].name.as_str())
+            .collect();
+        if !conflicts.is_empty() && !self.confirm_conflicts {
+            let msg = format!(
+                "⚠ conflicts with overrides: {}. Press i again to install anyway, any other key cancels.",
+                conflicts.join(", ")
+            );
+            self.confirm_conflicts = true;
+            self.push_log(msg);
+            return;
+        }
+        self.confirm_conflicts = false;
         let mut items = Vec::new();
         for i in idx {
             let r = &mut self.rows[i];

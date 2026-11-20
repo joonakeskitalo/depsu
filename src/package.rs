@@ -31,6 +31,8 @@ pub struct Dep {
 pub struct Manifest {
     pub deps: Vec<Dep>,
     pub package_manager: Option<String>,
+    /// The parsed `package.json`, for fields needing package-manager-specific handling.
+    pub raw: serde_json::Value,
 }
 
 pub fn read_manifest(path: &Path) -> Result<Manifest> {
@@ -63,6 +65,7 @@ pub fn read_manifest(path: &Path) -> Result<Manifest> {
     Ok(Manifest {
         deps,
         package_manager,
+        raw: json,
     })
 }
 
