@@ -1,5 +1,5 @@
 use crate::app::{App, Row as AppRow, Status};
-use crate::overrides::{self, Compat};
+use crate::overrides::{self, Compat, Override};
 use crate::pm::Pm;
 use crate::tree::{self, Hit};
 use crate::view::{Child, GroupBy, Item, Overrides, Release};
@@ -11,9 +11,16 @@ use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph};
 
 pub fn draw(f: &mut Frame, app: &mut App) {
     let log_h = 7.min(app.log.len() as u16 + 2).max(3);
-    let [header, body, log, help] = Layout::vertical([
+    // While the nested override lists are hidden, a text summary takes their place.
+    let summary_h = if app.show_overrides == Overrides::Off {
+        SUMMARY_LINES
+    } else {
+        0
+    };
+    let [header, body, summary, log, help] = Layout::vertical([
         Constraint::Length(1),
         Constraint::Min(3),
+        Constraint::Length(summary_h),
         Constraint::Length(log_h),
         Constraint::Length(1),
     ])
@@ -82,6 +89,12 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         .block(Block::default().borders(Borders::TOP))
         .highlight_style(Style::new().add_modifier(Modifier::REVERSED));
     f.render_stateful_widget(list, body, &mut app.table);
+    if summary_h > 0 {
+        f.render_widget(
+            Paragraph::new(summary_lines(app, summary.width as usize)),
+            summary,
+        );
+    }
 
     let lines: Vec<Line> = app
         .log
@@ -266,29 +279,7 @@ fn detail_lines(
     let (text, tail, color) = match child {
         Child::Own(i) => {
             let o = &r.overrides[i];
-            let c = overrides::check(std::slice::from_ref(o), app.pm, &r.new_spec(), &r.latest);
-            // Up-to-date packages have no pending update to be compatible with.
-            let note = if !o.path.is_empty() {
-                "only applies below another package".to_string()
-            } else if !r.outdated {
-                String::new()
-            } else {
-                match c {
-                    Compat::Ok => format!("compatible with {}", r.latest),
-                    Compat::Unknown => "cannot verify compatibility".to_string(),
-                    Compat::Conflict if app.pm == Pm::Npm => {
-                        "must equal the dependency spec (EOVERRIDE), use \"$name\" or update it"
-                            .to_string()
-                    }
-                    Compat::Conflict => {
-                        format!(
-                            "{} is outside the override, the update would have no effect",
-                            r.latest
-                        )
-                    }
-                }
-            };
-            let c = if r.outdated { c } else { Compat::Ok };
+            let (c, note) = own_override_note(app, r, o);
             let tail = if note.is_empty() {
                 String::new()
             } else {
@@ -437,6 +428,89 @@ fn wrap(
             Line::from(l)
         })
         .collect()
+}
+
+/// Compatibility of the update of `r` with its own override `o`, and a short explanation.
+fn own_override_note(app: &App, r: &AppRow, o: &Override) -> (Compat, String) {
+    let c = overrides::check(std::slice::from_ref(o), app.pm, &r.new_spec(), &r.latest);
+    // Up-to-date packages have no pending update to be compatible with.
+    let note = if !o.path.is_empty() {
+        "only applies below another package".to_string()
+    } else if !r.outdated {
+        String::new()
+    } else {
+        match c {
+            Compat::Ok => format!("compatible with {}", r.latest),
+            Compat::Unknown => "cannot verify compatibility".to_string(),
+            Compat::Conflict if app.pm == Pm::Npm => {
+                "must equal the dependency spec (EOVERRIDE), use \"$name\" or update it".to_string()
+            }
+            Compat::Conflict => format!(
+                "{} is outside the override, the update would have no effect",
+                r.latest
+            ),
+        }
+    };
+    (if r.outdated { c } else { Compat::Ok }, note)
+}
+
+/// Lines reserved at the bottom for the override summary while the nested lists are hidden.
+const SUMMARY_LINES: u16 = 3;
+
+/// Text summary of the overrides of the highlighted package, wrapped to `width`. Shown in
+/// place of the nested lists when those are hidden.
+fn summary_lines(app: &App, width: usize) -> Vec<Line<'static>> {
+    let Some(Item::Row { idx, .. }) = app.cursor_item() else {
+        return Vec::new();
+    };
+    let r = &app.rows[*idx];
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    for o in &r.overrides {
+        let (c, note) = own_override_note(app, r, o);
+        let mut text = format!("{} {}", compat_symbol(c), o.describe());
+        if let Some(u) = app.update_target(o) {
+            text.push_str(&format!(" ⇢ {}", u.value));
+        }
+        if !note.is_empty() {
+            text.push_str(&format!(" ({note})"));
+        }
+        text.push_str("   ");
+        spans.push(Span::styled(text, Style::new().fg(compat_color(c))));
+    }
+    if !r.tree_hits.is_empty() {
+        // Risky hits come first, so they survive the cut-off.
+        let shown: Vec<String> = r.tree_hits.iter().take(3).map(hit_text).collect();
+        let more = r.tree_hits.len().saturating_sub(3);
+        let mut text = format!("↳ overrides in dependency tree: {}", shown.join(", "));
+        if more > 0 {
+            text.push_str(&format!(", +{more} more"));
+        }
+        let color = if r.tree_hits.iter().any(|h| h.risk == Compat::Conflict) {
+            Color::Yellow
+        } else {
+            Color::Cyan
+        };
+        spans.push(Span::styled(text, Style::new().fg(color)));
+    }
+    if spans.is_empty() {
+        return Vec::new();
+    }
+
+    // Two columns stay free for the " …" shown when the text is cut off.
+    let mut lines = wrap(
+        Span::raw(" "),
+        Span::raw(" "),
+        spans,
+        width.saturating_sub(2),
+    );
+    if lines.len() > SUMMARY_LINES as usize {
+        lines.truncate(SUMMARY_LINES as usize);
+        if let Some(last) = lines.last_mut() {
+            last.spans
+                .push(Span::styled(" …", Style::new().fg(Color::DarkGray)));
+        }
+    }
+    lines
 }
 
 fn hit_text(h: &Hit) -> String {
