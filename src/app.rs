@@ -2,7 +2,7 @@
 
 use crate::npmrc::Npmrc;
 use crate::overrides::{self, Compat, Override};
-use crate::package::{Dep, Kind, parse_spec};
+use crate::package::{Dep, Kind, installed_dependencies, parse_spec};
 use crate::pm::Pm;
 use crate::registry;
 use crate::view::{self, GroupBy, Item, Release};
@@ -47,6 +47,8 @@ pub struct Row {
     /// Overrides targeting this package, and whether the update is compatible with them.
     pub overrides: Vec<Override>,
     pub compat: Compat,
+    /// Overrides targeting dependencies of the installed package itself.
+    pub dep_overrides: Vec<Override>,
 }
 
 impl Row {
@@ -81,6 +83,7 @@ pub struct App {
     pub quit: bool,
     current: HashMap<String, (Kind, &'static str, Version)>,
     overrides: Vec<Override>,
+    dir: PathBuf,
     confirm_conflicts: bool,
     quit_warned: bool,
     rx: Receiver<Event>,
@@ -119,6 +122,7 @@ impl App {
         }
 
         // One install worker: package managers don't tolerate parallel installs.
+        let project_dir = dir.clone();
         thread::spawn(move || install_worker(dir, pm, job_rx, tx));
 
         App {
@@ -136,6 +140,7 @@ impl App {
             quit: false,
             current,
             overrides,
+            dir: project_dir,
             confirm_conflicts: false,
             quit_warned: false,
             rx,
@@ -182,6 +187,15 @@ impl App {
                                     &format!("{prefix}{latest}"),
                                     &latest,
                                 );
+                                let dep_overrides = installed_dependencies(&self.dir, &name)
+                                    .map(|deps| {
+                                        overrides::affecting_dependencies(
+                                            &self.overrides,
+                                            &name,
+                                            &deps,
+                                        )
+                                    })
+                                    .unwrap_or_default();
                                 self.insert_row(Row {
                                     name,
                                     kind,
@@ -192,6 +206,7 @@ impl App {
                                     status: Status::Idle,
                                     overrides,
                                     compat,
+                                    dep_overrides,
                                 });
                             }
                         }

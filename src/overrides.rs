@@ -42,6 +42,20 @@ impl Override {
     fn global(&self) -> bool {
         self.path.is_empty()
     }
+
+    /// True if the override applies to dependencies of `pkg`: it applies everywhere, or it is
+    /// limited to children of `pkg`.
+    fn applies_under(&self, pkg: &str) -> bool {
+        self.global() || self.path.last().is_some_and(|p| split_name(p).0 == pkg)
+    }
+}
+
+/// Overrides affecting the dependencies `deps` of package `pkg`.
+pub fn affecting_dependencies(all: &[Override], pkg: &str, deps: &[String]) -> Vec<Override> {
+    all.iter()
+        .filter(|o| deps.contains(&o.name) && o.applies_under(pkg))
+        .cloned()
+        .collect()
 }
 
 /// Ordered by severity.
@@ -316,6 +330,24 @@ mod tests {
         let y = collect(&m, Pm::Yarn);
         assert_eq!(y.iter().find(|o| o.name == "@s/c").unwrap().path, ["@s/x"]);
         assert!(y.iter().find(|o| o.name == "b").unwrap().path.is_empty());
+    }
+
+    #[test]
+    fn dependency_overrides_of_a_package() {
+        let m = json!({"overrides": {
+            "shared": "1.0.0",
+            "pkg": {"inner": "2.0.0"},
+            "other": {"inner": "3.0.0", "shared": "4.0.0"},
+            "unrelated": "5.0.0"
+        }});
+        let all = collect(&m, Pm::Npm);
+        let deps = ["shared".to_string(), "inner".to_string()];
+        let mut got: Vec<_> = affecting_dependencies(&all, "pkg", &deps)
+            .into_iter()
+            .map(|o| o.value)
+            .collect();
+        got.sort();
+        assert_eq!(got, ["1.0.0", "2.0.0"]); // not the ones limited to `other`
     }
 
     fn ovr(value: &str) -> Vec<Override> {

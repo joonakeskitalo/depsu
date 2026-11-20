@@ -104,7 +104,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         [
             Constraint::Length(2),
             Constraint::Min(20),
-            Constraint::Length(2),
+            Constraint::Length(3),
             Constraint::Length(4),
             Constraint::Length(14),
             Constraint::Length(2),
@@ -169,15 +169,20 @@ fn compat_color(c: Compat) -> Color {
 
 /// Marker column: ⚑ overridden and compatible, ? cannot verify, ⚠ conflicts with the override.
 fn override_marker(r: &AppRow) -> Cell<'static> {
-    if r.overrides.is_empty() {
-        return Cell::from("");
+    let mut spans = Vec::new();
+    if !r.overrides.is_empty() {
+        let sym = match r.compat {
+            Compat::Ok => "⚑",
+            Compat::Unknown => "?",
+            Compat::Conflict => "⚠",
+        };
+        spans.push(Span::styled(sym, Style::new().fg(compat_color(r.compat))));
     }
-    let sym = match r.compat {
-        Compat::Ok => "⚑",
-        Compat::Unknown => "?",
-        Compat::Conflict => "⚠",
-    };
-    Cell::from(sym).style(Style::new().fg(compat_color(r.compat)))
+    // ↳: a dependency of the package itself is overridden.
+    if !r.dep_overrides.is_empty() {
+        spans.push(Span::styled("↳", Style::new().fg(Color::Cyan)));
+    }
+    Cell::from(Line::from(spans))
 }
 
 /// One-line explanation of the overrides affecting the highlighted package.
@@ -186,25 +191,39 @@ fn detail_line(app: &App) -> Line<'static> {
         return Line::default();
     };
     let r = &app.rows[*idx];
-    if r.overrides.is_empty() {
-        return Line::default();
+    let mut spans = Vec::new();
+    if !r.overrides.is_empty() {
+        let list = join(&r.overrides);
+        let text = match r.compat {
+            Compat::Ok => format!(" overridden ({list}), compatible with {}", r.latest),
+            Compat::Unknown => format!(" overridden ({list}), cannot verify compatibility"),
+            Compat::Conflict if app.pm == Pm::Npm => format!(
+                " {list}: must equal the dependency spec (EOVERRIDE). Use \"$name\" or update it."
+            ),
+            Compat::Conflict => format!(
+                " {list}: {} is outside the override, so the update would have no effect",
+                r.latest
+            ),
+        };
+        spans.push(Span::styled(text, Style::new().fg(compat_color(r.compat))));
     }
-    let list = r
-        .overrides
+    if !r.dep_overrides.is_empty() {
+        let sep = if spans.is_empty() { " " } else { "  │  " };
+        spans.push(Span::styled(
+            format!(
+                "{sep}↳ its dependencies are overridden: {}",
+                join(&r.dep_overrides)
+            ),
+            Style::new().fg(Color::Cyan),
+        ));
+    }
+    Line::from(spans)
+}
+
+fn join(overrides: &[crate::overrides::Override]) -> String {
+    overrides
         .iter()
         .map(|o| o.describe())
         .collect::<Vec<_>>()
-        .join("; ");
-    let text = match r.compat {
-        Compat::Ok => format!(" overridden ({list}), compatible with {}", r.latest),
-        Compat::Unknown => format!(" overridden ({list}), cannot verify compatibility"),
-        Compat::Conflict if app.pm == Pm::Npm => format!(
-            " {list}: must equal the dependency spec (EOVERRIDE). Use \"$name\" or update it."
-        ),
-        Compat::Conflict => format!(
-            " {list}: {} is outside the override, so the update would have no effect",
-            r.latest
-        ),
-    };
-    Line::from(Span::styled(text, Style::new().fg(compat_color(r.compat))))
+        .join("; ")
 }
