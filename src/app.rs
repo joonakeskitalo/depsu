@@ -6,9 +6,9 @@ use crate::package::{Dep, Kind, parse_spec};
 use crate::pm::Pm;
 use crate::registry;
 use crate::tree::{Analyzer, Hit};
-use crate::view::{self, GroupBy, Item, Release};
+use crate::view::{self, GroupBy, Item, Overrides, Release};
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use ratatui::widgets::TableState;
+use ratatui::widgets::ListState;
 use semver::Version;
 use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
@@ -76,7 +76,8 @@ struct Job {
 pub struct App {
     pub pm: Pm,
     pub rows: Vec<Row>,
-    pub table: TableState,
+    pub table: ListState,
+    pub show_overrides: Overrides,
     pub view: Vec<Item>,
     pub group_by: GroupBy,
     pub filter: String,
@@ -149,7 +150,8 @@ impl App {
         App {
             pm,
             rows: Vec::new(),
-            table: TableState::default(),
+            table: ListState::default(),
+            show_overrides: Overrides::Compact,
             view: Vec::new(),
             group_by: GroupBy::None,
             filter: String::new(),
@@ -230,7 +232,11 @@ impl App {
                 }
                 Event::Tree { name, hits } => {
                     if let Some(r) = self.rows.iter_mut().find(|r| r.name == name) {
+                        // Risky hits first, so they survive the compact view's cut-off.
+                        let mut hits = hits;
+                        hits.sort_by_key(|h| std::cmp::Reverse(h.risk));
                         r.tree_hits = hits;
+                        self.rebuild_view();
                     }
                 }
                 Event::InstallStarted(names) => {
@@ -278,9 +284,13 @@ impl App {
     fn rebuild_view(&mut self) {
         let anchor = self.cursor_item().map(anchor_of);
         let prev = self.table.selected().unwrap_or(0);
-        self.view = view::build(&self.rows, self.group_by, &self.filter);
+        self.view = view::build(&self.rows, self.group_by, &self.filter, self.show_overrides);
         let pos = anchor.and_then(|a| self.view.iter().position(|it| anchor_of(it) == a));
-        let sel = pos.unwrap_or_else(|| prev.min(self.view.len().saturating_sub(1)));
+        let mut sel = pos.unwrap_or_else(|| prev.min(self.view.len().saturating_sub(1)));
+        // Override lines can't be selected: fall back to the package they belong to.
+        while sel > 0 && matches!(self.view.get(sel), Some(Item::Detail { .. })) {
+            sel -= 1;
+        }
         self.table.select((!self.view.is_empty()).then_some(sel));
     }
 
@@ -325,6 +335,10 @@ impl App {
                 }
             }
             KeyCode::Char('/') => self.filter_mode = true,
+            KeyCode::Char('o') => {
+                self.show_overrides = self.show_overrides.next();
+                self.rebuild_view();
+            }
             KeyCode::Char('g') => {
                 self.group_by = self.group_by.next();
                 self.rebuild_view();
@@ -332,7 +346,13 @@ impl App {
             KeyCode::Down | KeyCode::Char('j') => self.move_cursor(1),
             KeyCode::Up | KeyCode::Char('k') => self.move_cursor(-1),
             KeyCode::Home => self.table.select((!self.view.is_empty()).then_some(0)),
-            KeyCode::End => self.table.select(self.view.len().checked_sub(1)),
+            KeyCode::End => {
+                let last = self
+                    .view
+                    .iter()
+                    .rposition(|i| !matches!(i, Item::Detail { .. }));
+                self.table.select(last);
+            }
             KeyCode::Char(' ') => self.toggle_cursor(),
             KeyCode::Char('a') => {
                 let visible = self.visible_rows();
@@ -379,7 +399,7 @@ impl App {
             .iter()
             .filter_map(|it| match it {
                 Item::Row { idx, .. } => Some(*idx),
-                Item::Header { .. } => None,
+                Item::Header { .. } | Item::Detail { .. } => None,
             })
             .collect()
     }
@@ -404,18 +424,32 @@ impl App {
                     }
                 }
             }
-            None => {}
+            None | Some(Item::Detail { .. }) => {}
         }
     }
 
+    /// Moves to the next selectable item in the direction of `delta`, skipping override lines.
     fn move_cursor(&mut self, delta: isize) {
-        if self.view.is_empty() {
-            return;
-        }
         let len = self.view.len() as isize;
-        let cur = self.table.selected().unwrap_or(0) as isize;
-        self.table
-            .select(Some((cur + delta).clamp(0, len - 1) as usize));
+        let step = delta.signum();
+        let mut i = self.table.selected().unwrap_or(0) as isize;
+        let mut remaining = delta.abs();
+        while remaining > 0 {
+            let mut next = i + step;
+            while (0..len).contains(&next)
+                && matches!(self.view[next as usize], Item::Detail { .. })
+            {
+                next += step;
+            }
+            if !(0..len).contains(&next) {
+                break;
+            }
+            i = next;
+            remaining -= 1;
+        }
+        if len > 0 {
+            self.table.select(Some(i.clamp(0, len - 1) as usize));
+        }
     }
 
     /// Queues all checked visible rows. If none are checked, queues the row under the cursor,
@@ -430,7 +464,7 @@ impl App {
             match self.cursor_item() {
                 Some(Item::Row { idx: i, .. }) => idx.push(*i),
                 Some(Item::Header { members, .. }) => idx.extend(members),
-                None => {}
+                None | Some(Item::Detail { .. }) => {}
             }
             idx.retain(|&i| !self.rows[i].busy());
         }
@@ -468,10 +502,11 @@ impl App {
 }
 
 /// Identity of a list item that survives index changes: (is_header, label or name).
-fn anchor_of(item: &Item) -> (bool, String) {
+fn anchor_of(item: &Item) -> (u8, String) {
     match item {
-        Item::Header { label, .. } => (true, label.clone()),
-        Item::Row { name, .. } => (false, name.clone()),
+        Item::Header { label, .. } => (0, label.clone()),
+        Item::Row { name, .. } => (1, name.clone()),
+        Item::Detail { .. } => (2, String::new()),
     }
 }
 

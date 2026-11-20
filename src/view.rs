@@ -29,6 +29,47 @@ impl GroupBy {
     }
 }
 
+/// How much of the override information is listed under each package.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Overrides {
+    Off,
+    /// Own overrides plus the first few overrides found in the dependency tree.
+    Compact,
+    Full,
+}
+
+impl Overrides {
+    pub fn next(self) -> Self {
+        match self {
+            Overrides::Compact => Overrides::Full,
+            Overrides::Full => Overrides::Off,
+            Overrides::Off => Overrides::Compact,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Overrides::Off => "hidden",
+            Overrides::Compact => "compact",
+            Overrides::Full => "full",
+        }
+    }
+}
+
+/// Tree hits listed per package in compact mode.
+const COMPACT_TREE_HITS: usize = 5;
+
+/// A nested entry under a package.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Child {
+    /// `Row::overrides[i]`: an override on the package itself.
+    Own(usize),
+    /// `Row::tree_hits[i]`: an override somewhere in its dependency tree.
+    Tree(usize),
+    /// Number of tree hits not listed.
+    More(usize),
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Release {
     Patch,
@@ -59,8 +100,45 @@ impl Release {
 /// One line in the list. `idx` and `members` index into `App::rows`.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Item {
-    Header { label: String, members: Vec<usize> },
-    Row { idx: usize, name: String },
+    Header {
+        label: String,
+        members: Vec<usize>,
+    },
+    Row {
+        idx: usize,
+        name: String,
+    },
+    /// Override line nested under the package `rows[idx]`. Never selectable.
+    Detail {
+        idx: usize,
+        child: Child,
+        last: bool,
+    },
+}
+
+fn children(r: &Row, idx: usize, mode: Overrides) -> Vec<Item> {
+    if mode == Overrides::Off {
+        return Vec::new();
+    }
+    let mut kids: Vec<Child> = (0..r.overrides.len()).map(Child::Own).collect();
+    let cap = if mode == Overrides::Full {
+        usize::MAX
+    } else {
+        COMPACT_TREE_HITS
+    };
+    kids.extend((0..r.tree_hits.len().min(cap)).map(Child::Tree));
+    if r.tree_hits.len() > cap {
+        kids.push(Child::More(r.tree_hits.len() - cap));
+    }
+    let n = kids.len();
+    kids.into_iter()
+        .enumerate()
+        .map(|(i, child)| Item::Detail {
+            idx,
+            child,
+            last: i + 1 == n,
+        })
+        .collect()
 }
 
 const OTHER: &str = "(other)";
@@ -81,18 +159,23 @@ fn prefix_label(name: &str, counts: &HashMap<&str, usize>) -> String {
     }
 }
 
-pub fn build(rows: &[Row], mode: GroupBy, filter: &str) -> Vec<Item> {
+pub fn build(rows: &[Row], mode: GroupBy, filter: &str, ov: Overrides) -> Vec<Item> {
     let needle = filter.trim().to_lowercase();
     let visible: Vec<usize> = (0..rows.len())
         .filter(|&i| needle.is_empty() || rows[i].name.to_lowercase().contains(&needle))
         .collect();
-    let item = |i: usize| Item::Row {
-        idx: i,
-        name: rows[i].name.clone(),
+    // A package row followed by its nested override lines.
+    let item = |i: usize| {
+        let mut v = vec![Item::Row {
+            idx: i,
+            name: rows[i].name.clone(),
+        }];
+        v.extend(children(&rows[i], i, ov));
+        v
     };
 
     if mode == GroupBy::None {
-        return visible.into_iter().map(item).collect();
+        return visible.into_iter().flat_map(item).collect();
     }
 
     // (sort key, label) -> members
@@ -131,7 +214,7 @@ pub fn build(rows: &[Row], mode: GroupBy, filter: &str) -> Vec<Item> {
             label,
             members: members.clone(),
         });
-        out.extend(members.into_iter().map(item));
+        out.extend(members.into_iter().flat_map(item));
     }
     out
 }
@@ -164,6 +247,7 @@ mod tests {
             .map(|i| match i {
                 Item::Header { label, .. } => format!("# {label}"),
                 Item::Row { name, .. } => name.clone(),
+                Item::Detail { child, .. } => format!("  - {child:?}"),
             })
             .collect()
     }
@@ -188,7 +272,7 @@ mod tests {
 
     #[test]
     fn groups_by_release_patch_first() {
-        let items = build(&sample(), GroupBy::Release, "");
+        let items = build(&sample(), GroupBy::Release, "", Overrides::Compact);
         assert_eq!(
             labels(&items),
             [
@@ -206,7 +290,7 @@ mod tests {
 
     #[test]
     fn groups_by_prefix() {
-        let items = build(&sample(), GroupBy::Prefix, "");
+        let items = build(&sample(), GroupBy::Prefix, "", Overrides::Compact);
         assert_eq!(
             labels(&items),
             [
@@ -224,8 +308,55 @@ mod tests {
 
     #[test]
     fn filter_is_case_insensitive_and_drops_empty_groups() {
-        let items = build(&sample(), GroupBy::Prefix, "ESLINT");
+        let items = build(&sample(), GroupBy::Prefix, "ESLINT", Overrides::Compact);
         assert_eq!(labels(&items), ["# eslint-*", "eslint", "eslint-plugin-a"]);
-        assert!(build(&sample(), GroupBy::None, "zzz").is_empty());
+        assert!(build(&sample(), GroupBy::None, "zzz", Overrides::Compact).is_empty());
+    }
+
+    fn hit(name: &str, risk: crate::overrides::Compat) -> crate::tree::Hit {
+        crate::tree::Hit {
+            over: crate::overrides::Override {
+                name: name.into(),
+                range: None,
+                value: "1.0.0".into(),
+                source: "overrides",
+                path: vec![],
+            },
+            via: vec![name.into()],
+            installed: None,
+            requested: "^1".into(),
+            risk,
+        }
+    }
+
+    #[test]
+    fn nests_overrides_under_their_package() {
+        use crate::overrides::Compat;
+        let mut rows = vec![row("a", "1.0.0", "2.0.0"), row("b", "1.0.0", "2.0.0")];
+        rows[0].overrides = vec![hit("a", Compat::Ok).over];
+        rows[0].tree_hits = (0..7).map(|i| hit(&format!("t{i}"), Compat::Ok)).collect();
+
+        let kinds = |mode| -> Vec<String> {
+            build(&rows, GroupBy::None, "", mode)
+                .iter()
+                .map(|i| match i {
+                    Item::Row { name, .. } => name.clone(),
+                    Item::Detail { child, last, .. } => {
+                        format!("{child:?}{}", if *last { "$" } else { "" })
+                    }
+                    Item::Header { .. } => "H".into(),
+                })
+                .collect()
+        };
+        assert_eq!(kinds(Overrides::Off), ["a", "b"]);
+        let compact = kinds(Overrides::Compact);
+        // own override + 5 tree hits + "+2 more", all nested under `a`, none under `b`
+        assert_eq!(compact.len(), 1 + 1 + 5 + 1 + 1);
+        assert_eq!(compact[1], "Own(0)");
+        assert_eq!(compact[7], "More(2)$");
+        assert_eq!(compact[8], "b");
+        let full = kinds(Overrides::Full);
+        assert_eq!(full.len(), 1 + 1 + 7 + 1);
+        assert_eq!(full[8], "Tree(6)$");
     }
 }
