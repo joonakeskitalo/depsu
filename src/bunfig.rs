@@ -76,7 +76,9 @@ pub fn merge_into(rc: &mut Npmrc, dir: &Path) -> Vec<String> {
     }
     paths.push(dir.join("bunfig.toml"));
     for p in paths {
-        let Ok(text) = std::fs::read_to_string(&p) else { continue };
+        let Ok(text) = std::fs::read_to_string(&p) else {
+            continue;
+        };
         if let Err(e) = merge_str(rc, &text) {
             warnings.push(format!("! {}: {e}", p.display()));
         }
@@ -86,7 +88,9 @@ pub fn merge_into(rc: &mut Npmrc, dir: &Path) -> Vec<String> {
 
 pub fn merge_str(rc: &mut Npmrc, text: &str) -> Result<(), toml::de::Error> {
     let doc: Value = toml::from_str(text)?;
-    let Some(install) = doc.get("install") else { return Ok(()) };
+    let Some(install) = doc.get("install") else {
+        return Ok(());
+    };
     if let Some(reg) = install.get("registry") {
         apply(rc, None, reg);
     }
@@ -117,7 +121,9 @@ fn apply(rc: &mut Npmrc, scope: Option<&str>, v: &Value) {
     };
     rc.set(&key, &url);
 
-    let Some((_, rest)) = url.split_once("://") else { return };
+    let Some((_, rest)) = url.split_once("://") else {
+        return;
+    };
     let prefix = format!("//{}/:", rest.trim_end_matches('/'));
     if let Some(t) = token.filter(|t| !t.is_empty()) {
         rc.set(&format!("{prefix}_authToken"), &t);
@@ -142,7 +148,10 @@ mod tests {
             "[install.registry]\nurl = \"https://npm.example.fi/sok-npm/\"\ntoken = \"$DEPSU_BUN_TOK\"\n",
         )
         .unwrap();
-        assert_eq!(rc.registry_for("left-pad"), "https://npm.example.fi/sok-npm/");
+        assert_eq!(
+            rc.registry_for("left-pad"),
+            "https://npm.example.fi/sok-npm/"
+        );
         assert_eq!(
             rc.auth_header("https://npm.example.fi/sok-npm/").as_deref(),
             Some("Bearer tok")
@@ -159,7 +168,10 @@ mod tests {
         .unwrap();
         assert_eq!(rc.registry_for("foo"), "https://a.example/");
         assert_eq!(rc.registry_for("@acme/foo"), "https://b.example/");
-        assert_eq!(rc.auth_header("https://b.example/").as_deref(), Some("Bearer x"));
+        assert_eq!(
+            rc.auth_header("https://b.example/").as_deref(),
+            Some("Bearer x")
+        );
     }
 
     #[test]

@@ -65,19 +65,28 @@ impl Pm {
         match kind {
             Kind::Prod => {}
             Kind::Dev => a.push("-D".into()),
-            Kind::Optional => a.push(
-                if self == Pm::Bun { "--optional" } else { "-O" }.into(),
-            ),
+            Kind::Optional => a.push(if self == Pm::Bun { "--optional" } else { "-O" }.into()),
         }
         if exact {
-            a.push(if matches!(self, Pm::Npm | Pm::Pnpm) { "--save-exact" } else { "--exact" }.into());
+            a.push(
+                if matches!(self, Pm::Npm | Pm::Pnpm) {
+                    "--save-exact"
+                } else {
+                    "--exact"
+                }
+                .into(),
+            );
         }
         a
     }
 
     /// Executable name (Windows uses `.cmd` shims).
     pub fn program(self) -> String {
-        if cfg!(windows) { format!("{}.cmd", self.name()) } else { self.name().into() }
+        if cfg!(windows) {
+            format!("{}.cmd", self.name())
+        } else {
+            self.name().into()
+        }
     }
 }
 
@@ -87,13 +96,22 @@ mod tests {
 
     #[test]
     fn field_wins() {
-        assert_eq!(Pm::detect(Path::new("/nonexistent"), Some("pnpm@9.1.0")), Pm::Pnpm);
+        assert_eq!(
+            Pm::detect(Path::new("/nonexistent"), Some("pnpm@9.1.0")),
+            Pm::Pnpm
+        );
     }
 
     #[test]
     fn args() {
         let s = vec!["a@^1.0.0".to_string()];
-        assert_eq!(Pm::Npm.install_args(&s, Kind::Dev, false), ["install", "a@^1.0.0", "-D"]);
-        assert_eq!(Pm::Yarn.install_args(&s, Kind::Prod, true), ["add", "a@^1.0.0", "--exact"]);
+        assert_eq!(
+            Pm::Npm.install_args(&s, Kind::Dev, false),
+            ["install", "a@^1.0.0", "-D"]
+        );
+        assert_eq!(
+            Pm::Yarn.install_args(&s, Kind::Prod, true),
+            ["add", "a@^1.0.0", "--exact"]
+        );
     }
 }

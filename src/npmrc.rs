@@ -22,10 +22,10 @@ impl Npmrc {
         }
         rc.merge_file(&dir.join(".npmrc"));
         for var in ["NPM_CONFIG_REGISTRY", "npm_config_registry"] {
-            if let Ok(v) = std::env::var(var) {
-                if !v.is_empty() {
-                    rc.values.insert("registry".into(), v);
-                }
+            if let Ok(v) = std::env::var(var)
+                && !v.is_empty()
+            {
+                rc.values.insert("registry".into(), v);
             }
         }
         rc
@@ -47,7 +47,9 @@ impl Npmrc {
             if line.is_empty() || line.starts_with('#') || line.starts_with(';') {
                 continue;
             }
-            let Some((k, v)) = line.split_once('=') else { continue };
+            let Some((k, v)) = line.split_once('=') else {
+                continue;
+            };
             let v = v.trim().trim_matches(|c| c == '"' || c == '\'');
             self.values.insert(k.trim().to_string(), expand_env(v));
         }
@@ -63,7 +65,11 @@ impl Npmrc {
             .or_else(|| self.values.get("registry"))
             .map(String::as_str)
             .unwrap_or(DEFAULT_REGISTRY);
-        if url.ends_with('/') { url.to_string() } else { format!("{url}/") }
+        if url.ends_with('/') {
+            url.to_string()
+        } else {
+            format!("{url}/")
+        }
     }
 
     /// Value for the `Authorization` header for a registry URL, if configured.
@@ -84,7 +90,10 @@ impl Npmrc {
                 self.values.get(&format!("{prefix}username")),
                 self.values.get(&format!("{prefix}_password")),
             ) {
-                let pw = STANDARD.decode(p).ok().and_then(|b| String::from_utf8(b).ok())?;
+                let pw = STANDARD
+                    .decode(p)
+                    .ok()
+                    .and_then(|b| String::from_utf8(b).ok())?;
                 return Some(format!("Basic {}", STANDARD.encode(format!("{u}:{pw}"))));
             }
             match path.rfind('/') {
@@ -146,15 +155,23 @@ mod tests {
     #[test]
     fn auth_token_prefix_match() {
         let r = rc("//a.example/:_authToken=tok\n");
-        assert_eq!(r.auth_header("https://a.example/npm/deep/").as_deref(), Some("Bearer tok"));
+        assert_eq!(
+            r.auth_header("https://a.example/npm/deep/").as_deref(),
+            Some("Bearer tok")
+        );
         assert_eq!(r.auth_header("https://other.example/"), None);
     }
 
     #[test]
     fn env_expansion() {
         unsafe { std::env::set_var("DEPSU_TEST_TOK", "abc") };
-        let r = rc("//a.example/:_authToken=${DEPSU_TEST_TOK}\nregistry=${DEPSU_NOPE:-https://d.example/}");
-        assert_eq!(r.auth_header("https://a.example/").as_deref(), Some("Bearer abc"));
+        let r = rc(
+            "//a.example/:_authToken=${DEPSU_TEST_TOK}\nregistry=${DEPSU_NOPE:-https://d.example/}",
+        );
+        assert_eq!(
+            r.auth_header("https://a.example/").as_deref(),
+            Some("Bearer abc")
+        );
         assert_eq!(r.registry_for("x"), "https://d.example/");
     }
 }

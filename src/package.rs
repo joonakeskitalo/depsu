@@ -34,7 +34,8 @@ pub struct Manifest {
 }
 
 pub fn read_manifest(path: &Path) -> Result<Manifest> {
-    let text = std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+    let text =
+        std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
     let json: serde_json::Value =
         serde_json::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
     let mut deps = Vec::new();
@@ -46,13 +47,23 @@ pub fn read_manifest(path: &Path) -> Result<Manifest> {
         if let Some(map) = json.get(field).and_then(|v| v.as_object()) {
             for (name, spec) in map {
                 if let Some(spec) = spec.as_str() {
-                    deps.push(Dep { name: name.clone(), spec: spec.into(), kind });
+                    deps.push(Dep {
+                        name: name.clone(),
+                        spec: spec.into(),
+                        kind,
+                    });
                 }
             }
         }
     }
-    let package_manager = json.get("packageManager").and_then(|v| v.as_str()).map(String::from);
-    Ok(Manifest { deps, package_manager })
+    let package_manager = json
+        .get("packageManager")
+        .and_then(|v| v.as_str())
+        .map(String::from);
+    Ok(Manifest {
+        deps,
+        package_manager,
+    })
 }
 
 /// Splits a simple range like `^1.2.3`, `~1.2`, `1.0.0` into (prefix, version).
@@ -60,18 +71,18 @@ pub fn read_manifest(path: &Path) -> Result<Manifest> {
 pub fn parse_spec(spec: &str) -> Option<(&'static str, Version)> {
     let spec = spec.trim();
     for prefix in ["^", "~", ">=", ""] {
-        if let Some(rest) = spec.strip_prefix(prefix) {
-            if let Some(v) = lenient_version(rest) {
-                return Some((
-                    match prefix {
-                        "^" => "^",
-                        "~" => "~",
-                        ">=" => ">=",
-                        _ => "",
-                    },
-                    v,
-                ));
-            }
+        if let Some(rest) = spec.strip_prefix(prefix)
+            && let Some(v) = lenient_version(rest)
+        {
+            return Some((
+                match prefix {
+                    "^" => "^",
+                    "~" => "~",
+                    ">=" => ">=",
+                    _ => "",
+                },
+                v,
+            ));
         }
     }
     None
@@ -107,7 +118,16 @@ mod tests {
         assert_eq!(parse_spec("~1.2"), Some(("~", Version::new(1, 2, 0))));
         assert_eq!(parse_spec("2"), Some(("", Version::new(2, 0, 0))));
         assert_eq!(parse_spec(">=1.0.0"), Some((">=", Version::new(1, 0, 0))));
-        for bad in ["latest", "workspace:*", "1.x", "*", "^1 || ^2", "npm:foo@1", "github:a/b", "file:../x"] {
+        for bad in [
+            "latest",
+            "workspace:*",
+            "1.x",
+            "*",
+            "^1 || ^2",
+            "npm:foo@1",
+            "github:a/b",
+            "file:../x",
+        ] {
             assert_eq!(parse_spec(bad), None, "{bad}");
         }
     }

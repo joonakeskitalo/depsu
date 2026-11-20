@@ -15,9 +15,15 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 
 pub enum Event {
-    Fetched { name: String, result: Result<Version, String> },
+    Fetched {
+        name: String,
+        result: Result<Version, String>,
+    },
     InstallStarted(Vec<String>),
-    InstallFinished { names: Vec<String>, result: Result<(), String> },
+    InstallFinished {
+        names: Vec<String>,
+        result: Result<(), String>,
+    },
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -140,18 +146,19 @@ impl App {
                     self.pending = self.pending.saturating_sub(1);
                     match result {
                         Ok(latest) => {
-                            if let Some((kind, prefix, cur)) = self.current.get(&name).cloned() {
-                                if latest > cur && latest.pre.is_empty() {
-                                    self.insert_row(Row {
-                                        name,
-                                        kind,
-                                        prefix,
-                                        current: cur,
-                                        latest,
-                                        selected: false,
-                                        status: Status::Idle,
-                                    });
-                                }
+                            if let Some((kind, prefix, cur)) = self.current.get(&name).cloned()
+                                && latest > cur
+                                && latest.pre.is_empty()
+                            {
+                                self.insert_row(Row {
+                                    name,
+                                    kind,
+                                    prefix,
+                                    current: cur,
+                                    latest,
+                                    selected: false,
+                                    status: Status::Idle,
+                                });
                             }
                         }
                         Err(e) => self.push_log(format!("! {name}: {e}")),
@@ -174,7 +181,14 @@ impl App {
                             r.status = Status::Failed;
                         }
                         self.push_log(format!("✘ failed {}:", names.join(", ")));
-                        for line in e.lines().rev().take(6).collect::<Vec<_>>().into_iter().rev() {
+                        for line in e
+                            .lines()
+                            .rev()
+                            .take(6)
+                            .collect::<Vec<_>>()
+                            .into_iter()
+                            .rev()
+                        {
                             self.push_log(format!("  {line}"));
                         }
                     }
@@ -221,15 +235,17 @@ impl App {
             }
             KeyCode::Down | KeyCode::Char('j') => self.move_cursor(1),
             KeyCode::Up | KeyCode::Char('k') => self.move_cursor(-1),
-            KeyCode::Home | KeyCode::Char('g') => self.table.select((!self.rows.is_empty()).then_some(0)),
+            KeyCode::Home | KeyCode::Char('g') => {
+                self.table.select((!self.rows.is_empty()).then_some(0))
+            }
             KeyCode::End | KeyCode::Char('G') => {
                 self.table.select(self.rows.len().checked_sub(1));
             }
             KeyCode::Char(' ') => {
-                if let Some(r) = self.table.selected().and_then(|i| self.rows.get_mut(i)) {
-                    if !r.busy() {
-                        r.selected = !r.selected;
-                    }
+                if let Some(r) = self.table.selected().and_then(|i| self.rows.get_mut(i))
+                    && !r.busy()
+                {
+                    r.selected = !r.selected;
                 }
                 self.move_cursor(1);
             }
@@ -250,7 +266,8 @@ impl App {
         }
         let len = self.rows.len() as isize;
         let cur = self.table.selected().unwrap_or(0) as isize;
-        self.table.select(Some((cur + delta).clamp(0, len - 1) as usize));
+        self.table
+            .select(Some((cur + delta).clamp(0, len - 1) as usize));
     }
 
     /// Queues all checked rows, or the row under the cursor if none are checked.
@@ -258,12 +275,11 @@ impl App {
         let mut idx: Vec<usize> = (0..self.rows.len())
             .filter(|&i| self.rows[i].selected && !self.rows[i].busy())
             .collect();
-        if idx.is_empty() {
-            if let Some(i) = self.table.selected() {
-                if self.rows.get(i).is_some_and(|r| !r.busy()) {
-                    idx.push(i);
-                }
-            }
+        if idx.is_empty()
+            && let Some(i) = self.table.selected()
+            && self.rows.get(i).is_some_and(|r| !r.busy())
+        {
+            idx.push(i);
         }
         if idx.is_empty() {
             return;
@@ -300,7 +316,10 @@ fn install_worker(dir: PathBuf, pm: Pm, jobs: Receiver<Job>, tx: Sender<Event>) 
         let mut result = Ok(());
         for ((kind, exact), specs) in groups {
             let args = pm.install_args(&specs, kind, exact);
-            let out = Command::new(pm.program()).args(&args).current_dir(&dir).output();
+            let out = Command::new(pm.program())
+                .args(&args)
+                .current_dir(&dir)
+                .output();
             match out {
                 Ok(o) if o.status.success() => {}
                 Ok(o) => {
@@ -308,7 +327,13 @@ fn install_worker(dir: PathBuf, pm: Pm, jobs: Receiver<Job>, tx: Sender<Event>) 
                     if text.trim().is_empty() {
                         text = String::from_utf8_lossy(&o.stdout).into_owned();
                     }
-                    result = Err(format!("`{} {}` exited with {}\n{}", pm.name(), args.join(" "), o.status, text.trim()));
+                    result = Err(format!(
+                        "`{} {}` exited with {}\n{}",
+                        pm.name(),
+                        args.join(" "),
+                        o.status,
+                        text.trim()
+                    ));
                     break;
                 }
                 Err(e) => {
@@ -317,7 +342,10 @@ fn install_worker(dir: PathBuf, pm: Pm, jobs: Receiver<Job>, tx: Sender<Event>) 
                 }
             }
         }
-        if tx.send(Event::InstallFinished { names: all, result }).is_err() {
+        if tx
+            .send(Event::InstallFinished { names: all, result })
+            .is_err()
+        {
             break;
         }
     }

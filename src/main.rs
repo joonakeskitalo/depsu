@@ -33,8 +33,18 @@ fn main() -> Result<()> {
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
-            "-h" | "--help" => return Ok(println!("{HELP}")),
-            "-V" | "--version" => return Ok(println!("depsu {}", env!("CARGO_PKG_VERSION"))),
+            "-h" | "--help" => {
+                return {
+                    println!("{HELP}");
+                    Ok(())
+                };
+            }
+            "-V" | "--version" => {
+                return {
+                    println!("depsu {}", env!("CARGO_PKG_VERSION"));
+                    Ok(())
+                };
+            }
             "-C" | "--dir" => match args.next() {
                 Some(p) => dir = p.into(),
                 None => bail!("{arg} requires a value"),
@@ -55,7 +65,11 @@ fn main() -> Result<()> {
     let pm = forced_pm.unwrap_or_else(|| pm::Pm::detect(&dir, manifest.package_manager.as_deref()));
     let mut rc = npmrc::Npmrc::load(&dir);
     // Bun reads bunfig.toml (taking precedence over .npmrc), so honour it for bun projects.
-    let warnings = if pm == pm::Pm::Bun { bunfig::merge_into(&mut rc, &dir) } else { Vec::new() };
+    let warnings = if pm == pm::Pm::Bun {
+        bunfig::merge_into(&mut rc, &dir)
+    } else {
+        Vec::new()
+    };
 
     let mut app = app::App::start(dir, pm, manifest.deps, rc);
     for w in warnings {
@@ -71,12 +85,11 @@ fn run(terminal: &mut ratatui::DefaultTerminal, app: &mut app::App) -> Result<()
     while !app.quit {
         app.drain_events();
         terminal.draw(|f| ui::draw(f, app))?;
-        if event::poll(Duration::from_millis(100))? {
-            if let Event::Key(key) = event::read()? {
-                if key.kind == KeyEventKind::Press {
-                    app.on_key(key);
-                }
-            }
+        if event::poll(Duration::from_millis(100))?
+            && let Event::Key(key) = event::read()?
+            && key.kind == KeyEventKind::Press
+        {
+            app.on_key(key);
         }
     }
     Ok(())
