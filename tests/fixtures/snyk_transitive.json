@@ -1,0 +1,113 @@
+{
+ "ok": false,
+ "packageManager": "npm",
+ "projectName": "fixture",
+ "vulnerabilities": [
+  {
+   "id": "SNYK-JS-TAR-1",
+   "title": "Arbitrary File Write",
+   "severity": "high",
+   "severityWithCritical": "critical",
+   "packageName": "tar",
+   "version": "5.0.0",
+   "from": [
+    "fixture@1.0.0",
+    "mid@1.0.0",
+    "tar@5.0.0"
+   ],
+   "upgradePath": [
+    false,
+    "mid@1.2.0",
+    "tar@5.0.5"
+   ],
+   "isUpgradable": true,
+   "isPatchable": false,
+   "fixedIn": [
+    "5.0.5"
+   ],
+   "cvssScore": 8.2,
+   "identifiers": {
+    "CVE": [
+     "CVE-2099-0001"
+    ]
+   }
+  },
+  {
+   "id": "SNYK-JS-TAR-1",
+   "title": "Arbitrary File Write",
+   "severity": "high",
+   "severityWithCritical": "critical",
+   "packageName": "tar",
+   "version": "5.0.0",
+   "from": [
+    "fixture@1.0.0",
+    "other@2.0.0",
+    "tar@5.0.0"
+   ],
+   "upgradePath": [
+    false,
+    "other@2.1.0",
+    "tar@5.0.5"
+   ],
+   "isUpgradable": true,
+   "isPatchable": false,
+   "fixedIn": [
+    "5.0.5"
+   ],
+   "cvssScore": 8.2,
+   "identifiers": {
+    "CVE": [
+     "CVE-2099-0001"
+    ]
+   }
+  },
+  {
+   "id": "SNYK-JS-OLD-9",
+   "title": "Prototype Pollution",
+   "severity": "medium",
+   "packageName": "@scope/old",
+   "version": "1.0.0",
+   "from": [
+    "fixture@1.0.0",
+    "@scope/old@1.0.0"
+   ],
+   "upgradePath": [],
+   "isUpgradable": false,
+   "isPatchable": false,
+   "fixedIn": [],
+   "cvssScore": 5.0,
+   "identifiers": {
+    "CVE": []
+   }
+  }
+ ],
+ "remediation": {
+  "unresolved": [
+   {
+    "id": "SNYK-JS-OLD-9"
+   }
+  ],
+  "pin": {},
+  "ignore": null,
+  "upgrade": {
+   "mid@1.0.0": {
+    "upgradeTo": "mid@1.2.0",
+    "upgrades": [
+     "tar@5.0.0"
+    ],
+    "vulns": [
+     "SNYK-JS-TAR-1"
+    ]
+   },
+   "other@2.0.0": {
+    "upgradeTo": "other@2.1.0",
+    "upgrades": [
+     "tar@5.0.0"
+    ],
+    "vulns": [
+     "SNYK-JS-TAR-1"
+    ]
+   }
+  }
+ }
+}

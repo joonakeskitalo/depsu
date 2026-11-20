@@ -6,6 +6,7 @@ use crate::overrides::{self, Compat, Override, Unneeded};
 use crate::package::{self, Dep, Kind, parse_spec};
 use crate::pm::Pm;
 use crate::registry;
+use crate::snyk::{self, Report, Severity, Vuln};
 use crate::tree::{Analyzer, Hit};
 use crate::view::{self, Child, GroupBy, Item, Overrides, Release, UNNEEDED};
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -29,6 +30,7 @@ pub enum Event {
     },
     /// Overrides that look unnecessary, by key. Empty when it can't be determined.
     Unneeded(Vec<(String, Unneeded)>),
+    Snyk(Result<Report, String>),
     InstallStarted {
         names: Vec<String>,
     },
@@ -72,6 +74,10 @@ pub struct Row {
     pub compat: Compat,
     /// Overrides applying anywhere in the installed dependency tree of this package.
     pub tree_hits: Vec<Hit>,
+    /// Snyk findings in this dependency or anything it brings in, worst first.
+    pub vulns: Vec<Vuln>,
+    /// The version Snyk suggests to fix them.
+    pub snyk_fix: Option<Version>,
 }
 
 impl Row {
@@ -87,9 +93,18 @@ impl Row {
         matches!(self.status, Status::Queued | Status::Installing)
     }
 
-    /// Can be selected for install.
+    /// Can be installed at its latest version.
     pub fn actionable(&self) -> bool {
         self.outdated && !self.busy()
+    }
+
+    /// Can be checked with `space`: there is a newer version or a Snyk fix to install.
+    pub fn can_select(&self) -> bool {
+        !self.busy() && (self.outdated || self.snyk_fix.is_some())
+    }
+
+    pub fn worst_severity(&self) -> Option<Severity> {
+        self.vulns.iter().map(|v| v.severity).max()
     }
 }
 
@@ -107,12 +122,24 @@ struct Job {
     keys: Vec<String>,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum SnykStatus {
+    NotRun,
+    Running,
+    Done { total: usize, severe: usize },
+    Failed,
+}
+
 pub struct App {
     pub pm: Pm,
     pub rows: Vec<Row>,
     pub table: ListState,
     pub show_overrides: Overrides,
     pub show_uptodate: bool,
+    pub show_vulns: bool,
+    pub snyk_status: SnykStatus,
+    /// Install finished since the last scan: the findings may be out of date.
+    pub snyk_stale: bool,
     pub view: Vec<Item>,
     pub group_by: GroupBy,
     pub filter: String,
@@ -138,7 +165,12 @@ pub struct App {
     /// False until the first key press: the cursor then stays at the top of the package list.
     cursor_moved: bool,
     tree_tx: Option<Sender<TreeMsg>>,
-    confirm_conflicts: bool,
+    snyk_report: Option<Report>,
+    events_tx: Sender<Event>,
+    /// Target version of each package being installed.
+    install_targets: HashMap<String, Version>,
+    /// The key (`i` or `f`) that must be pressed again to install despite override conflicts.
+    confirm_conflicts: Option<char>,
     quit_warned: bool,
     rx: Receiver<Event>,
     jobs: Sender<Job>,
@@ -216,6 +248,7 @@ impl App {
             Some(msg_tx)
         };
 
+        let events_tx = tx.clone();
         // One install worker: package managers don't tolerate parallel installs.
         let worker_dir = dir.clone();
         thread::spawn(move || install_worker(worker_dir, pm, job_rx, tx));
@@ -226,6 +259,9 @@ impl App {
             table: ListState::default(),
             show_overrides: Overrides::Compact,
             show_uptodate: true,
+            show_vulns: true,
+            snyk_status: SnykStatus::NotRun,
+            snyk_stale: false,
             view: Vec::new(),
             group_by: GroupBy::None,
             filter: String::new(),
@@ -247,7 +283,10 @@ impl App {
             confirm_remove: false,
             cursor_moved: false,
             tree_tx,
-            confirm_conflicts: false,
+            snyk_report: None,
+            events_tx,
+            install_targets: HashMap::new(),
+            confirm_conflicts: None,
             quit_warned: false,
             rx,
             jobs,
@@ -281,6 +320,7 @@ impl App {
                     }
                 }
                 Event::Tree { name, hits } => self.on_tree(name, hits),
+                Event::Snyk(result) => self.on_snyk(result),
                 Event::Unneeded(found) => {
                     self.unneeded = found.into_iter().collect();
                     self.rebuild_view();
@@ -335,6 +375,8 @@ impl App {
             overrides: own,
             compat,
             tree_hits: Vec::new(),
+            vulns: Vec::new(),
+            snyk_fix: None,
         };
         // Packages that are already up to date are listed too, so their overrides are visible.
         let compat = if outdated {
@@ -375,13 +417,27 @@ impl App {
                 self.push_log(format!("✔ done: {}", what.join(", ")));
                 // Updated packages are up to date now; they stay in the list as such.
                 for r in self.rows.iter_mut().filter(|r| names.contains(&r.name)) {
-                    r.outdated = false;
-                    r.current = r.latest.clone();
+                    // The target is the latest version, or the one Snyk suggested.
+                    let target = self
+                        .install_targets
+                        .remove(&r.name)
+                        .unwrap_or_else(|| r.latest.clone());
+                    r.outdated = r.latest > target && r.latest.pre.is_empty();
+                    r.current = target;
                     r.compat = Compat::Ok;
                     r.status = Status::Idle;
+                    // The old findings no longer describe what is installed.
+                    r.vulns.clear();
+                    r.snyk_fix = None;
+                }
+                if !names.is_empty() && self.snyk_report.is_some() {
+                    self.snyk_stale = true;
                 }
             }
             Err(e) => {
+                for n in &names {
+                    self.install_targets.remove(n);
+                }
                 for r in self.rows.iter_mut().filter(|r| names.contains(&r.name)) {
                     r.status = Status::Failed;
                 }
@@ -452,7 +508,10 @@ impl App {
         self.rebuild_view();
     }
 
-    fn insert_row(&mut self, row: Row) {
+    fn insert_row(&mut self, mut row: Row) {
+        if let Some(rep) = &self.snyk_report {
+            apply_snyk(rep, &mut row);
+        }
         // Keep rows sorted by (kind, name) so late arrivals don't shuffle randomly.
         let key = |r: &Row| (r.kind.label(), r.name.clone());
         let pos = self.rows.partition_point(|r| key(r) < key(&row));
@@ -470,6 +529,7 @@ impl App {
             &self.filter,
             self.show_overrides,
             self.show_uptodate,
+            self.show_vulns,
         );
         self.append_unneeded_section();
         let pos = if self.cursor_moved {
@@ -548,7 +608,7 @@ impl App {
         match child {
             Child::Own(i) => r.overrides.get(*i),
             Child::Tree(i) => r.tree_hits.get(*i).map(|h| &h.over),
-            Child::More(_) => None,
+            Child::More(_) | Child::Vuln(_) | Child::MoreVulns(_) => None,
         }
     }
 
@@ -630,8 +690,11 @@ impl App {
         if !matches!(key.code, KeyCode::Char('q') | KeyCode::Esc) {
             self.quit_warned = false;
         }
-        if !matches!(key.code, KeyCode::Char('i') | KeyCode::Enter) {
-            self.confirm_conflicts = false;
+        if !matches!(
+            key.code,
+            KeyCode::Char('i') | KeyCode::Char('f') | KeyCode::Enter
+        ) {
+            self.confirm_conflicts = None;
         }
         if key.code != KeyCode::Char('x') {
             self.confirm_remove = false;
@@ -674,7 +737,7 @@ impl App {
                 let visible: Vec<usize> = self
                     .visible_rows()
                     .into_iter()
-                    .filter(|&i| self.rows[i].actionable())
+                    .filter(|&i| self.rows[i].can_select())
                     .collect();
                 let all = visible.iter().all(|&i| self.rows[i].selected);
                 for i in visible {
@@ -683,6 +746,12 @@ impl App {
             }
             KeyCode::Char('i') | KeyCode::Enter => self.install_selected(),
             KeyCode::Char('x') => self.remove_selected(),
+            KeyCode::Char('s') => self.start_snyk_scan(),
+            KeyCode::Char('f') => self.fix_selected(),
+            KeyCode::Char('v') => {
+                self.show_vulns = !self.show_vulns;
+                self.rebuild_view();
+            }
             _ => {}
         }
     }
@@ -728,7 +797,7 @@ impl App {
         };
         match item {
             Item::Row { idx, .. } => {
-                if self.rows[idx].actionable() {
+                if self.rows[idx].can_select() {
                     self.rows[idx].selected = !self.rows[idx].selected;
                 }
                 self.move_cursor(1);
@@ -736,7 +805,7 @@ impl App {
             Item::Header { members, .. } => {
                 let members: Vec<usize> = members
                     .into_iter()
-                    .filter(|&i| self.rows[i].actionable())
+                    .filter(|&i| self.rows[i].can_select())
                     .collect();
                 let all = members.iter().all(|&i| self.rows[i].selected);
                 for i in members {
@@ -816,29 +885,85 @@ impl App {
             return;
         }
 
-        // Updates that clash with an override need an explicit second press.
-        let conflicts: Vec<&str> = idx
-            .iter()
-            .filter(|&&i| self.rows[i].compat == Compat::Conflict)
-            .map(|&i| self.rows[i].name.as_str())
+        let pkgs = idx
+            .into_iter()
+            .map(|i| (i, self.rows[i].latest.clone()))
             .collect();
-        if !conflicts.is_empty() && !self.confirm_conflicts {
+        self.dispatch('i', pkgs, ovr);
+    }
+
+    /// Installs the Snyk-suggested version of the checked packages, or of the one under the
+    /// cursor (every package of a group when on a group header).
+    fn fix_selected(&mut self) {
+        let has_fix = |a: &App, i: usize| a.rows[i].snyk_fix.is_some() && !a.rows[i].busy();
+        let mut idx: Vec<usize> = self
+            .visible_rows()
+            .into_iter()
+            .filter(|&i| self.rows[i].selected && has_fix(self, i))
+            .collect();
+        if idx.is_empty() {
+            match self.cursor_item().cloned() {
+                Some(Item::Row { idx: i, .. }) => idx.push(i),
+                Some(Item::Header { members, .. }) => idx.extend(members),
+                _ => {}
+            }
+            idx.retain(|&i| has_fix(self, i));
+        }
+        if idx.is_empty() {
+            self.push_log(if self.snyk_report.is_none() {
+                "No Snyk data yet. Press s to scan."
+            } else {
+                "No Snyk fix for the selection: put the cursor on a package marked ✱ with a fix."
+            });
+            return;
+        }
+        let pkgs = idx
+            .into_iter()
+            .filter_map(|i| Some((i, self.rows[i].snyk_fix.clone()?)))
+            .collect();
+        self.dispatch('f', pkgs, Vec::new());
+    }
+
+    /// Queues the installs of `pkgs` (row index, version to install) and the override updates.
+    /// `key` is the key the user pressed, which must be pressed again to go ahead when an
+    /// update clashes with an override.
+    fn dispatch(&mut self, key: char, pkgs: Vec<(usize, Version)>, ovr: Vec<(Override, String)>) {
+        if pkgs.is_empty() && ovr.is_empty() {
+            return;
+        }
+        // Updates that clash with an override need an explicit second press.
+        let conflicts: Vec<&str> = pkgs
+            .iter()
+            .filter(|(i, target)| {
+                let r = &self.rows[*i];
+                let spec = format!("{}{target}", r.prefix);
+                overrides::check(&r.overrides, self.pm, &spec, target) == Compat::Conflict
+            })
+            .map(|(i, _)| self.rows[*i].name.as_str())
+            .collect();
+        if !conflicts.is_empty() && self.confirm_conflicts != Some(key) {
             let msg = format!(
-                "⚠ conflicts with overrides: {}. Press i again to install anyway, any other key cancels.",
+                "⚠ conflicts with overrides: {}. Press {key} again to install anyway, any other key cancels.",
                 conflicts.join(", ")
             );
-            self.confirm_conflicts = true;
+            self.confirm_conflicts = Some(key);
             self.push_log(msg);
             return;
         }
-        self.confirm_conflicts = false;
+        self.confirm_conflicts = None;
 
         let mut items = Vec::new();
-        for i in idx {
+        for (i, target) in pkgs {
             let r = &mut self.rows[i];
             r.selected = false;
             r.status = Status::Queued;
-            items.push((r.name.clone(), r.new_spec(), r.kind, r.prefix.is_empty()));
+            items.push((
+                r.name.clone(),
+                format!("{}{target}", r.prefix),
+                r.kind,
+                r.prefix.is_empty(),
+            ));
+            self.install_targets.insert(r.name.clone(), target);
         }
         let mut edits = Vec::new();
         let mut keys = Vec::new();
@@ -852,11 +977,90 @@ impl App {
                 new,
             });
         }
-        let mut what: Vec<String> = items.iter().map(|i| i.0.clone()).collect();
+        let mut what: Vec<String> = items.iter().map(|i| format!("{}@{}", i.0, i.1)).collect();
         what.extend(keys.iter().map(|k| override_label(k)));
         self.push_log(format!("… queued {}", what.join(", ")));
         let _ = self.jobs.send(Job { items, edits, keys });
     }
+
+    // ---- Snyk ------------------------------------------------------------------------
+
+    fn start_snyk_scan(&mut self) {
+        if self.snyk_status == SnykStatus::Running {
+            return;
+        }
+        self.snyk_status = SnykStatus::Running;
+        self.push_log("… scanning with Snyk (this sends the dependency list to Snyk)");
+        let (dir, tx) = (self.dir.clone(), self.events_tx.clone());
+        thread::spawn(move || {
+            let _ = tx.send(Event::Snyk(snyk::scan(&dir)));
+        });
+    }
+
+    fn on_snyk(&mut self, result: Result<Report, String>) {
+        match result {
+            Err(e) => {
+                self.snyk_status = SnykStatus::Failed;
+                self.push_log(format!("✘ Snyk: {e}"));
+            }
+            Ok(report) => {
+                for w in &report.warnings {
+                    self.push_log(format!("! Snyk: {}", w.lines().next().unwrap_or("")));
+                }
+                for r in &mut self.rows {
+                    apply_snyk(&report, r);
+                }
+                let severe = report
+                    .vulns
+                    .iter()
+                    .filter(|v| v.severity >= Severity::High)
+                    .count();
+                self.snyk_status = SnykStatus::Done {
+                    total: report.vulns.len(),
+                    severe,
+                };
+                self.snyk_stale = false;
+
+                let shown: HashSet<&str> = self.rows.iter().map(|r| r.name.as_str()).collect();
+                let hidden: HashSet<&str> = report
+                    .vulns
+                    .iter()
+                    .map(|v| v.direct.as_str())
+                    .filter(|d| !shown.contains(d))
+                    .collect();
+                let fixes = self.rows.iter().filter(|r| r.snyk_fix.is_some()).count();
+                if report.vulns.is_empty() {
+                    self.push_log("✔ Snyk: no known vulnerabilities");
+                } else {
+                    self.push_log(format!(
+                        "✔ Snyk: {} vulnerabilities ({severe} high or critical), fixes suggested for {fixes} package(s). Press f to apply.",
+                        report.vulns.len()
+                    ));
+                }
+                if !hidden.is_empty() {
+                    let mut names: Vec<&str> = hidden.into_iter().collect();
+                    names.sort();
+                    self.push_log(format!(
+                        "! Snyk: findings in packages not listed here: {}",
+                        names.join(", ")
+                    ));
+                }
+                self.snyk_report = Some(report);
+            }
+        }
+        self.rebuild_view();
+    }
+}
+
+/// Copies the Snyk findings and suggested fix for `row` out of `report`.
+fn apply_snyk(report: &Report, row: &mut Row) {
+    row.vulns = report
+        .vulns
+        .iter()
+        .filter(|v| v.direct == row.name)
+        .cloned()
+        .collect();
+    row.snyk_fix = report.fixes.get(&row.name).cloned();
 }
 
 impl App {
@@ -931,7 +1135,7 @@ fn anchor_of(item: &Item) -> (u8, String) {
         } => (
             2,
             match child {
-                Child::More(_) => format!("{row}\u{0}more"),
+                Child::More(_) | Child::MoreVulns(_) => format!("{row}\u{0}more"),
                 _ => format!("{row}\u{0}{key}"),
             },
         ),

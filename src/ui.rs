@@ -1,6 +1,7 @@
-use crate::app::{App, Row as AppRow, Status};
+use crate::app::{App, Row as AppRow, SnykStatus, Status};
 use crate::overrides::{self, Compat, Override};
 use crate::pm::Pm;
+use crate::snyk::Severity;
 use crate::tree::{self, Hit};
 use crate::view::{Child, GroupBy, Item, Overrides, Release, UNNEEDED};
 use ratatui::Frame;
@@ -48,6 +49,18 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     }
     if !app.show_uptodate {
         info.push_str(" · up-to-date hidden");
+    }
+    match app.snyk_status {
+        SnykStatus::NotRun => {}
+        SnykStatus::Running => info.push_str(" · snyk: scanning…"),
+        SnykStatus::Failed => info.push_str(" · snyk: failed (see log)"),
+        SnykStatus::Done { total: 0, .. } => info.push_str(" · snyk: clean"),
+        SnykStatus::Done { total, severe } => info.push_str(&format!(
+            " · snyk: {total} vulnerabilities ({severe} high+)"
+        )),
+    }
+    if app.snyk_stale {
+        info.push_str(" · snyk results outdated, press s");
     }
     f.render_widget(
         Line::from(vec![" depsu ".black().on_cyan().bold(), info.into()]),
@@ -117,11 +130,14 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         log,
     );
 
-    let remove_hint = if app.has_unneeded() {
-        "   x remove ✂"
-    } else {
-        ""
-    };
+    // Hints for actions that only exist when there is something to act on.
+    let mut remove_hint = String::new();
+    if app.has_unneeded() {
+        remove_hint.push_str("   x remove ✂");
+    }
+    if app.rows.iter().any(|r| r.snyk_fix.is_some()) {
+        remove_hint.push_str("   f snyk fix");
+    }
     let footer: Line = if app.filter_mode {
         Line::from(vec![
             " /".cyan().bold(),
@@ -137,7 +153,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         ])
     } else {
         Line::from(
-            format!(" ↑/↓ move   space select   a all   i install   / filter   g group   o overrides   u up-to-date{remove_hint}   q quit")
+            format!(" ↑/↓ move   space select   a all   i install   / filter   g group   o overrides   u up-to-date   s snyk{remove_hint}   q quit")
                 .dark_gray(),
         )
     };
@@ -195,7 +211,7 @@ fn row_line(r: &AppRow, indent: usize, name_w: usize) -> Line<'static> {
         w = name_w - indent
     ))];
     spans.extend(marker);
-    spans.push(Span::raw(" ".repeat(3usize.saturating_sub(marker_w) + 1)));
+    spans.push(Span::raw(" ".repeat(4usize.saturating_sub(marker_w) + 1)));
     spans.push(Span::styled(
         format!("{:<4}", r.kind.label()),
         Style::new().fg(Color::DarkGray),
@@ -210,11 +226,26 @@ fn row_line(r: &AppRow, indent: usize, name_w: usize) -> Line<'static> {
     } else {
         spans.push(Span::styled("✓ up to date", Style::new().fg(Color::Green)));
     }
+    if let Some(fix) = &r.snyk_fix {
+        spans.push(Span::styled(
+            format!("   snyk fix: {}{fix}", r.prefix),
+            Style::new().fg(Color::Magenta),
+        ));
+    }
     let line = Line::from(spans);
     if r.busy() || !r.outdated {
         line.style(Style::new().add_modifier(Modifier::DIM))
     } else {
         line
+    }
+}
+
+fn severity_color(s: Severity) -> Color {
+    match s {
+        Severity::Critical => Color::Magenta,
+        Severity::High => Color::Red,
+        Severity::Medium => Color::Yellow,
+        Severity::Low => Color::Blue,
     }
 }
 
@@ -253,6 +284,16 @@ fn override_marker(r: &AppRow) -> (Vec<Span<'static>>, usize) {
         spans.push(Span::styled("↳", Style::new().fg(color)));
         width += 1;
     }
+    // ✱: Snyk found vulnerabilities, coloured by the worst severity.
+    if let Some(sev) = r.worst_severity() {
+        spans.push(Span::styled(
+            "✱",
+            Style::new()
+                .fg(severity_color(sev))
+                .add_modifier(Modifier::BOLD),
+        ));
+        width += 1;
+    }
     (spans, width)
 }
 
@@ -271,7 +312,7 @@ fn detail_lines(
     let o = match child {
         Child::Own(i) => r.overrides.get(i),
         Child::Tree(i) => r.tree_hits.get(i).map(|h| &h.over),
-        Child::More(_) => None,
+        Child::More(_) | Child::Vuln(_) | Child::MoreVulns(_) => None,
     };
     let update = o.and_then(|o| app.update_target(o));
     // Selection mark, only on override lines that can be updated.
@@ -325,6 +366,35 @@ fn detail_lines(
             }
             (format!("↳ {}", hit_text(h)), tail, color)
         }
+        Child::Vuln(i) => {
+            let v = &r.vulns[i];
+            let mut t = format!("✱ {:<8} {}  {}", v.severity.label(), v.id, v.title);
+            t.push_str(&format!("  · {}@{}", v.package, v.version));
+            if v.path.len() > 1 {
+                t.push_str(&format!(" via {}", v.path[..v.path.len() - 1].join(" > ")));
+            }
+            if let Some(cve) = v.cve.first() {
+                t.push_str(&format!("  · {cve}"));
+            }
+            if v.fixed_in.is_empty() {
+                t.push_str("  · no fix available");
+            } else if v.fixable {
+                t.push_str(&format!("  · fixed in {}", v.fixed_in.join(" / ")));
+            } else {
+                // A fixed release exists, but upgrading this dependency doesn't bring it in.
+                t.push_str(&format!(
+                    "  · fixed in {}, but not reachable by upgrading {}",
+                    v.fixed_in.join(" / "),
+                    v.direct
+                ));
+            }
+            (t, String::new(), severity_color(v.severity))
+        }
+        Child::MoreVulns(n) => (
+            format!("… +{n} more vulnerabilities (press o for all)"),
+            String::new(),
+            Color::DarkGray,
+        ),
         Child::More(n) => (
             format!("… +{n} more (press o for all)"),
             String::new(),

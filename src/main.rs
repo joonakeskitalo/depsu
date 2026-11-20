@@ -6,6 +6,7 @@ mod overrides;
 mod package;
 mod pm;
 mod registry;
+mod snyk;
 mod tree;
 mod ui;
 mod view;

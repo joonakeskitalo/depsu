@@ -1,0 +1,316 @@
+{
+ "ok": false,
+ "packageManager": "npm",
+ "projectName": "fixture",
+ "vulnerabilities": [
+  {
+   "id": "SNYK-JS-LODASH-1040724",
+   "title": "Code Injection",
+   "severity": "high",
+   "severityWithCritical": "high",
+   "packageName": "lodash",
+   "version": "4.17.15",
+   "from": [
+    "fixture@1.0.0",
+    "lodash@4.17.15"
+   ],
+   "upgradePath": [
+    false,
+    "lodash@4.17.21"
+   ],
+   "isUpgradable": true,
+   "isPatchable": false,
+   "fixedIn": [
+    "4.17.21"
+   ],
+   "cvssScore": 7.2,
+   "identifiers": {
+    "CVE": [
+     "CVE-2021-23337"
+    ]
+   }
+  },
+  {
+   "id": "SNYK-JS-LODASH-15053838",
+   "title": "Prototype Pollution",
+   "severity": "medium",
+   "severityWithCritical": "medium",
+   "packageName": "lodash",
+   "version": "4.17.15",
+   "from": [
+    "fixture@1.0.0",
+    "lodash@4.17.15"
+   ],
+   "upgradePath": [
+    false,
+    "lodash@4.17.23"
+   ],
+   "isUpgradable": true,
+   "isPatchable": false,
+   "fixedIn": [
+    "4.17.23"
+   ],
+   "cvssScore": 6.9,
+   "identifiers": {
+    "CVE": [
+     "CVE-2025-13465"
+    ]
+   }
+  },
+  {
+   "id": "SNYK-JS-LODASH-15869619",
+   "title": "Prototype Pollution",
+   "severity": "medium",
+   "severityWithCritical": "medium",
+   "packageName": "lodash",
+   "version": "4.17.15",
+   "from": [
+    "fixture@1.0.0",
+    "lodash@4.17.15"
+   ],
+   "upgradePath": [
+    false,
+    "lodash@4.18.1"
+   ],
+   "isUpgradable": true,
+   "isPatchable": false,
+   "fixedIn": [
+    "4.18.1"
+   ],
+   "cvssScore": 6.9,
+   "identifiers": {
+    "CVE": [
+     "CVE-2026-2950"
+    ]
+   }
+  },
+  {
+   "id": "SNYK-JS-LODASH-15869625",
+   "title": "Arbitrary Code Injection",
+   "severity": "high",
+   "severityWithCritical": "high",
+   "packageName": "lodash",
+   "version": "4.17.15",
+   "from": [
+    "fixture@1.0.0",
+    "lodash@4.17.15"
+   ],
+   "upgradePath": [
+    false,
+    "lodash@4.18.1"
+   ],
+   "isUpgradable": true,
+   "isPatchable": false,
+   "fixedIn": [
+    "4.18.1"
+   ],
+   "cvssScore": 8.6,
+   "identifiers": {
+    "CVE": [
+     "CVE-2026-4800"
+    ]
+   }
+  },
+  {
+   "id": "SNYK-JS-MINIMIST-2429795",
+   "title": "Prototype Pollution",
+   "severity": "low",
+   "severityWithCritical": "low",
+   "packageName": "minimist",
+   "version": "1.2.0",
+   "from": [
+    "fixture@1.0.0",
+    "minimist@1.2.0"
+   ],
+   "upgradePath": [
+    false,
+    "minimist@1.2.6"
+   ],
+   "isUpgradable": true,
+   "isPatchable": false,
+   "fixedIn": [
+    "0.2.4",
+    "1.2.6"
+   ],
+   "cvssScore": 3.7,
+   "identifiers": {
+    "CVE": [
+     "CVE-2021-44906"
+    ]
+   }
+  },
+  {
+   "id": "SNYK-JS-LODASH-1018905",
+   "title": "Regular Expression Denial of Service (ReDoS)",
+   "severity": "medium",
+   "severityWithCritical": "medium",
+   "packageName": "lodash",
+   "version": "4.17.15",
+   "from": [
+    "fixture@1.0.0",
+    "lodash@4.17.15"
+   ],
+   "upgradePath": [
+    false,
+    "lodash@4.17.21"
+   ],
+   "isUpgradable": true,
+   "isPatchable": false,
+   "fixedIn": [
+    "4.17.21"
+   ],
+   "cvssScore": 5.3,
+   "identifiers": {
+    "CVE": [
+     "CVE-2020-28500"
+    ]
+   }
+  },
+  {
+   "id": "SNYK-JS-LODASH-567746",
+   "title": "Prototype Pollution",
+   "severity": "high",
+   "severityWithCritical": "high",
+   "packageName": "lodash",
+   "version": "4.17.15",
+   "from": [
+    "fixture@1.0.0",
+    "lodash@4.17.15"
+   ],
+   "upgradePath": [
+    false,
+    "lodash@4.17.20"
+   ],
+   "isUpgradable": true,
+   "isPatchable": false,
+   "fixedIn": [
+    "4.17.20"
+   ],
+   "cvssScore": 8.2,
+   "identifiers": {
+    "CVE": [
+     "CVE-2020-8203"
+    ]
+   }
+  },
+  {
+   "id": "SNYK-JS-LODASH-608086",
+   "title": "Prototype Pollution",
+   "severity": "high",
+   "severityWithCritical": "high",
+   "packageName": "lodash",
+   "version": "4.17.15",
+   "from": [
+    "fixture@1.0.0",
+    "lodash@4.17.15"
+   ],
+   "upgradePath": [
+    false,
+    "lodash@4.17.17"
+   ],
+   "isUpgradable": true,
+   "isPatchable": false,
+   "fixedIn": [
+    "4.17.17"
+   ],
+   "cvssScore": 7.3,
+   "identifiers": {
+    "CVE": []
+   }
+  },
+  {
+   "id": "SNYK-JS-LODASH-6139239",
+   "title": "Prototype Pollution",
+   "severity": "high",
+   "severityWithCritical": "high",
+   "packageName": "lodash",
+   "version": "4.17.15",
+   "from": [
+    "fixture@1.0.0",
+    "lodash@4.17.15"
+   ],
+   "upgradePath": [
+    false,
+    "lodash@4.17.17"
+   ],
+   "isUpgradable": true,
+   "isPatchable": false,
+   "fixedIn": [
+    "4.17.17"
+   ],
+   "cvssScore": 7.5,
+   "identifiers": {
+    "CVE": []
+   }
+  },
+  {
+   "id": "SNYK-JS-MINIMIST-559764",
+   "title": "Prototype Pollution",
+   "severity": "medium",
+   "severityWithCritical": "medium",
+   "packageName": "minimist",
+   "version": "1.2.0",
+   "from": [
+    "fixture@1.0.0",
+    "minimist@1.2.0"
+   ],
+   "upgradePath": [
+    false,
+    "minimist@1.2.3"
+   ],
+   "isUpgradable": true,
+   "isPatchable": false,
+   "fixedIn": [
+    "0.2.1",
+    "1.2.3"
+   ],
+   "cvssScore": 5.6,
+   "identifiers": {
+    "CVE": [
+     "CVE-2020-7598"
+    ]
+   }
+  }
+ ],
+ "remediation": {
+  "ignore": null,
+  "pin": {},
+  "unresolved": [],
+  "upgrade": {
+   "lodash@4.17.15": {
+    "upgradeTo": "lodash@4.18.1",
+    "upgrades": [
+     "lodash@4.17.15",
+     "lodash@4.17.15",
+     "lodash@4.17.15",
+     "lodash@4.17.15",
+     "lodash@4.17.15",
+     "lodash@4.17.15",
+     "lodash@4.17.15",
+     "lodash@4.17.15"
+    ],
+    "vulns": [
+     "SNYK-JS-LODASH-1018905",
+     "SNYK-JS-LODASH-1040724",
+     "SNYK-JS-LODASH-15053838",
+     "SNYK-JS-LODASH-15869619",
+     "SNYK-JS-LODASH-15869625",
+     "SNYK-JS-LODASH-567746",
+     "SNYK-JS-LODASH-608086",
+     "SNYK-JS-LODASH-6139239"
+    ]
+   },
+   "minimist@1.2.0": {
+    "upgradeTo": "minimist@1.2.6",
+    "upgrades": [
+     "minimist@1.2.0",
+     "minimist@1.2.0"
+    ],
+    "vulns": [
+     "SNYK-JS-MINIMIST-2429795",
+     "SNYK-JS-MINIMIST-559764"
+    ]
+   }
+  }
+ }
+}

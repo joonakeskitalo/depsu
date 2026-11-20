@@ -68,6 +68,10 @@ pub enum Child {
     Tree(usize),
     /// Number of tree hits not listed.
     More(usize),
+    /// `Row::vulns[i]`: a Snyk finding.
+    Vuln(usize),
+    /// Number of Snyk findings not listed.
+    MoreVulns(usize),
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -124,19 +128,26 @@ pub enum Item {
     },
 }
 
-fn children(r: &Row, idx: usize, mode: Overrides) -> Vec<Item> {
-    if mode == Overrides::Off {
-        return Vec::new();
-    }
-    let mut kids: Vec<Child> = (0..r.overrides.len()).map(Child::Own).collect();
+fn children(r: &Row, idx: usize, mode: Overrides, vulns: bool) -> Vec<Item> {
     let cap = if mode == Overrides::Full {
         usize::MAX
     } else {
         COMPACT_TREE_HITS
     };
-    kids.extend((0..r.tree_hits.len().min(cap)).map(Child::Tree));
-    if r.tree_hits.len() > cap {
-        kids.push(Child::More(r.tree_hits.len() - cap));
+    let mut kids: Vec<Child> = Vec::new();
+    // Security findings first: they matter more than where overrides apply.
+    if vulns {
+        kids.extend((0..r.vulns.len().min(cap)).map(Child::Vuln));
+        if r.vulns.len() > cap {
+            kids.push(Child::MoreVulns(r.vulns.len() - cap));
+        }
+    }
+    if mode != Overrides::Off {
+        kids.extend((0..r.overrides.len()).map(Child::Own));
+        kids.extend((0..r.tree_hits.len().min(cap)).map(Child::Tree));
+        if r.tree_hits.len() > cap {
+            kids.push(Child::More(r.tree_hits.len() - cap));
+        }
     }
     let n = kids.len();
     kids.into_iter()
@@ -149,7 +160,8 @@ fn children(r: &Row, idx: usize, mode: Overrides) -> Vec<Item> {
             key: match child {
                 Child::Own(i) => r.overrides[i].key(),
                 Child::Tree(i) => r.tree_hits[i].over.key(),
-                Child::More(_) => String::new(),
+                Child::Vuln(i) => format!("vuln:{}", r.vulns[i].id),
+                Child::More(_) | Child::MoreVulns(_) => String::new(),
             },
         })
         .collect()
@@ -184,6 +196,7 @@ pub fn build(
     filter: &str,
     ov: Overrides,
     uptodate: bool,
+    vulns: bool,
 ) -> Vec<Item> {
     let needle = filter.trim().to_lowercase();
     let mut visible: Vec<usize> = (0..rows.len())
@@ -197,7 +210,7 @@ pub fn build(
             idx: i,
             name: rows[i].name.clone(),
         }];
-        v.extend(children(&rows[i], i, ov));
+        v.extend(children(&rows[i], i, ov, vulns));
         v
     };
 
@@ -267,6 +280,8 @@ mod tests {
             compat: Compat::Ok,
             tree_hits: Vec::new(),
             outdated: true,
+            vulns: Vec::new(),
+            snyk_fix: None,
         }
     }
 
@@ -302,7 +317,14 @@ mod tests {
 
     #[test]
     fn groups_by_release_patch_first() {
-        let items = build(&sample(), GroupBy::Release, "", Overrides::Compact, true);
+        let items = build(
+            &sample(),
+            GroupBy::Release,
+            "",
+            Overrides::Compact,
+            true,
+            true,
+        );
         assert_eq!(
             labels(&items),
             [
@@ -320,7 +342,14 @@ mod tests {
 
     #[test]
     fn groups_by_prefix() {
-        let items = build(&sample(), GroupBy::Prefix, "", Overrides::Compact, true);
+        let items = build(
+            &sample(),
+            GroupBy::Prefix,
+            "",
+            Overrides::Compact,
+            true,
+            true,
+        );
         assert_eq!(
             labels(&items),
             [
@@ -344,9 +373,20 @@ mod tests {
             "ESLINT",
             Overrides::Compact,
             true,
+            true,
         );
         assert_eq!(labels(&items), ["# eslint-*", "eslint", "eslint-plugin-a"]);
-        assert!(build(&sample(), GroupBy::None, "zzz", Overrides::Compact, true).is_empty());
+        assert!(
+            build(
+                &sample(),
+                GroupBy::None,
+                "zzz",
+                Overrides::Compact,
+                true,
+                true
+            )
+            .is_empty()
+        );
     }
 
     fn hit(name: &str, risk: crate::overrides::Compat) -> crate::tree::Hit {
@@ -374,7 +414,7 @@ mod tests {
         rows[0].tree_hits = (0..7).map(|i| hit(&format!("t{i}"), Compat::Ok)).collect();
 
         let kinds = |mode| -> Vec<String> {
-            build(&rows, GroupBy::None, "", mode, true)
+            build(&rows, GroupBy::None, "", mode, true, true)
                 .iter()
                 .map(|i| match i {
                     Item::Row { name, .. } => name.clone(),
@@ -411,15 +451,29 @@ mod tests {
                 })
                 .collect()
         };
-        let flat = names(&build(&rows, GroupBy::None, "", Overrides::Off, true));
+        let flat = names(&build(&rows, GroupBy::None, "", Overrides::Off, true, true));
         assert_eq!(flat.last().unwrap(), "@babel/core");
         assert_eq!(flat.len(), 5);
-        let grouped = names(&build(&rows, GroupBy::Release, "", Overrides::Off, true));
+        let grouped = names(&build(
+            &rows,
+            GroupBy::Release,
+            "",
+            Overrides::Off,
+            true,
+            true,
+        ));
         assert_eq!(
             &grouped[grouped.len() - 2..],
             ["# Up to date", "@babel/core"]
         );
-        let hidden = names(&build(&rows, GroupBy::None, "", Overrides::Off, false));
+        let hidden = names(&build(
+            &rows,
+            GroupBy::None,
+            "",
+            Overrides::Off,
+            false,
+            true,
+        ));
         assert!(!hidden.contains(&"@babel/core".to_string()));
         assert_eq!(hidden.len(), 4);
     }
