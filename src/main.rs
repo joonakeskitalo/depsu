@@ -28,10 +28,18 @@ OPTIONS:
     -V, --version      Print version
 
 KEYS:
-    up/down, j/k   move        space  select one       a  select all / none
+    up/down, j/k   move                 home/end  first / last
+    space          select (package, group header or override line)
+    a              select all / none
+    i, enter       install the selected packages (or the highlighted one)
     /              filter by name (enter keeps it, esc clears it)
-    g              cycle grouping: none, release type, name prefix
-    i, enter       install selected (or the highlighted row)
+    g              group by: none, release type, name prefix
+    u              show / hide up-to-date packages
+    o              overrides: hidden, compact, full
+    x              remove overrides marked as unneeded (press twice to confirm)
+    s              scan with Snyk
+    f              install the version Snyk suggests
+    v              show / hide Snyk findings
     q, esc         quit";
 
 fn main() -> Result<()> {
