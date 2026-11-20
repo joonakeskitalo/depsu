@@ -1,0 +1,238 @@
+{
+ "body-parser": [
+  {
+   "id": 1123977,
+   "url": "https://github.com/advisories/GHSA-v422-hmwv-36x6",
+   "title": "body-parser vulnerable to denial of service when invalid limit value silently disables size enforcement",
+   "severity": "low",
+   "vulnerable_versions": "<1.20.6",
+   "cwe": [
+    "CWE-770"
+   ]
+  },
+  {
+   "id": 1099520,
+   "url": "https://github.com/advisories/GHSA-qwcr-r2fm-qrc7",
+   "title": "body-parser vulnerable to denial of service when url encoding is enabled",
+   "severity": "high",
+   "vulnerable_versions": "<1.20.3",
+   "cwe": [
+    "CWE-405"
+   ]
+  },
+  {
+   "id": 1243073,
+   "url": "https://github.com/advisories/GHSA-27r3-jxmh-p828",
+   "title": "body-parser vulnerable to Denial of Service via trailing bytes after a compressed request body",
+   "severity": "high",
+   "vulnerable_versions": "<1.20.9",
+   "cwe": [
+    "CWE-248"
+   ]
+  }
+ ],
+ "cookie": [
+  {
+   "id": 1103907,
+   "url": "https://github.com/advisories/GHSA-pxg6-pf52-xh8x",
+   "title": "cookie accepts cookie name, path, and domain with out of bounds characters",
+   "severity": "low",
+   "vulnerable_versions": "<0.7.0",
+   "cwe": [
+    "CWE-74"
+   ]
+  }
+ ],
+ "express": [
+  {
+   "id": 1100530,
+   "url": "https://github.com/advisories/GHSA-qw6h-vgh9-j6wx",
+   "title": "express vulnerable to XSS via response.redirect()",
+   "severity": "low",
+   "vulnerable_versions": "<4.20.0",
+   "cwe": [
+    "CWE-79"
+   ]
+  },
+  {
+   "id": 1111636,
+   "url": "https://github.com/advisories/GHSA-rv95-896h-c2vc",
+   "title": "Express.js Open Redirect in malformed URLs",
+   "severity": "moderate",
+   "vulnerable_versions": "<4.19.2",
+   "cwe": [
+    "CWE-601",
+    "CWE-1286"
+   ]
+  }
+ ],
+ "form-data": [
+  {
+   "id": 1109540,
+   "url": "https://github.com/advisories/GHSA-fjxv-7rqg-78g4",
+   "title": "form-data uses unsafe random function in form-data for choosing boundary",
+   "severity": "critical",
+   "vulnerable_versions": "<2.5.4",
+   "cwe": [
+    "CWE-330"
+   ]
+  },
+  {
+   "id": 1120745,
+   "url": "https://github.com/advisories/GHSA-hmw2-7cc7-3qxx",
+   "title": "form-data: CRLF injection in form-data via unescaped multipart field names and filenames",
+   "severity": "high",
+   "vulnerable_versions": "<2.5.6",
+   "cwe": [
+    "CWE-93"
+   ]
+  }
+ ],
+ "path-to-regexp": [
+  {
+   "id": 1101850,
+   "url": "https://github.com/advisories/GHSA-9wv6-86v2-598j",
+   "title": "path-to-regexp outputs backtracking regular expressions",
+   "severity": "high",
+   "vulnerable_versions": "<0.1.10",
+   "cwe": [
+    "CWE-1333"
+   ]
+  },
+  {
+   "id": 1105199,
+   "url": "https://github.com/advisories/GHSA-rhx6-c78j-4q9w",
+   "title": "path-to-regexp contains a ReDoS",
+   "severity": "high",
+   "vulnerable_versions": "<0.1.12",
+   "cwe": [
+    "CWE-1333"
+   ]
+  },
+  {
+   "id": 1115527,
+   "url": "https://github.com/advisories/GHSA-37ch-88jc-xwx2",
+   "title": "path-to-regexp vulnerable to Regular Expression Denial of Service via multiple route parameters",
+   "severity": "high",
+   "vulnerable_versions": "<0.1.13",
+   "cwe": [
+    "CWE-1333"
+   ]
+  }
+ ],
+ "qs": [
+  {
+   "id": 1104120,
+   "url": "https://github.com/advisories/GHSA-hrpp-h998-j3pp",
+   "title": "qs vulnerable to Prototype Pollution",
+   "severity": "high",
+   "vulnerable_versions": ">=6.7.0 <6.7.3",
+   "cwe": [
+    "CWE-1321"
+   ]
+  },
+  {
+   "id": 1158507,
+   "url": "https://github.com/advisories/GHSA-4mjr-xmp4-gh2g",
+   "title": "qs: Denial of Service via Attacker Controlled isBuffer",
+   "severity": "moderate",
+   "vulnerable_versions": ">=2.2.5 <6.16.0",
+   "cwe": [
+    "CWE-248",
+    "CWE-703"
+   ]
+  },
+  {
+   "id": 1113161,
+   "url": "https://github.com/advisories/GHSA-w7fw-mjwx-w883",
+   "title": "qs's arrayLimit bypass in comma parsing allows denial of service",
+   "severity": "low",
+   "vulnerable_versions": ">=6.7.0 <=6.14.1",
+   "cwe": [
+    "CWE-20"
+   ]
+  },
+  {
+   "id": 1113719,
+   "url": "https://github.com/advisories/GHSA-6rw7-vpxm-498p",
+   "title": "qs's arrayLimit bypass in its bracket notation allows DoS via memory exhaustion",
+   "severity": "moderate",
+   "vulnerable_versions": "<6.14.1",
+   "cwe": [
+    "CWE-20"
+   ]
+  },
+  {
+   "id": 1243687,
+   "url": "https://github.com/advisories/GHSA-6pq8-jhm2-2vcw",
+   "title": "qs : qs.stringify with arrayFormat 'comma' throws an uncaught TypeError on array elements carrying a non-callable own toString (DoS)",
+   "severity": "moderate",
+   "vulnerable_versions": ">=6.7.0 <=6.16.0",
+   "cwe": [
+    "CWE-248",
+    "CWE-704"
+   ]
+  }
+ ],
+ "request": [
+  {
+   "id": 1096727,
+   "url": "https://github.com/advisories/GHSA-p8p7-x288-28g6",
+   "title": "Server-Side Request Forgery in Request",
+   "severity": "moderate",
+   "vulnerable_versions": "<=2.88.2",
+   "cwe": [
+    "CWE-918"
+   ]
+  }
+ ],
+ "send": [
+  {
+   "id": 1109556,
+   "url": "https://github.com/advisories/GHSA-m6fv-jmcg-4jfg",
+   "title": "send vulnerable to template injection that can lead to XSS",
+   "severity": "low",
+   "vulnerable_versions": "<0.19.0",
+   "cwe": [
+    "CWE-79"
+   ]
+  }
+ ],
+ "serve-static": [
+  {
+   "id": 1100528,
+   "url": "https://github.com/advisories/GHSA-cm22-4g7w-348p",
+   "title": "serve-static vulnerable to template injection that can lead to XSS",
+   "severity": "low",
+   "vulnerable_versions": "<1.16.0",
+   "cwe": [
+    "CWE-79"
+   ]
+  }
+ ],
+ "tough-cookie": [
+  {
+   "id": 1097682,
+   "url": "https://github.com/advisories/GHSA-72xf-g2v4-qvf3",
+   "title": "tough-cookie Prototype Pollution vulnerability",
+   "severity": "moderate",
+   "vulnerable_versions": "<4.1.3",
+   "cwe": [
+    "CWE-1321"
+   ]
+  }
+ ],
+ "uuid": [
+  {
+   "id": 1119441,
+   "url": "https://github.com/advisories/GHSA-w5hq-g745-h8pq",
+   "title": "uuid: Missing buffer bounds check in v3/v5/v6 when buf is provided",
+   "severity": "moderate",
+   "vulnerable_versions": "<11.1.1",
+   "cwe": [
+    "CWE-787",
+    "CWE-1285"
+   ]
+  }
+ ]
+}

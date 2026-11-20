@@ -1,120 +1,12 @@
 //! Snyk integration: runs `snyk test --json` and turns the result into per-dependency
 //! vulnerabilities and the upgrade versions Snyk suggests.
 
+use crate::vuln::{Report, Severity, Source, Vuln};
 use semver::Version;
 use serde_json::Value;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::path::Path;
 use std::process::Command;
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub enum Severity {
-    Low,
-    Medium,
-    High,
-    Critical,
-}
-
-impl Severity {
-    fn parse(s: &str) -> Self {
-        match s {
-            "critical" => Severity::Critical,
-            "high" => Severity::High,
-            "medium" => Severity::Medium,
-            _ => Severity::Low,
-        }
-    }
-
-    pub fn label(self) -> &'static str {
-        match self {
-            Severity::Low => "low",
-            Severity::Medium => "medium",
-            Severity::High => "high",
-            Severity::Critical => "critical",
-        }
-    }
-}
-
-#[derive(Clone, Debug)]
-pub struct Vuln {
-    pub id: String,
-    pub title: String,
-    pub severity: Severity,
-    /// The vulnerable package and its installed version.
-    pub package: String,
-    pub version: String,
-    /// The project's direct dependency that brings it in (equal to `package` for direct ones).
-    pub direct: String,
-    /// Packages below the direct dependency down to the vulnerable one (empty if it is the
-    /// direct dependency itself).
-    pub path: Vec<String>,
-    /// Versions of the vulnerable package that fix it, across all its release lines.
-    pub fixed_in: Vec<String>,
-    /// The version of the direct dependency that fixes this finding, if upgrading it does.
-    pub upgrade_to: Option<String>,
-    /// For a transitive finding: the version of the vulnerable package that upgrade brings in.
-    pub upgrade_brings: Option<String>,
-    pub cve: Vec<String>,
-}
-
-impl Vuln {
-    /// Releases of the vulnerable package that fix this finding and are newer than the
-    /// installed one. Snyk lists the fixed version of every older release line too, which is
-    /// of no use here.
-    pub fn newer_fixes(&self) -> Vec<&str> {
-        let installed = Version::parse(&self.version).ok();
-        let mut fixes: Vec<(Option<Version>, &str)> = self
-            .fixed_in
-            .iter()
-            .map(|f| (Version::parse(f).ok(), f.as_str()))
-            .filter(|(v, _)| match (v, &installed) {
-                (Some(v), Some(i)) => v > i,
-                _ => true, // can't compare: keep it rather than hide a fix
-            })
-            .collect();
-        fixes.sort_by(|a, b| a.0.cmp(&b.0));
-        fixes.into_iter().map(|(_, s)| s).collect()
-    }
-
-    /// What to do about this finding, from the point of view of the direct dependency.
-    pub fn fix_summary(&self) -> String {
-        if let Some(to) = &self.upgrade_to {
-            return match &self.upgrade_brings {
-                None => format!("fixed in {} {to}", self.direct),
-                Some(nested) => format!(
-                    "fixed by upgrading {} to {to} (brings {} {nested})",
-                    self.direct, self.package
-                ),
-            };
-        }
-        let fixes = self.newer_fixes();
-        if fixes.is_empty() {
-            return "no fix available".to_string();
-        }
-        let shown: Vec<&str> = fixes.iter().take(3).copied().collect();
-        let more = if fixes.len() > 3 { " …" } else { "" };
-        let who = if self.path.is_empty() {
-            self.package.clone()
-        } else {
-            format!("{} (in {})", self.package, self.direct)
-        };
-        format!(
-            "{} {}{more} has the fix, but upgrading {} doesn't bring it in",
-            who,
-            shown.join(" / "),
-            self.direct
-        )
-    }
-}
-
-#[derive(Clone, Debug, Default)]
-pub struct Report {
-    pub vulns: Vec<Vuln>,
-    /// The version Snyk suggests for each direct dependency to fix what can be fixed.
-    pub fixes: HashMap<String, Version>,
-    /// Problems with some projects of a multi-project scan that didn't stop the others.
-    pub warnings: Vec<String>,
-}
 
 /// Splits `name@version`, where the name may itself start with `@scope/`.
 fn split_pkg(s: &str) -> Option<(&str, &str)> {
@@ -210,6 +102,7 @@ pub fn parse(text: &str) -> Result<Report, String> {
                 .map(Severity::parse)
                 .unwrap_or(Severity::Low);
             report.vulns.push(Vuln {
+                source: Source::Snyk,
                 id: id.to_string(),
                 title: v
                     .get("title")
@@ -227,6 +120,9 @@ pub fn parse(text: &str) -> Result<Report, String> {
                 fixed_in: strings(v.get("fixedIn")),
                 upgrade_to,
                 upgrade_brings,
+                upgrade_major: false,
+                range: None,
+                fix_note: None,
                 cve: strings(v.get("identifiers").and_then(|i| i.get("CVE"))),
             });
         }

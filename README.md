@@ -29,7 +29,8 @@ Illustrative output:
   prefix, and filter by name.
 - **Overrides.** Shows overridden packages, checks that an update is compatible with the override,
   finds overrides that are probably no longer needed, and can update or remove them.
-- **Snyk.** Lists vulnerabilities per dependency and installs Snyk's suggested version.
+- **Vulnerabilities.** Lists vulnerabilities per dependency from Snyk, `npm audit` or `bun audit`,
+  and installs the version they suggest.
 
 ## Install
 
@@ -72,8 +73,10 @@ depsu --pm pnpm       # skip detection
 | `o` | Overrides: hidden → compact → full |
 | `x` | Remove overrides marked `✂` (press twice to confirm) |
 | `s` | Scan with Snyk |
+| `n` | Run `npm audit` / `bun audit` (whichever the project uses) |
 | `f` | Install the version Snyk suggests |
-| `v` | Show / hide Snyk findings |
+| `F` | Install the version `npm audit` / `bun audit` suggests |
+| `v` | Show / hide vulnerability findings |
 | `q` / `Esc` | Quit (press twice while an install is running) |
 
 `a`, `i` and `f` act only on the packages currently shown, so a filter narrows what they touch.
@@ -135,7 +138,7 @@ them under each package.
 | `⚠` | The update conflicts with its override |
 | `?` | The override can't be interpreted (URL, alias, odd range) |
 | `↳` | An override applies somewhere in the package's installed dependency tree (yellow if it forces a version outside what the parent declares) |
-| `✱` | Snyk found vulnerabilities (coloured by worst severity) |
+| `✱` | A scan found vulnerabilities (coloured by worst severity) |
 
 **Compatibility.** npm requires an override on a direct dependency to have the exact same spec as
 the dependency (or be `$name`), otherwise it fails with `EOVERRIDE`. yarn, pnpm and bun let the
@@ -181,6 +184,37 @@ counts against your organisation's test quota**, so it never runs automatically.
 - After an install, the findings of updated packages are dropped and the top bar says the results
   are outdated. Press `s` to rescan.
 
+### npm audit and bun audit
+
+`n` runs the project's own audit command: `npm audit --json` for npm projects, `bun audit --json`
+for bun projects (a Bun new enough to have `bun audit`). Nothing leaves your machine except the
+package list the command itself sends to your registry, and no account is needed. Yarn and pnpm
+projects can't be audited this way (use Snyk, which works with any package manager).
+
+The findings look like Snyk's and are tagged `[npm audit]` or `[bun audit]`, so both can be shown
+at once. A rescan replaces only the findings of that tool.
+
+Neither tool says which direct dependency a finding belongs to or which installed copy is
+affected, so `depsu` matches the advisories against the installed tree in `node_modules`: every
+copy whose version is in the advisory's affected range is listed under each direct dependency
+that reaches it, with the path to it and its installed version. This needs installed dependencies;
+without `node_modules` the scan stops with a message.
+
+Suggested fixes:
+
+- **npm:** uses `fixAvailable` from the report. If the direct dependency's own entry says
+  upgrading it fixes it, that is what each finding under it shows (`fixed by upgrading express to
+  4.22.3`, with `(breaking)` for a semver-major upgrade). `F` installs it, keeping your range
+  prefix. When npm can fix something only by updating the lockfile, the finding says so
+  (`run npm audit fix`), since no `package.json` version is involved.
+- **bun:** uses the plan from `bun audit fix --dry-run --json`, which changes nothing. A direct
+  dependency that Bun would upgrade in `package.json` gets that version. Findings Bun can't fix
+  say which dependent blocks them (`qs 6.16.1 has the fix, but express@4.17.1 requires 6.7.0`),
+  per installed copy.
+
+`npm audit` doesn't report CVE numbers or fixed-version lists, so those parts of a Snyk finding
+are replaced by the advisory's affected range.
+
 ## Development
 
 ```sh
@@ -200,7 +234,7 @@ Source layout:
 | `registry.rs`, `npmrc.rs`, `bunfig.rs`, `yarnrc.rs` | Registry access and configuration |
 | `pm.rs`, `package.rs`, `edit.rs` | Package manager detection and commands, `package.json` reading and editing |
 | `overrides.rs`, `tree.rs` | Override parsing, compatibility, unneeded detection, dependency tree walk |
-| `snyk.rs` | Snyk CLI integration. `tests/fixtures/` holds real and hand-written Snyk output |
+| `snyk.rs`, `audit.rs`, `vuln.rs` | Snyk CLI integration, `npm audit` / `bun audit` integration, and the finding type they share. `tests/fixtures/` holds real and hand-written output |
 
 ## Limitations
 
@@ -209,4 +243,7 @@ Source layout:
   Yarn Classic still gets its registry from `.npmrc`.
 - Override analysis reads `node_modules`, so it finds nothing with Yarn Plug'n'Play or before the
   first install, and it does not predict the dependency tree of a new version.
+- `npm audit` / `bun audit` findings are traced through `node_modules`, so they need installed
+  dependencies. Bun's plan comes from `bun audit fix --dry-run`, which I could only check with
+  Bun 1.4.5. Older Bun versions have no `bun audit`.
 - Not tested on Windows.

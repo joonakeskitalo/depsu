@@ -282,6 +282,7 @@ mod tests {
             outdated: true,
             vulns: Vec::new(),
             snyk_fix: None,
+            audit_fix: None,
         }
     }
 

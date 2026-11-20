@@ -1,4 +1,5 @@
 mod app;
+mod audit;
 mod bunfig;
 mod edit;
 mod npmrc;
@@ -10,6 +11,7 @@ mod snyk;
 mod tree;
 mod ui;
 mod view;
+mod vuln;
 mod yarnrc;
 
 use anyhow::{Result, bail};
@@ -39,8 +41,10 @@ KEYS:
     o              overrides: hidden, compact, full
     x              remove overrides marked as unneeded (press twice to confirm)
     s              scan with Snyk
+    n              run npm audit / bun audit (by the project's package manager)
     f              install the version Snyk suggests
-    v              show / hide Snyk findings
+    F              install the version npm audit / bun audit suggests
+    v              show / hide vulnerability findings
     q, esc         quit";
 
 fn main() -> Result<()> {

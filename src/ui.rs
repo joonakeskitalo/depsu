@@ -1,9 +1,10 @@
-use crate::app::{App, Row as AppRow, SnykStatus, Status};
+use crate::app::{App, Row as AppRow, ScanStatus, Status, fix_key, scan_key};
+use crate::audit;
 use crate::overrides::{self, Compat, Override};
 use crate::pm::Pm;
-use crate::snyk::Severity;
 use crate::tree::{self, Hit};
 use crate::view::{Child, GroupBy, Item, Overrides, Release, UNNEEDED};
+use crate::vuln::{Severity, Source};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout};
 use ratatui::style::{Color, Modifier, Style, Stylize};
@@ -50,17 +51,24 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     if !app.show_uptodate {
         info.push_str(" · up-to-date hidden");
     }
-    match app.snyk_status {
-        SnykStatus::NotRun => {}
-        SnykStatus::Running => info.push_str(" · snyk: scanning…"),
-        SnykStatus::Failed => info.push_str(" · snyk: failed (see log)"),
-        SnykStatus::Done { total: 0, .. } => info.push_str(" · snyk: clean"),
-        SnykStatus::Done { total, severe } => info.push_str(&format!(
-            " · snyk: {total} vulnerabilities ({severe} high+)"
-        )),
-    }
-    if app.snyk_stale {
-        info.push_str(" · snyk results outdated, press s");
+    let audit_source = app.audit_source();
+    for (source, scan) in [(Source::Snyk, &app.snyk), (audit_source, &app.audit)] {
+        let label = source.label();
+        match scan.status {
+            ScanStatus::NotRun => {}
+            ScanStatus::Running => info.push_str(&format!(" · {label}: scanning…")),
+            ScanStatus::Failed => info.push_str(&format!(" · {label}: failed (see log)")),
+            ScanStatus::Done { total: 0, .. } => info.push_str(&format!(" · {label}: clean")),
+            ScanStatus::Done { total, severe } => info.push_str(&format!(
+                " · {label}: {total} vulnerabilities ({severe} high+)"
+            )),
+        }
+        if scan.stale {
+            info.push_str(&format!(
+                " · {label} results outdated, press {}",
+                scan_key(source)
+            ));
+        }
     }
     f.render_widget(
         Line::from(vec![" depsu ".black().on_cyan().bold(), info.into()]),
@@ -135,9 +143,19 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     if app.has_unneeded() {
         remove_hint.push_str("   x remove ✂");
     }
-    if app.rows.iter().any(|r| r.snyk_fix.is_some()) {
-        remove_hint.push_str("   f snyk fix");
+    for source in [Source::Snyk, app.audit_source()] {
+        if app.rows.iter().any(|r| r.fix_of(source).is_some()) {
+            remove_hint.push_str(&format!(
+                "   {} {} fix",
+                fix_key(source),
+                if source.is_audit() { "audit" } else { "snyk" }
+            ));
+        }
     }
+    let audit_hint = match audit::source_for(app.pm) {
+        Some(src) => format!("   n {}", src.label()),
+        None => String::new(),
+    };
     let footer: Line = if app.filter_mode {
         Line::from(vec![
             " /".cyan().bold(),
@@ -153,7 +171,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         ])
     } else {
         Line::from(
-            format!(" ↑/↓ move   space select   a all   i install   / filter   g group   o overrides   u up-to-date   s snyk{remove_hint}   q quit")
+            format!(" ↑/↓ move   space select   a all   i install   / filter   g group   o overrides   u up-to-date   s snyk{audit_hint}{remove_hint}   q quit")
                 .dark_gray(),
         )
     };
@@ -226,11 +244,13 @@ fn row_line(r: &AppRow, indent: usize, name_w: usize) -> Line<'static> {
     } else {
         spans.push(Span::styled("✓ up to date", Style::new().fg(Color::Green)));
     }
-    if let Some(fix) = &r.snyk_fix {
-        spans.push(Span::styled(
-            format!("   snyk fix: {}{fix}", r.prefix),
-            Style::new().fg(Color::Magenta),
-        ));
+    for (label, fix) in [("snyk", &r.snyk_fix), ("audit", &r.audit_fix)] {
+        if let Some(fix) = fix {
+            spans.push(Span::styled(
+                format!("   {label} fix: {}{fix}", r.prefix),
+                Style::new().fg(Color::Magenta),
+            ));
+        }
     }
     let line = Line::from(spans);
     if r.busy() || !r.outdated {
@@ -368,8 +388,17 @@ fn detail_lines(
         }
         Child::Vuln(i) => {
             let v = &r.vulns[i];
-            let mut t = format!("✱ {:<8} {}  {}", v.severity.label(), v.id, v.title);
+            let mut t = format!(
+                "✱ {:<8} [{}] {}  {}",
+                v.severity.label(),
+                v.source.label(),
+                v.id,
+                v.title
+            );
             t.push_str(&format!("  · {}@{}", v.package, v.version));
+            if let Some(range) = &v.range {
+                t.push_str(&format!(" (affected {range})"));
+            }
             if v.path.len() > 1 {
                 t.push_str(&format!(" via {}", v.path[..v.path.len() - 1].join(" > ")));
             }

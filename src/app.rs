@@ -1,14 +1,16 @@
 //! Application state, background workers and key handling.
 
+use crate::audit;
 use crate::edit::{self, Change};
 use crate::npmrc::Npmrc;
 use crate::overrides::{self, Compat, Override, Unneeded};
 use crate::package::{self, Dep, Kind, parse_spec};
 use crate::pm::Pm;
 use crate::registry;
-use crate::snyk::{self, Report, Severity, Vuln};
+use crate::snyk;
 use crate::tree::{Analyzer, Hit};
 use crate::view::{self, Child, GroupBy, Item, Overrides, Release, UNNEEDED};
+use crate::vuln::{Report, Severity, Source, Vuln};
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::widgets::ListState;
 use semver::Version;
@@ -30,7 +32,10 @@ pub enum Event {
     },
     /// Overrides that look unnecessary, by key. Empty when it can't be determined.
     Unneeded(Vec<(String, Unneeded)>),
-    Snyk(Result<Report, String>),
+    Scan {
+        source: Source,
+        result: Result<Report, String>,
+    },
     InstallStarted {
         names: Vec<String>,
     },
@@ -74,10 +79,13 @@ pub struct Row {
     pub compat: Compat,
     /// Overrides applying anywhere in the installed dependency tree of this package.
     pub tree_hits: Vec<Hit>,
-    /// Snyk findings in this dependency or anything it brings in, worst first.
+    /// Vulnerabilities (Snyk, npm audit, bun audit) in this dependency or anything it brings
+    /// in, worst first.
     pub vulns: Vec<Vuln>,
     /// The version Snyk suggests to fix them.
     pub snyk_fix: Option<Version>,
+    /// The version `npm audit` / `bun audit` suggests to fix them.
+    pub audit_fix: Option<Version>,
 }
 
 impl Row {
@@ -98,9 +106,18 @@ impl Row {
         self.outdated && !self.busy()
     }
 
-    /// Can be checked with `space`: there is a newer version or a Snyk fix to install.
+    /// Can be checked with `space`: there is a newer version or a security fix to install.
     pub fn can_select(&self) -> bool {
-        !self.busy() && (self.outdated || self.snyk_fix.is_some())
+        !self.busy() && (self.outdated || self.snyk_fix.is_some() || self.audit_fix.is_some())
+    }
+
+    /// The version a vulnerability scanner suggests installing.
+    pub fn fix_of(&self, source: Source) -> Option<&Version> {
+        if source.is_audit() {
+            self.audit_fix.as_ref()
+        } else {
+            self.snyk_fix.as_ref()
+        }
     }
 
     pub fn worst_severity(&self) -> Option<Severity> {
@@ -122,12 +139,25 @@ struct Job {
     keys: Vec<String>,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub enum SnykStatus {
+#[derive(Clone, Copy, PartialEq, Eq, Default)]
+pub enum ScanStatus {
+    #[default]
     NotRun,
     Running,
-    Done { total: usize, severe: usize },
+    Done {
+        total: usize,
+        severe: usize,
+    },
     Failed,
+}
+
+/// State of one vulnerability scanner.
+#[derive(Default)]
+pub struct Scan {
+    pub status: ScanStatus,
+    /// An install finished since the last scan: the findings may be out of date.
+    pub stale: bool,
+    report: Option<Report>,
 }
 
 pub struct App {
@@ -137,9 +167,8 @@ pub struct App {
     pub show_overrides: Overrides,
     pub show_uptodate: bool,
     pub show_vulns: bool,
-    pub snyk_status: SnykStatus,
-    /// Install finished since the last scan: the findings may be out of date.
-    pub snyk_stale: bool,
+    pub snyk: Scan,
+    pub audit: Scan,
     pub view: Vec<Item>,
     pub group_by: GroupBy,
     pub filter: String,
@@ -165,7 +194,6 @@ pub struct App {
     /// False until the first key press: the cursor then stays at the top of the package list.
     cursor_moved: bool,
     tree_tx: Option<Sender<TreeMsg>>,
-    snyk_report: Option<Report>,
     events_tx: Sender<Event>,
     /// Target version of each package being installed.
     install_targets: HashMap<String, Version>,
@@ -260,8 +288,8 @@ impl App {
             show_overrides: Overrides::Off,
             show_uptodate: true,
             show_vulns: true,
-            snyk_status: SnykStatus::NotRun,
-            snyk_stale: false,
+            snyk: Scan::default(),
+            audit: Scan::default(),
             view: Vec::new(),
             group_by: GroupBy::None,
             filter: String::new(),
@@ -283,7 +311,6 @@ impl App {
             confirm_remove: false,
             cursor_moved: false,
             tree_tx,
-            snyk_report: None,
             events_tx,
             install_targets: HashMap::new(),
             confirm_conflicts: None,
@@ -320,7 +347,7 @@ impl App {
                     }
                 }
                 Event::Tree { name, hits } => self.on_tree(name, hits),
-                Event::Snyk(result) => self.on_snyk(result),
+                Event::Scan { source, result } => self.on_scan(source, result),
                 Event::Unneeded(found) => {
                     self.unneeded = found.into_iter().collect();
                     self.rebuild_view();
@@ -377,6 +404,7 @@ impl App {
             tree_hits: Vec::new(),
             vulns: Vec::new(),
             snyk_fix: None,
+            audit_fix: None,
         };
         // Packages that are already up to date are listed too, so their overrides are visible.
         let compat = if outdated {
@@ -429,9 +457,12 @@ impl App {
                     // The old findings no longer describe what is installed.
                     r.vulns.clear();
                     r.snyk_fix = None;
+                    r.audit_fix = None;
                 }
-                if !names.is_empty() && self.snyk_report.is_some() {
-                    self.snyk_stale = true;
+                if !names.is_empty() {
+                    for scan in [&mut self.snyk, &mut self.audit] {
+                        scan.stale |= scan.report.is_some();
+                    }
                 }
             }
             Err(e) => {
@@ -509,8 +540,13 @@ impl App {
     }
 
     fn insert_row(&mut self, mut row: Row) {
-        if let Some(rep) = &self.snyk_report {
-            apply_snyk(rep, &mut row);
+        for (source, scan) in [
+            (Source::Snyk, &self.snyk),
+            (self.audit_source(), &self.audit),
+        ] {
+            if let Some(rep) = &scan.report {
+                apply_report(source, rep, &mut row);
+            }
         }
         // Keep rows sorted by (kind, name) so late arrivals don't shuffle randomly.
         let key = |r: &Row| (r.kind.label(), r.name.clone());
@@ -692,7 +728,7 @@ impl App {
         }
         if !matches!(
             key.code,
-            KeyCode::Char('i') | KeyCode::Char('f') | KeyCode::Enter
+            KeyCode::Char('i') | KeyCode::Char('f') | KeyCode::Char('F') | KeyCode::Enter
         ) {
             self.confirm_conflicts = None;
         }
@@ -746,8 +782,10 @@ impl App {
             }
             KeyCode::Char('i') | KeyCode::Enter => self.install_selected(),
             KeyCode::Char('x') => self.remove_selected(),
-            KeyCode::Char('s') => self.start_snyk_scan(),
-            KeyCode::Char('f') => self.fix_selected(),
+            KeyCode::Char('s') => self.start_scan(Source::Snyk),
+            KeyCode::Char('n') => self.start_scan(self.audit_source()),
+            KeyCode::Char('f') => self.fix_selected(Source::Snyk),
+            KeyCode::Char('F') => self.fix_selected(self.audit_source()),
             KeyCode::Char('v') => {
                 self.show_vulns = !self.show_vulns;
                 self.rebuild_view();
@@ -892,10 +930,10 @@ impl App {
         self.dispatch('i', pkgs, ovr);
     }
 
-    /// Installs the Snyk-suggested version of the checked packages, or of the one under the
-    /// cursor (every package of a group when on a group header).
-    fn fix_selected(&mut self) {
-        let has_fix = |a: &App, i: usize| a.rows[i].snyk_fix.is_some() && !a.rows[i].busy();
+    /// Installs the version `source` suggests for the checked packages, or for the one under
+    /// the cursor (every package of a group when on a group header).
+    fn fix_selected(&mut self, source: Source) {
+        let has_fix = |a: &App, i: usize| a.rows[i].fix_of(source).is_some() && !a.rows[i].busy();
         let mut idx: Vec<usize> = self
             .visible_rows()
             .into_iter()
@@ -910,18 +948,22 @@ impl App {
             idx.retain(|&i| has_fix(self, i));
         }
         if idx.is_empty() {
-            self.push_log(if self.snyk_report.is_none() {
-                "No Snyk data yet. Press s to scan."
+            let (scan_key, name) = (scan_key(source), source.label());
+            let msg = if self.scan(source).report.is_none() {
+                format!("No {name} data yet. Press {scan_key} to scan.")
             } else {
-                "No Snyk fix for the selection: put the cursor on a package marked ✱ with a fix."
-            });
+                format!(
+                    "No {name} fix for the selection: put the cursor on a package marked ✱ that has one."
+                )
+            };
+            self.push_log(msg);
             return;
         }
         let pkgs = idx
             .into_iter()
-            .filter_map(|i| Some((i, self.rows[i].snyk_fix.clone()?)))
+            .filter_map(|i| Some((i, self.rows[i].fix_of(source)?.clone())))
             .collect();
-        self.dispatch('f', pkgs, Vec::new());
+        self.dispatch(fix_key(source), pkgs, Vec::new());
     }
 
     /// Queues the installs of `pkgs` (row index, version to install) and the override updates.
@@ -983,43 +1025,88 @@ impl App {
         let _ = self.jobs.send(Job { items, edits, keys });
     }
 
-    // ---- Snyk ------------------------------------------------------------------------
+    // ---- vulnerability scans -----------------------------------------------------------
 
-    fn start_snyk_scan(&mut self) {
-        if self.snyk_status == SnykStatus::Running {
+    /// The source the package manager's own audit command reports as.
+    pub fn audit_source(&self) -> Source {
+        audit::source_for(self.pm).unwrap_or(Source::NpmAudit)
+    }
+
+    fn scan(&self, source: Source) -> &Scan {
+        if source.is_audit() {
+            &self.audit
+        } else {
+            &self.snyk
+        }
+    }
+
+    fn scan_mut(&mut self, source: Source) -> &mut Scan {
+        if source.is_audit() {
+            &mut self.audit
+        } else {
+            &mut self.snyk
+        }
+    }
+
+    fn start_scan(&mut self, source: Source) {
+        if self.scan(source).status == ScanStatus::Running {
             return;
         }
-        self.snyk_status = SnykStatus::Running;
-        self.push_log("… scanning with Snyk (this sends the dependency list to Snyk)");
-        let (dir, tx) = (self.dir.clone(), self.events_tx.clone());
+        if source.is_audit() && audit::source_for(self.pm).is_none() {
+            let msg = format!(
+                "✘ {}: auditing is supported for npm and bun projects. Snyk (s) works with any package manager",
+                self.pm.name()
+            );
+            self.push_log(msg);
+            return;
+        }
+        self.scan_mut(source).status = ScanStatus::Running;
+        self.push_log(match source {
+            Source::Snyk => {
+                "… scanning with Snyk (this sends the dependency list to Snyk)".to_string()
+            }
+            _ => format!(
+                "… running {} (advisories come from your registry)",
+                source.label()
+            ),
+        });
+        let (dir, tx, pm) = (self.dir.clone(), self.events_tx.clone(), self.pm);
+        let roots = self.root_deps.clone();
         thread::spawn(move || {
-            let _ = tx.send(Event::Snyk(snyk::scan(&dir)));
+            let result = if source.is_audit() {
+                audit::scan(pm, &dir, &roots)
+            } else {
+                snyk::scan(&dir)
+            };
+            let _ = tx.send(Event::Scan { source, result });
         });
     }
 
-    fn on_snyk(&mut self, result: Result<Report, String>) {
+    fn on_scan(&mut self, source: Source, result: Result<Report, String>) {
+        let name = source.label();
         match result {
             Err(e) => {
-                self.snyk_status = SnykStatus::Failed;
-                self.push_log(format!("✘ Snyk: {e}"));
+                self.scan_mut(source).status = ScanStatus::Failed;
+                self.push_log(format!("✘ {name}: {e}"));
             }
             Ok(report) => {
                 for w in &report.warnings {
-                    self.push_log(format!("! Snyk: {}", w.lines().next().unwrap_or("")));
+                    self.push_log(format!("! {name}: {}", w.lines().next().unwrap_or("")));
                 }
                 for r in &mut self.rows {
-                    apply_snyk(&report, r);
+                    apply_report(source, &report, r);
                 }
                 let severe = report
                     .vulns
                     .iter()
                     .filter(|v| v.severity >= Severity::High)
                     .count();
-                self.snyk_status = SnykStatus::Done {
+                let scan = self.scan_mut(source);
+                scan.status = ScanStatus::Done {
                     total: report.vulns.len(),
                     severe,
                 };
-                self.snyk_stale = false;
+                scan.stale = false;
 
                 let shown: HashSet<&str> = self.rows.iter().map(|r| r.name.as_str()).collect();
                 let hidden: HashSet<&str> = report
@@ -1028,39 +1115,66 @@ impl App {
                     .map(|v| v.direct.as_str())
                     .filter(|d| !shown.contains(d))
                     .collect();
-                let fixes = self.rows.iter().filter(|r| r.snyk_fix.is_some()).count();
+                let fixes = self
+                    .rows
+                    .iter()
+                    .filter(|r| r.fix_of(source).is_some())
+                    .count();
                 if report.vulns.is_empty() {
-                    self.push_log("✔ Snyk: no known vulnerabilities");
+                    self.push_log(format!("✔ {name}: no known vulnerabilities"));
                 } else {
                     self.push_log(format!(
-                        "✔ Snyk: {} vulnerabilities ({severe} high or critical), fixes suggested for {fixes} package(s). Press f to apply.",
-                        report.vulns.len()
+                        "✔ {name}: {} vulnerabilities ({severe} high or critical), fixes suggested for {fixes} package(s). Press {} to apply.",
+                        report.vulns.len(),
+                        fix_key(source)
                     ));
                 }
                 if !hidden.is_empty() {
                     let mut names: Vec<&str> = hidden.into_iter().collect();
                     names.sort();
                     self.push_log(format!(
-                        "! Snyk: findings in packages not listed here: {}",
+                        "! {name}: findings in packages not listed here: {}",
                         names.join(", ")
                     ));
                 }
-                self.snyk_report = Some(report);
+                self.scan_mut(source).report = Some(report);
             }
         }
         self.rebuild_view();
     }
 }
 
-/// Copies the Snyk findings and suggested fix for `row` out of `report`.
-fn apply_snyk(report: &Report, row: &mut Row) {
-    row.vulns = report
-        .vulns
-        .iter()
-        .filter(|v| v.direct == row.name)
-        .cloned()
-        .collect();
-    row.snyk_fix = report.fixes.get(&row.name).cloned();
+/// The key that starts a scan with `source`.
+pub fn scan_key(source: Source) -> char {
+    if source.is_audit() { 'n' } else { 's' }
+}
+
+/// The key that installs the version `source` suggests.
+pub fn fix_key(source: Source) -> char {
+    if source.is_audit() { 'F' } else { 'f' }
+}
+
+/// Copies the findings and the suggested fix for `row` out of `report`, replacing what the
+/// same kind of scanner found before. Findings of the other scanner are kept.
+fn apply_report(source: Source, report: &Report, row: &mut Row) {
+    row.vulns
+        .retain(|v| v.source.is_audit() != source.is_audit());
+    row.vulns.extend(
+        report
+            .vulns
+            .iter()
+            .filter(|v| v.direct == row.name)
+            .cloned(),
+    );
+    row.vulns.sort_by(|a, b| {
+        (std::cmp::Reverse(a.severity), &a.id).cmp(&(std::cmp::Reverse(b.severity), &b.id))
+    });
+    let fix = report.fixes.get(&row.name).cloned();
+    if source.is_audit() {
+        row.audit_fix = fix;
+    } else {
+        row.snyk_fix = fix;
+    }
 }
 
 impl App {

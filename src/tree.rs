@@ -263,6 +263,118 @@ impl Analyzer {
     }
 }
 
+/// An installed copy of a package that an advisory applies to.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Located {
+    /// The project's direct dependency that brings it in.
+    pub direct: String,
+    /// Packages below the direct dependency down to the vulnerable one (empty when the
+    /// vulnerable package is the direct dependency itself).
+    pub path: Vec<String>,
+    pub package: String,
+    pub version: Version,
+    /// Index of the advisory, as given to `find_vulnerable`.
+    pub advisory: usize,
+}
+
+impl Analyzer {
+    /// Finds the installed packages hit by advisories and traces each one to the direct
+    /// dependency (or dependencies) that bring it in.
+    ///
+    /// `advisories` maps a package name to `(advisory index, affected version range)`.
+    /// The same installed package is reported once per direct dependency reaching it, since
+    /// upgrading either one may or may not fix it. Fails when none of `root_deps` is
+    /// installed, because then there is nothing to trace through.
+    pub fn find_vulnerable(
+        &mut self,
+        root_deps: &[(String, String)],
+        advisories: &HashMap<String, Vec<(usize, String)>>,
+    ) -> Result<Vec<Located>, String> {
+        let dir = self.dir.clone();
+        let mut out = Vec::new();
+        let mut installed_any = false;
+        for (dep, _) in root_deps {
+            let Some(root) = self.resolve(&dir, dep) else {
+                continue;
+            };
+            installed_any = true;
+            let mut st = AuditWalk {
+                direct: dep.clone(),
+                visited: HashSet::from([root.clone()]),
+                found: HashSet::new(),
+                out: Vec::new(),
+                budget: MAX_EDGES,
+            };
+            self.audit_visit(&root, dep, &mut Vec::new(), advisories, &mut st);
+            out.extend(st.out);
+        }
+        if !installed_any {
+            return Err(
+                "none of the dependencies is installed (no node_modules), so vulnerable packages can't be traced to them. Install dependencies first"
+                    .to_string(),
+            );
+        }
+        Ok(out)
+    }
+
+    /// Checks the package in `dir` (called `name`) and everything below it.
+    fn audit_visit(
+        &mut self,
+        dir: &Path,
+        name: &str,
+        path: &mut Vec<String>,
+        advisories: &HashMap<String, Vec<(usize, String)>>,
+        st: &mut AuditWalk,
+    ) {
+        if path.len() > MAX_DEPTH {
+            return;
+        }
+        let pkg = self.pkg(dir);
+        if let (Some(version), Some(hits)) = (&pkg.version, advisories.get(name)) {
+            for (adv, range) in hits {
+                // A range that can't be interpreted counts as a hit: better a false alarm
+                // than a missed vulnerability.
+                if satisfies(range, version) != Some(false)
+                    && st.found.insert((*adv, name.to_string(), version.clone()))
+                {
+                    st.out.push(Located {
+                        direct: st.direct.clone(),
+                        path: path.clone(),
+                        package: name.to_string(),
+                        version: version.clone(),
+                        advisory: *adv,
+                    });
+                }
+            }
+        }
+        for (dep, _) in &pkg.deps {
+            if st.budget == 0 {
+                return;
+            }
+            st.budget -= 1;
+            let Some(child) = self.resolve(dir, dep) else {
+                continue;
+            };
+            // Visited per direct dependency, so a shared package is reported under each one.
+            if !st.visited.insert(child.clone()) {
+                continue;
+            }
+            path.push(dep.clone());
+            self.audit_visit(&child, dep, path, advisories, st);
+            path.pop();
+        }
+    }
+}
+
+struct AuditWalk {
+    direct: String,
+    visited: HashSet<PathBuf>,
+    /// (advisory, package, version) already reported for this direct dependency.
+    found: HashSet<(usize, String, Version)>,
+    out: Vec<Located>,
+    budget: usize,
+}
+
 struct UsageWalk {
     visited: HashSet<PathBuf>,
     /// Per override: the range declared by each dependent edge the override applies to.
@@ -446,6 +558,87 @@ mod tests {
         let found = a.unneeded(&roots);
         assert_eq!(found.len(), 1, "{found:?}");
         assert_eq!(found[0].1, Unneeded::FloorMet(Version::new(5, 0, 5)));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn traces_vulnerable_packages_to_each_direct_dependency_with_the_right_copy() {
+        let dir = tmp("audit");
+        // express -> qs 6.7.0 (hoisted), request -> qs 6.5.5 (its own nested copy)
+        write(
+            &dir,
+            "node_modules/express",
+            r#"{"version":"4.17.1","dependencies":{"qs":"6.7.0","body-parser":"1.19.0"}}"#,
+        );
+        write(
+            &dir,
+            "node_modules/body-parser",
+            r#"{"version":"1.19.0","dependencies":{"qs":"6.7.0"}}"#,
+        );
+        write(&dir, "node_modules/qs", r#"{"version":"6.7.0"}"#);
+        write(
+            &dir,
+            "node_modules/request",
+            r#"{"version":"2.88.0","dependencies":{"qs":"~6.5.2"}}"#,
+        );
+        write(
+            &dir,
+            "node_modules/request/node_modules/qs",
+            r#"{"version":"6.5.5"}"#,
+        );
+        let mut adv: HashMap<String, Vec<(usize, String)>> = HashMap::new();
+        adv.insert(
+            "qs".into(),
+            vec![(0, ">=6.7.0 <6.7.3".into()), (1, "<6.14.1".into())],
+        );
+        adv.insert("express".into(), vec![(2, "<4.20.0".into())]);
+        adv.insert("never-installed".into(), vec![(3, "*".into())]);
+
+        let roots = vec![
+            ("express".to_string(), "4.17.1".to_string()),
+            ("request".to_string(), "~2.88.0".to_string()),
+        ];
+        let mut a = Analyzer::new(dir.clone(), Vec::new());
+        let found = a.find_vulnerable(&roots, &adv).unwrap();
+        let of = |direct: &str, adv: usize| -> Vec<(String, String, Vec<String>)> {
+            let mut v: Vec<_> = found
+                .iter()
+                .filter(|f| f.direct == direct && f.advisory == adv)
+                .map(|f| (f.package.clone(), f.version.to_string(), f.path.clone()))
+                .collect();
+            v.sort();
+            v
+        };
+        // advisory 0 only affects qs 6.7.0..6.7.2: express's copy, not request's 6.5.5
+        assert_eq!(
+            of("express", 0),
+            [("qs".into(), "6.7.0".into(), vec!["qs".to_string()])]
+        );
+        assert!(of("request", 0).is_empty());
+        // advisory 1 affects both copies, each under its own direct dependency
+        assert_eq!(of("express", 1).len(), 1);
+        assert_eq!(
+            of("request", 1),
+            [("qs".into(), "6.5.5".into(), vec!["qs".to_string()])]
+        );
+        // the direct dependency itself is reported with an empty path
+        assert_eq!(
+            of("express", 2),
+            [("express".into(), "4.17.1".into(), vec![])]
+        );
+        // the same copy reached twice below one direct dependency is reported once
+        assert_eq!(
+            found
+                .iter()
+                .filter(|f| f.direct == "express" && f.advisory == 0)
+                .count(),
+            1
+        );
+        assert!(found.iter().all(|f| f.advisory != 3));
+
+        // nothing installed: an error, not "no vulnerabilities"
+        let mut empty = Analyzer::new(tmp("audit-empty"), Vec::new());
+        assert!(empty.find_vulnerable(&roots, &adv).is_err());
         std::fs::remove_dir_all(dir).unwrap();
     }
 
