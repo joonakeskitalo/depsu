@@ -42,6 +42,13 @@ pub struct Analyzer {
 }
 
 impl Analyzer {
+    /// Drops everything read from disk. Call after packages were installed or updated, since
+    /// both parsed `package.json` files and lookup results (including "not found") go stale.
+    pub fn reset(&mut self) {
+        self.pkgs.clear();
+        self.resolved.clear();
+    }
+
     /// Replaces the overrides, e.g. after `package.json` was edited.
     pub fn set_overrides(&mut self, overrides: Vec<Override>) {
         self.overrides = overrides;
@@ -406,6 +413,39 @@ mod tests {
         // Nothing installed: no evidence, so no verdicts (not "everything is unused").
         let mut empty = Analyzer::new(tmp("empty"), collect(&m, Pm::Npm));
         assert!(empty.unneeded(&roots).is_empty());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn reset_picks_up_installs_made_after_the_first_analysis() {
+        let dir = tmp("reset");
+        write(
+            &dir,
+            "node_modules/x",
+            r#"{"version":"1.0.0","dependencies":{"z":"^5.0.0"}}"#,
+        );
+        write(&dir, "node_modules/z", r#"{"version":"5.0.0"}"#);
+        let m = json!({"overrides": {"z": "5.0.5"}});
+        let mut a = Analyzer::new(dir.clone(), collect(&m, Pm::Npm));
+        let roots = vec![("x".to_string(), "^1.0.0".to_string())];
+        // z may still resolve below 5.0.5 here, so the override is needed
+        assert!(a.unneeded(&roots).is_empty());
+        assert_eq!(a.analyze("x").len(), 1);
+
+        // "install": x is updated and now requires ^5.1.0, and gains a new dependency
+        write(
+            &dir,
+            "node_modules/x",
+            r#"{"version":"2.0.0","dependencies":{"z":"^5.1.0","w":"1"}}"#,
+        );
+        write(&dir, "node_modules/w", r#"{"version":"1.0.0"}"#);
+        // without a reset the stale caches still describe the old x
+        assert!(a.unneeded(&roots).is_empty());
+        a.reset();
+        let roots = vec![("x".to_string(), "^2.0.0".to_string())];
+        let found = a.unneeded(&roots);
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(found[0].1, Unneeded::FloorMet(Version::new(5, 0, 5)));
         std::fs::remove_dir_all(dir).unwrap();
     }
 

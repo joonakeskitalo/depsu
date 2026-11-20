@@ -45,6 +45,8 @@ enum TreeMsg {
     SetOverrides(Vec<Override>),
     /// Check which overrides no longer matter, given the project's own (name, range) deps.
     FindUnneeded(Vec<(String, String)>),
+    /// `node_modules` changed: forget everything read from disk so far.
+    Reset,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -193,6 +195,7 @@ impl App {
                 let mut analyzer = Analyzer::new(dir, ovr);
                 while let Ok(msg) = msg_rx.recv() {
                     match msg {
+                        TreeMsg::Reset => analyzer.reset(),
                         TreeMsg::SetOverrides(o) => analyzer.set_overrides(o),
                         TreeMsg::FindUnneeded(roots) => {
                             let found = analyzer.unneeded(&roots);
@@ -395,16 +398,15 @@ impl App {
                 }
             }
         }
-        if keys.is_empty() {
-            self.rebuild_view();
-        } else {
-            // package.json may have changed even if the install afterwards failed.
-            self.reload_overrides();
-        }
+        // An install changes `node_modules` and usually `package.json` (also when it failed
+        // halfway), so everything derived from them has to be recomputed.
+        self.reload_project();
     }
 
-    /// Re-reads the overrides from `package.json` and refreshes everything derived from them.
-    fn reload_overrides(&mut self) {
+    /// Re-reads `package.json` and re-runs the override analysis against the current
+    /// `node_modules`. Called after every install, since updating a package changes what its
+    /// dependents ask for, which overrides still matter and which overrides apply where.
+    fn reload_project(&mut self) {
         let manifest = match package::read_manifest(&self.dir.join("package.json")) {
             Ok(m) => m,
             Err(e) => {
@@ -413,9 +415,21 @@ impl App {
                 return;
             }
         };
+        // The analysis starts from the project's own dependency ranges, which an update changes.
+        self.root_deps = manifest
+            .deps
+            .iter()
+            .map(|d| (d.name.clone(), d.spec.clone()))
+            .collect();
+        self.direct = manifest.deps.iter().map(|d| d.name.clone()).collect();
         self.overrides = overrides::collect(&manifest.raw, self.pm);
-        self.selected_overrides.clear();
+
+        // Keep the user's selections that still point at an existing override.
+        let existing: HashSet<String> = self.overrides.iter().map(Override::key).collect();
+        self.selected_overrides.retain(|k| existing.contains(k));
+        // Old verdicts are stale until the new analysis arrives.
         self.unneeded.clear();
+
         for i in 0..self.rows.len() {
             let own = self.own_overrides(&self.rows[i].name);
             let r = &mut self.rows[i];
@@ -427,6 +441,8 @@ impl App {
             r.overrides = own;
         }
         if let Some(tx) = &self.tree_tx {
+            // Messages are handled in order, so the caches are cleared before the new work.
+            let _ = tx.send(TreeMsg::Reset);
             let _ = tx.send(TreeMsg::SetOverrides(self.overrides.clone()));
             let _ = tx.send(TreeMsg::FindUnneeded(self.root_deps.clone()));
             for r in &self.rows {
