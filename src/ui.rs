@@ -6,7 +6,7 @@ use crate::view::{Child, GroupBy, Item, Overrides, Release};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout};
 use ratatui::style::{Color, Modifier, Style, Stylize};
-use ratatui::text::{Line, Span};
+use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph};
 
 pub fn draw(f: &mut Frame, app: &mut App) {
@@ -64,13 +64,19 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         .view
         .iter()
         .map(|item| match item {
-            Item::Header { label, members } => header_line(app, label, members),
-            Item::Row { idx, .. } => row_line(&app.rows[*idx], indent, name_w),
+            Item::Header { label, members } => ListItem::new(header_line(app, label, members)),
+            Item::Row { idx, .. } => ListItem::new(row_line(&app.rows[*idx], indent, name_w)),
             Item::Detail {
                 idx, child, last, ..
-            } => detail_line(app, &app.rows[*idx], *child, *last, indent),
+            } => ListItem::new(Text::from(detail_lines(
+                app,
+                &app.rows[*idx],
+                *child,
+                *last,
+                indent,
+                body.width as usize,
+            ))),
         })
-        .map(ListItem::new)
         .collect();
     let list = List::new(items)
         .block(Block::default().borders(Borders::TOP))
@@ -224,7 +230,14 @@ fn override_marker(r: &AppRow) -> (Vec<Span<'static>>, usize) {
 }
 
 /// An override line nested under its package.
-fn detail_line(app: &App, r: &AppRow, child: Child, last: bool, indent: usize) -> Line<'static> {
+fn detail_lines(
+    app: &App,
+    r: &AppRow,
+    child: Child,
+    last: bool,
+    indent: usize,
+    width: usize,
+) -> Vec<Line<'static>> {
     let branch = if last { "└─" } else { "├─" };
     let prefix = format!("  {}   {branch} ", " ".repeat(indent));
 
@@ -323,7 +336,6 @@ fn detail_line(app: &App, r: &AppRow, child: Child, last: bool, indent: usize) -
         _ => (text, String::new()),
     };
     let mut spans = vec![
-        Span::styled(prefix, Style::new().fg(Color::DarkGray)),
         Span::styled(mark.to_string(), Style::new().fg(Color::White)),
         Span::styled(head, Style::new().fg(color)),
     ];
@@ -332,7 +344,99 @@ fn detail_line(app: &App, r: &AppRow, child: Child, last: bool, indent: usize) -
         format!("{rest}{tail}"),
         Style::new().fg(color),
     ));
-    Line::from(spans)
+
+    // Wrapped lines continue the tree guide and line up under the text, after the mark.
+    let guide = Style::new().fg(Color::DarkGray);
+    let lead = format!("  {}   ", " ".repeat(indent));
+    let cont = format!(
+        "{lead}{}{}",
+        if last { "   " } else { "│  " },
+        " ".repeat(mark.chars().count())
+    );
+    wrap(
+        Span::styled(prefix, guide),
+        Span::styled(cont, guide),
+        spans,
+        width,
+    )
+}
+
+/// Word-wraps `spans` to `width` columns. The first line starts with `first`, the following
+/// ones with `cont`. Words longer than a whole line are split.
+fn wrap(
+    first: Span<'static>,
+    cont: Span<'static>,
+    spans: Vec<Span<'static>>,
+    width: usize,
+) -> Vec<Line<'static>> {
+    let avail = width
+        .saturating_sub(first.width().max(cont.width()))
+        .max(10);
+
+    // Words, each keeping its trailing spaces and its style.
+    let mut tokens: Vec<(String, Style)> = Vec::new();
+    for sp in spans {
+        let mut cur = String::new();
+        let mut in_space = false;
+        for ch in sp.content.chars() {
+            if ch == ' ' {
+                in_space = true;
+            } else if in_space {
+                tokens.push((std::mem::take(&mut cur), sp.style));
+                in_space = false;
+            }
+            cur.push(ch);
+        }
+        if !cur.is_empty() {
+            tokens.push((cur, sp.style));
+        }
+    }
+
+    let mut lines: Vec<Vec<Span<'static>>> = vec![Vec::new()];
+    let mut used = 0;
+    for (tok, style) in tokens {
+        let word_w = Span::raw(tok.trim_end().to_string()).width();
+        if used > 0 && used + word_w > avail {
+            lines.push(Vec::new());
+            used = 0;
+        }
+        if used == 0 && tok.trim().is_empty() {
+            continue; // no leading spaces on a continuation line
+        }
+        if word_w <= avail {
+            used += Span::raw(tok.clone()).width();
+            lines.last_mut().unwrap().push(Span::styled(tok, style));
+            continue;
+        }
+        // A single word wider than the line: break it by characters.
+        let mut chunk = String::new();
+        let mut chunk_w = 0;
+        for ch in tok.chars() {
+            let w = Span::raw(ch.to_string()).width();
+            if used + chunk_w + w > avail && (used + chunk_w) > 0 {
+                lines
+                    .last_mut()
+                    .unwrap()
+                    .push(Span::styled(std::mem::take(&mut chunk), style));
+                lines.push(Vec::new());
+                used = 0;
+                chunk_w = 0;
+            }
+            chunk.push(ch);
+            chunk_w += w;
+        }
+        used += chunk_w;
+        lines.last_mut().unwrap().push(Span::styled(chunk, style));
+    }
+
+    lines
+        .into_iter()
+        .enumerate()
+        .map(|(i, mut l)| {
+            l.insert(0, if i == 0 { first.clone() } else { cont.clone() });
+            Line::from(l)
+        })
+        .collect()
 }
 
 fn hit_text(h: &Hit) -> String {
@@ -348,4 +452,67 @@ fn hit_text(h: &Hit) -> String {
         t.push(')');
     }
     t
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn text(l: &Line) -> String {
+        l.spans.iter().map(|s| s.content.as_ref()).collect()
+    }
+
+    fn run(width: usize, body: &str) -> Vec<String> {
+        wrap(
+            Span::raw("├─ "),
+            Span::raw("│  "),
+            vec![Span::raw(body.to_string())],
+            width,
+        )
+        .iter()
+        .map(text)
+        .collect()
+    }
+
+    #[test]
+    fn short_text_stays_on_one_line() {
+        assert_eq!(run(40, "tar → 5.0.0"), ["├─ tar → 5.0.0"]);
+    }
+
+    #[test]
+    fn wraps_on_words_with_continuation_prefix() {
+        let lines = run(20, "one two three four five six");
+        assert!(lines.len() > 1);
+        assert!(lines[1..].iter().all(|l| l.starts_with("│  ")));
+        assert!(
+            lines.iter().all(|l| Span::raw(l.clone()).width() <= 20),
+            "{lines:?}"
+        );
+        // no words lost or reordered
+        let words: Vec<String> = lines
+            .iter()
+            .flat_map(|l| {
+                let body: String = l.chars().skip(3).collect();
+                body.split_whitespace()
+                    .map(String::from)
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        assert_eq!(words.join(" "), "one two three four five six");
+    }
+
+    #[test]
+    fn breaks_words_longer_than_the_line() {
+        let lines = run(14, "averyveryverylongpackagename");
+        assert!(lines.len() > 1);
+        assert!(
+            lines.iter().all(|l| Span::raw(l.clone()).width() <= 14),
+            "{lines:?}"
+        );
+        let joined: String = lines
+            .iter()
+            .map(|l| l.chars().skip(3).collect::<String>())
+            .collect();
+        assert_eq!(joined, "averyveryverylongpackagename");
+    }
 }
