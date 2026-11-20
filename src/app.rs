@@ -1,13 +1,13 @@
 //! Application state, background workers and key handling.
 
-use crate::edit::{self, OverrideEdit};
+use crate::edit::{self, Change};
 use crate::npmrc::Npmrc;
-use crate::overrides::{self, Compat, Override};
+use crate::overrides::{self, Compat, Override, Unneeded};
 use crate::package::{self, Dep, Kind, parse_spec};
 use crate::pm::Pm;
 use crate::registry;
 use crate::tree::{Analyzer, Hit};
-use crate::view::{self, Child, GroupBy, Item, Overrides, Release};
+use crate::view::{self, Child, GroupBy, Item, Overrides, Release, UNNEEDED};
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::widgets::ListState;
 use semver::Version;
@@ -27,6 +27,8 @@ pub enum Event {
         name: String,
         hits: Vec<Hit>,
     },
+    /// Overrides that look unnecessary, by key. Empty when it can't be determined.
+    Unneeded(Vec<(String, Unneeded)>),
     InstallStarted {
         names: Vec<String>,
     },
@@ -41,6 +43,8 @@ pub enum Event {
 enum TreeMsg {
     Analyze(String),
     SetOverrides(Vec<Override>),
+    /// Check which overrides no longer matter, given the project's own (name, range) deps.
+    FindUnneeded(Vec<(String, String)>),
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -100,7 +104,7 @@ pub struct Update {
 struct Job {
     /// (name, spec, kind, exact)
     items: Vec<(String, String, Kind, bool)>,
-    edits: Vec<OverrideEdit>,
+    edits: Vec<Change>,
     /// Keys of the overrides being edited.
     keys: Vec<String>,
 }
@@ -129,6 +133,12 @@ pub struct App {
     override_latest: HashMap<String, Version>,
     selected_overrides: HashSet<String>,
     busy_overrides: HashSet<String>,
+    /// Overrides that look unnecessary, by key.
+    unneeded: HashMap<String, Unneeded>,
+    root_deps: Vec<(String, String)>,
+    confirm_remove: bool,
+    /// False until the first key press: the cursor then stays at the top of the package list.
+    cursor_moved: bool,
     /// Up-to-date packages waiting for the tree analysis to decide if they have overrides.
     pending_uptodate: HashMap<String, (Kind, &'static str, Version, Version)>,
     tree_tx: Option<Sender<TreeMsg>>,
@@ -145,9 +155,11 @@ impl App {
 
         let mut current = HashMap::new();
         let mut direct = HashSet::new();
+        let mut root_deps = Vec::new();
         let mut names = VecDeque::new();
         for d in deps {
             direct.insert(d.name.clone());
+            root_deps.push((d.name.clone(), d.spec.clone()));
             if let Some((prefix, v)) = parse_spec(&d.spec) {
                 names.push_back(d.name.clone());
                 current.insert(d.name, (d.kind, prefix, v));
@@ -188,6 +200,12 @@ impl App {
                 while let Ok(msg) = msg_rx.recv() {
                     match msg {
                         TreeMsg::SetOverrides(o) => analyzer.set_overrides(o),
+                        TreeMsg::FindUnneeded(roots) => {
+                            let found = analyzer.unneeded(&roots);
+                            if ev_tx.send(Event::Unneeded(found)).is_err() {
+                                break;
+                            }
+                        }
                         TreeMsg::Analyze(name) => {
                             let hits = analyzer.analyze(&name);
                             if ev_tx.send(Event::Tree { name, hits }).is_err() {
@@ -197,6 +215,7 @@ impl App {
                     }
                 }
             });
+            let _ = msg_tx.send(TreeMsg::FindUnneeded(root_deps.clone()));
             Some(msg_tx)
         };
 
@@ -226,6 +245,10 @@ impl App {
             override_latest: HashMap::new(),
             selected_overrides: HashSet::new(),
             busy_overrides: HashSet::new(),
+            unneeded: HashMap::new(),
+            root_deps,
+            confirm_remove: false,
+            cursor_moved: false,
             pending_uptodate: HashMap::new(),
             tree_tx,
             confirm_conflicts: false,
@@ -262,6 +285,10 @@ impl App {
                     }
                 }
                 Event::Tree { name, hits } => self.on_tree(name, hits),
+                Event::Unneeded(found) => {
+                    self.unneeded = found.into_iter().collect();
+                    self.rebuild_view();
+                }
                 Event::InstallStarted { names } => {
                     for r in self.rows.iter_mut().filter(|r| names.contains(&r.name)) {
                         r.status = Status::Installing;
@@ -372,7 +399,7 @@ impl App {
             .collect();
         match result {
             Ok(()) => {
-                self.push_log(format!("✔ installed {}", what.join(", ")));
+                self.push_log(format!("✔ done: {}", what.join(", ")));
                 // Updated packages are up to date now. Keep the ones with overrides in the
                 // list (so the overrides stay visible) and drop the rest.
                 for r in self.rows.iter_mut().filter(|r| names.contains(&r.name)) {
@@ -420,6 +447,7 @@ impl App {
         };
         self.overrides = overrides::collect(&manifest.raw, self.pm);
         self.selected_overrides.clear();
+        self.unneeded.clear();
         for i in 0..self.rows.len() {
             let own = self.own_overrides(&self.rows[i].name);
             let r = &mut self.rows[i];
@@ -432,6 +460,7 @@ impl App {
         }
         if let Some(tx) = &self.tree_tx {
             let _ = tx.send(TreeMsg::SetOverrides(self.overrides.clone()));
+            let _ = tx.send(TreeMsg::FindUnneeded(self.root_deps.clone()));
             for r in &self.rows {
                 let _ = tx.send(TreeMsg::Analyze(r.name.clone()));
             }
@@ -458,13 +487,47 @@ impl App {
             self.show_overrides,
             self.show_uptodate,
         );
-        let pos = anchor.and_then(|a| self.view.iter().position(|it| anchor_of(it) == a));
+        self.append_unneeded_section();
+        let pos = if self.cursor_moved {
+            anchor.and_then(|a| self.view.iter().position(|it| anchor_of(it) == a))
+        } else {
+            // Before the user interacts, keep the cursor on the first package (or group), not on
+            // whatever happened to arrive first, such as the unneeded-overrides section.
+            self.view.iter().position(|it| match it {
+                Item::Row { .. } => true,
+                Item::Header { label, .. } => label != UNNEEDED,
+                _ => false,
+            })
+        };
         let mut sel = pos.unwrap_or_else(|| prev.min(self.view.len().saturating_sub(1)));
         // Fall back to the nearest selectable item above.
         while sel > 0 && !self.selectable(sel) {
             sel -= 1;
         }
         self.table.select((!self.view.is_empty()).then_some(sel));
+    }
+
+    /// Lists the overrides that look unnecessary in a section of their own. This is the only
+    /// place overrides nobody depends on can show up, as they belong to no package.
+    fn append_unneeded_section(&mut self) {
+        let needle = self.filter.trim().to_lowercase();
+        let mut found: Vec<&Override> = self
+            .overrides
+            .iter()
+            .filter(|o| self.unneeded.contains_key(&o.key()))
+            .filter(|o| needle.is_empty() || o.name.to_lowercase().contains(&needle))
+            .collect();
+        if found.is_empty() {
+            return;
+        }
+        found.sort_by(|a, b| (&a.name, a.key()).cmp(&(&b.name, b.key())));
+        let keys: Vec<String> = found.iter().map(|o| o.key()).collect();
+        self.view.push(Item::Header {
+            label: UNNEEDED.to_string(),
+            members: Vec::new(),
+        });
+        self.view
+            .extend(keys.into_iter().map(|key| Item::Override { key }));
     }
 
     pub fn cursor_item(&self) -> Option<&Item> {
@@ -491,6 +554,9 @@ impl App {
 
     /// The override an item refers to, if it is an override line.
     fn detail_override<'a>(&'a self, item: &Item) -> Option<&'a Override> {
+        if let Item::Override { key } = item {
+            return self.overrides.iter().find(|o| o.key() == *key);
+        }
         let Item::Detail { idx, child, .. } = item else {
             return None;
         };
@@ -518,6 +584,24 @@ impl App {
         })
     }
 
+    pub fn override_by_key(&self, key: &str) -> Option<&Override> {
+        self.overrides.iter().find(|o| o.key() == key)
+    }
+
+    pub fn has_unneeded(&self) -> bool {
+        !self.unneeded.is_empty()
+    }
+
+    /// Why the override looks unnecessary, if it does.
+    pub fn unneeded(&self, o: &Override) -> Option<&Unneeded> {
+        self.unneeded.get(&o.key())
+    }
+
+    /// An override line can be selected if it can be updated or removed.
+    fn override_actionable(&self, o: &Override) -> bool {
+        self.update_target(o).is_some() || self.unneeded(o).is_some()
+    }
+
     pub fn override_selected(&self, o: &Override) -> bool {
         self.selected_overrides.contains(&o.key())
     }
@@ -529,11 +613,9 @@ impl App {
     /// Whether the cursor may rest on `view[i]`.
     fn selectable(&self, i: usize) -> bool {
         match self.view.get(i) {
-            Some(Item::Detail { .. }) => self
-                .view
-                .get(i)
-                .and_then(|it| self.detail_override(it))
-                .is_some_and(|o| self.update_target(o).is_some()),
+            Some(item @ (Item::Detail { .. } | Item::Override { .. })) => self
+                .detail_override(item)
+                .is_some_and(|o| self.override_actionable(o)),
             Some(_) => true,
             None => false,
         }
@@ -552,6 +634,7 @@ impl App {
     // ---- keys ------------------------------------------------------------------------
 
     pub fn on_key(&mut self, key: KeyEvent) {
+        self.cursor_moved = true;
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
             self.quit = true;
             return;
@@ -565,6 +648,9 @@ impl App {
         }
         if !matches!(key.code, KeyCode::Char('i') | KeyCode::Enter) {
             self.confirm_conflicts = false;
+        }
+        if key.code != KeyCode::Char('x') {
+            self.confirm_remove = false;
         }
         match key.code {
             KeyCode::Esc if !self.filter.is_empty() => {
@@ -612,6 +698,7 @@ impl App {
                 }
             }
             KeyCode::Char('i') | KeyCode::Enter => self.install_selected(),
+            KeyCode::Char('x') => self.remove_selected(),
             _ => {}
         }
     }
@@ -672,12 +759,12 @@ impl App {
                     self.rows[i].selected = !all;
                 }
             }
-            Item::Detail { .. } => {
+            Item::Detail { .. } | Item::Override { .. } => {
                 let Some(o) = self.detail_override(&item) else {
                     return;
                 };
                 let key = o.key();
-                if self.override_busy(o) || self.update_target(o).is_none() {
+                if self.override_busy(o) || !self.override_actionable(o) {
                     return;
                 }
                 if !self.selected_overrides.remove(&key) {
@@ -729,7 +816,7 @@ impl App {
             match self.cursor_item().cloned() {
                 Some(Item::Row { idx: i, .. }) => idx.push(i),
                 Some(Item::Header { members, .. }) => idx.extend(members),
-                Some(item @ Item::Detail { .. }) => {
+                Some(item @ (Item::Detail { .. } | Item::Override { .. })) => {
                     if let Some(o) = self.detail_override(&item)
                         && !self.override_busy(o)
                         && let Some(u) = self.update_target(o)
@@ -775,7 +862,7 @@ impl App {
             keys.push(o.key());
             self.selected_overrides.remove(&o.key());
             self.busy_overrides.insert(o.key());
-            edits.push(OverrideEdit {
+            edits.push(Change::Set {
                 loc: o.loc.clone(),
                 old: o.value.clone(),
                 new,
@@ -785,6 +872,62 @@ impl App {
         what.extend(keys.iter().map(|k| override_label(k)));
         self.push_log(format!("… queued {}", what.join(", ")));
         let _ = self.jobs.send(Job { items, edits, keys });
+    }
+}
+
+impl App {
+    /// Removes the checked overrides that look unnecessary, or the one under the cursor.
+    /// Asks for a second press first, since the verdict is a heuristic.
+    fn remove_selected(&mut self) {
+        let mut targets: Vec<Override> = self
+            .visible_overrides()
+            .into_iter()
+            .filter(|o| self.selected_overrides.contains(&o.key()))
+            .filter(|o| self.unneeded(o).is_some() && !self.override_busy(o))
+            .cloned()
+            .collect();
+        if targets.is_empty()
+            && let Some(item) = self.cursor_item().cloned()
+            && let Some(o) = self.detail_override(&item)
+            && self.unneeded(o).is_some()
+            && !self.override_busy(o)
+        {
+            targets.push(o.clone());
+        }
+        if targets.is_empty() {
+            self.push_log("Nothing to remove: put the cursor on an override marked ✂, or select some with space.");
+            return;
+        }
+
+        if !self.confirm_remove {
+            self.confirm_remove = true;
+            let names: Vec<String> = targets.iter().map(|o| o.describe()).collect();
+            self.push_log(format!(
+                "✂ will remove from package.json: {}. Press x again to confirm, any other key cancels.",
+                names.join("; ")
+            ));
+            return;
+        }
+        self.confirm_remove = false;
+
+        let mut edits = Vec::new();
+        let mut keys = Vec::new();
+        for o in &targets {
+            keys.push(o.key());
+            self.selected_overrides.remove(&o.key());
+            self.busy_overrides.insert(o.key());
+            edits.push(Change::Remove {
+                loc: o.loc.clone(),
+                old: o.value.clone(),
+            });
+        }
+        let what: Vec<String> = keys.iter().map(|k| override_label(k)).collect();
+        self.push_log(format!("… queued removal of {}", what.join(", ")));
+        let _ = self.jobs.send(Job {
+            items: Vec::new(),
+            edits,
+            keys,
+        });
     }
 }
 
@@ -798,6 +941,7 @@ fn anchor_of(item: &Item) -> (u8, String) {
     match item {
         Item::Header { label, .. } => (0, label.clone()),
         Item::Row { name, .. } => (1, name.clone()),
+        Item::Override { key } => (3, key.clone()),
         Item::Detail {
             row, key, child, ..
         } => (

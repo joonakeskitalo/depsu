@@ -2,7 +2,7 @@ use crate::app::{App, Row as AppRow, Status};
 use crate::overrides::{self, Compat, Override};
 use crate::pm::Pm;
 use crate::tree::{self, Hit};
-use crate::view::{Child, GroupBy, Item, Overrides, Release};
+use crate::view::{Child, GroupBy, Item, Overrides, Release, UNNEEDED};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout};
 use ratatui::style::{Color, Modifier, Style, Stylize};
@@ -73,6 +73,9 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         .map(|item| match item {
             Item::Header { label, members } => ListItem::new(header_line(app, label, members)),
             Item::Row { idx, .. } => ListItem::new(row_line(&app.rows[*idx], indent, name_w)),
+            Item::Override { key } => {
+                ListItem::new(Text::from(orphan_lines(app, key, body.width as usize)))
+            }
             Item::Detail {
                 idx, child, last, ..
             } => ListItem::new(Text::from(detail_lines(
@@ -117,6 +120,11 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         log,
     );
 
+    let remove_hint = if app.has_unneeded() {
+        "   x remove ✂"
+    } else {
+        ""
+    };
     let footer: Line = if app.filter_mode {
         Line::from(vec![
             " /".cyan().bold(),
@@ -132,7 +140,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         ])
     } else {
         Line::from(
-            " ↑/↓ move   space select   a all   i install   / filter   g group   o overrides   u up-to-date   q quit"
+            format!(" ↑/↓ move   space select   a all   i install   / filter   g group   o overrides   u up-to-date{remove_hint}   q quit")
                 .dark_gray(),
         )
     };
@@ -140,6 +148,15 @@ pub fn draw(f: &mut Frame, app: &mut App) {
 }
 
 fn header_line(app: &App, label: &str, members: &[usize]) -> Line<'static> {
+    if label == UNNEEDED && members.is_empty() {
+        let n = app
+            .view
+            .iter()
+            .filter(|i| matches!(i, Item::Override { .. }))
+            .count();
+        return Line::from(format!("✂ {label} ({n}), press x to remove"))
+            .style(Style::new().fg(Color::Magenta).add_modifier(Modifier::BOLD));
+    }
     let sel = members.iter().filter(|&&i| app.rows[i].selected).count();
     let mark = if sel == 0 {
         "○"
@@ -261,10 +278,12 @@ fn detail_lines(
     };
     let update = o.and_then(|o| app.update_target(o));
     // Selection mark, only on override lines that can be updated.
-    let mark = match (o, &update) {
-        (Some(o), Some(_)) if app.override_busy(o) => "⟳ ",
-        (Some(o), Some(_)) if app.override_selected(o) => "● ",
-        (Some(_), Some(_)) => "○ ",
+    let unneeded = o.and_then(|o| app.unneeded(o).map(|u| u.reason(o)));
+    let actionable = update.is_some() || unneeded.is_some();
+    let mark = match o {
+        Some(o) if actionable && app.override_busy(o) => "⟳ ",
+        Some(o) if actionable && app.override_selected(o) => "● ",
+        Some(_) if actionable => "○ ",
         _ => "",
     };
     let new_value = update.as_ref().map(|u| {
@@ -335,6 +354,12 @@ fn detail_lines(
         format!("{rest}{tail}"),
         Style::new().fg(color),
     ));
+    if let Some(reason) = unneeded {
+        spans.push(Span::styled(
+            format!("  ✂ may be removed: {reason}"),
+            Style::new().fg(Color::Magenta),
+        ));
+    }
 
     // Wrapped lines continue the tree guide and line up under the text, after the mark.
     let guide = Style::new().fg(Color::DarkGray);
@@ -430,6 +455,28 @@ fn wrap(
         .collect()
 }
 
+/// An override listed on its own in the "unneeded" section.
+fn orphan_lines(app: &App, key: &str, width: usize) -> Vec<Line<'static>> {
+    let Some(o) = app.override_by_key(key) else {
+        return vec![Line::default()];
+    };
+    let mark = if app.override_busy(o) {
+        "⟳ "
+    } else if app.override_selected(o) {
+        "● "
+    } else {
+        "○ "
+    };
+    let reason = app.unneeded(o).map(|u| u.reason(o)).unwrap_or_default();
+    let spans = vec![
+        Span::raw(mark),
+        Span::styled("✂ ", Style::new().fg(Color::Magenta)),
+        Span::raw(o.describe()),
+        Span::styled(format!("   {reason}"), Style::new().fg(Color::DarkGray)),
+    ];
+    wrap(Span::raw("  "), Span::raw("      "), spans, width)
+}
+
 /// Compatibility of the update of `r` with its own override `o`, and a short explanation.
 fn own_override_note(app: &App, r: &AppRow, o: &Override) -> (Compat, String) {
     let c = overrides::check(std::slice::from_ref(o), app.pm, &r.new_spec(), &r.latest);
@@ -474,12 +521,23 @@ fn summary_lines(app: &App, width: usize) -> Vec<Line<'static>> {
         if !note.is_empty() {
             text.push_str(&format!(" ({note})"));
         }
+        if let Some(u) = app.unneeded(o) {
+            text.push_str(&format!(" ✂ may be removed: {}", u.reason(o)));
+        }
         text.push_str("   ");
         spans.push(Span::styled(text, Style::new().fg(compat_color(c))));
     }
     if !r.tree_hits.is_empty() {
         // Risky hits come first, so they survive the cut-off.
-        let shown: Vec<String> = r.tree_hits.iter().take(3).map(hit_text).collect();
+        let shown: Vec<String> = r
+            .tree_hits
+            .iter()
+            .take(3)
+            .map(|h| match app.unneeded(&h.over) {
+                Some(u) => format!("{} ✂ may be removed: {}", hit_text(h), u.reason(&h.over)),
+                None => hit_text(h),
+            })
+            .collect();
         let more = r.tree_hits.len().saturating_sub(3);
         let mut text = format!("↳ overrides in dependency tree: {}", shown.join(", "));
         if more > 0 {

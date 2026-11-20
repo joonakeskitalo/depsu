@@ -2,7 +2,7 @@
 //! below it, since an override can change the behaviour of the package even when the
 //! overridden dependency is several levels deep.
 
-use crate::overrides::{Compat, Override, satisfies};
+use crate::overrides::{Compat, Override, Unneeded, assess, satisfies};
 use semver::Version;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -11,6 +11,8 @@ use std::rc::Rc;
 const MAX_DEPTH: usize = 64;
 /// Upper bound on dependency edges visited per analysed package.
 const MAX_EDGES: usize = 20_000;
+/// Same, for the walk over the whole project.
+const MAX_PROJECT_EDGES: usize = 500_000;
 
 #[derive(Clone, Debug)]
 pub struct Hit {
@@ -170,6 +172,119 @@ impl Analyzer {
     }
 }
 
+impl Analyzer {
+    /// Finds overrides that probably no longer change anything. Walks the whole installed tree
+    /// starting from the project's own dependencies (`root_deps`: name and declared range),
+    /// collecting for every override the ranges that all dependents declare for it.
+    ///
+    /// Returns nothing when none of the project's dependencies are installed, because then the
+    /// absence of dependents proves nothing.
+    pub fn unneeded(&mut self, root_deps: &[(String, String)]) -> Vec<(String, Unneeded)> {
+        let overrides = self.overrides.clone();
+        if overrides.is_empty() {
+            return Vec::new();
+        }
+        let dir = self.dir.clone();
+        let mut st = UsageWalk {
+            visited: HashSet::new(),
+            requested: vec![Vec::new(); overrides.len()],
+            budget: MAX_PROJECT_EDGES,
+        };
+        let mut installed_any = false;
+        for (dep, spec) in root_deps {
+            let child = self.resolve(&dir, dep);
+            installed_any |= child.is_some();
+            let version = child.as_ref().and_then(|c| self.pkg(c).version.clone());
+            record(
+                &overrides,
+                &[],
+                dep,
+                spec,
+                version.as_ref(),
+                &mut st.requested,
+            );
+            if let Some(c) = child
+                && st.visited.insert(c.clone())
+            {
+                self.usage_walk(&overrides, &c, &mut vec![dep.clone()], &mut st);
+            }
+        }
+        if !installed_any {
+            return Vec::new();
+        }
+        overrides
+            .iter()
+            .zip(&st.requested)
+            .filter_map(|(o, req)| Some((o.key(), assess(o, req)?)))
+            .collect()
+    }
+
+    fn usage_walk(
+        &mut self,
+        overrides: &[Override],
+        dir: &Path,
+        chain: &mut Vec<String>,
+        st: &mut UsageWalk,
+    ) {
+        if chain.len() > MAX_DEPTH {
+            return;
+        }
+        let pkg = self.pkg(dir);
+        for (dep, requested) in &pkg.deps {
+            if st.budget == 0 {
+                return;
+            }
+            st.budget -= 1;
+            let child = self.resolve(dir, dep);
+            let version = child.as_ref().and_then(|c| self.pkg(c).version.clone());
+            record(
+                overrides,
+                chain,
+                dep,
+                requested,
+                version.as_ref(),
+                &mut st.requested,
+            );
+            if let Some(c) = child
+                && st.visited.insert(c.clone())
+            {
+                chain.push(dep.clone());
+                self.usage_walk(overrides, &c, chain, st);
+                chain.pop();
+            }
+        }
+    }
+}
+
+struct UsageWalk {
+    visited: HashSet<PathBuf>,
+    /// Per override: the range declared by each dependent edge the override applies to.
+    requested: Vec<Vec<String>>,
+    budget: usize,
+}
+
+/// Notes the declared range of an edge `parent chain -> dep` for every override applying to it.
+fn record(
+    overrides: &[Override],
+    chain: &[String],
+    dep: &str,
+    requested: &str,
+    installed: Option<&Version>,
+    out: &mut [Vec<String>],
+) {
+    for (i, o) in overrides.iter().enumerate() {
+        if o.name != dep || !o.path_applies(chain) {
+            continue;
+        }
+        if let (Some(sel), Some(v)) = (&o.range, installed)
+            && satisfies(sel, v) == Some(false)
+        {
+            continue;
+        }
+        out[i].push(requested.to_string());
+    }
+}
+
 struct Walk {
     visited: HashSet<PathBuf>,
     seen: HashSet<(usize, String, Option<Version>)>,
@@ -244,6 +359,53 @@ mod tests {
         let scoped = hits.iter().find(|h| h.over.value == "5.0.0").unwrap();
         assert_eq!(scoped.risk, Compat::Ok);
         assert!(a.analyze("not-installed").is_empty());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn finds_overrides_that_no_longer_matter() {
+        let dir = tmp("unneeded");
+        write(
+            &dir,
+            "node_modules/a",
+            r#"{"version":"1.0.0","dependencies":{"floor":"^5.1.0","same":"2.0.0","needed":"^1.0.0"}}"#,
+        );
+        write(
+            &dir,
+            "node_modules/b",
+            r#"{"version":"1.0.0","dependencies":{"floor":"^5.0.5","needed":"^1.0.0"}}"#,
+        );
+        for (n, v) in [("floor", "5.1.0"), ("same", "2.0.0"), ("needed", "1.2.0")] {
+            write(
+                &dir,
+                &format!("node_modules/{n}"),
+                &format!(r#"{{"version":"{v}"}}"#),
+            );
+        }
+        let m = json!({"overrides": {
+            "floor": "5.0.5",     // every dependent already requires >= 5.0.5
+            "same": "2.0.0",      // dependents already ask for exactly this
+            "needed": "1.1.0",    // b still allows ^1.0.0, below the floor
+            "ghost": "1.0.0"      // nothing depends on it
+        }});
+        let mut a = Analyzer::new(dir.clone(), collect(&m, Pm::Npm));
+        let roots = vec![
+            ("a".to_string(), "^1.0.0".to_string()),
+            ("b".to_string(), "^1.0.0".to_string()),
+        ];
+        let got: HashMap<String, Unneeded> = a.unneeded(&roots).into_iter().collect();
+        let key = |n: &str| format!("overrides\u{1f}{n}");
+        assert_eq!(
+            got[&key("floor")],
+            Unneeded::FloorMet(Version::new(5, 0, 5))
+        );
+        assert_eq!(got[&key("same")], Unneeded::SameSpec);
+        assert_eq!(got[&key("ghost")], Unneeded::Unused);
+        assert!(!got.contains_key(&key("needed")), "{got:?}");
+
+        // Nothing installed: no evidence, so no verdicts (not "everything is unused").
+        let mut empty = Analyzer::new(tmp("empty"), collect(&m, Pm::Npm));
+        assert!(empty.unneeded(&roots).is_empty());
         std::fs::remove_dir_all(dir).unwrap();
     }
 

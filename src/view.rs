@@ -108,6 +108,10 @@ pub enum Item {
         idx: usize,
         name: String,
     },
+    /// An override listed on its own, in the section of overrides that look unnecessary.
+    Override {
+        key: String,
+    },
     /// Override line nested under the package `rows[idx]`. It can hold the cursor only when
     /// the override can be updated (decided by the app).
     Detail {
@@ -153,6 +157,8 @@ fn children(r: &Row, idx: usize, mode: Overrides) -> Vec<Item> {
 
 const OTHER: &str = "(other)";
 pub const UP_TO_DATE: &str = "Up to date";
+/// Label of the section listing overrides that look unnecessary.
+pub const UNNEEDED: &str = "Unneeded overrides";
 
 /// Group label for a package name. Scoped packages group by scope; unscoped ones by the
 /// text before the first `-`, but only when at least two outdated packages share it.
@@ -271,6 +277,7 @@ mod tests {
                 Item::Header { label, .. } => format!("# {label}"),
                 Item::Row { name, .. } => name.clone(),
                 Item::Detail { child, .. } => format!("  - {child:?}"),
+                Item::Override { key } => format!("  ✂ {key}"),
             })
             .collect()
     }
@@ -374,7 +381,7 @@ mod tests {
                     Item::Detail { child, last, .. } => {
                         format!("{child:?}{}", if *last { "$" } else { "" })
                     }
-                    Item::Header { .. } => "H".into(),
+                    Item::Header { .. } | Item::Override { .. } => "H".into(),
                 })
                 .collect()
         };
@@ -400,7 +407,7 @@ mod tests {
                 .map(|i| match i {
                     Item::Row { name, .. } => name.clone(),
                     Item::Header { label, .. } => format!("# {label}"),
-                    Item::Detail { .. } => "-".into(),
+                    Item::Detail { .. } | Item::Override { .. } => "-".into(),
                 })
                 .collect()
         };

@@ -308,6 +308,116 @@ fn alt_satisfies(alt: &str, v: &Version) -> Option<bool> {
         .map(|r| r.matches(v))
 }
 
+/// Why an override is probably no longer needed.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Unneeded {
+    /// No installed package depends on the overridden package.
+    Unused,
+    /// Every dependent already asks for exactly the override's value.
+    SameSpec,
+    /// Every dependent already requires at least this version, which is what the override
+    /// guarantees as a floor.
+    FloorMet(Version),
+}
+
+impl Unneeded {
+    pub fn reason(&self, o: &Override) -> String {
+        match self {
+            Unneeded::Unused => format!("nothing installed depends on {}", o.name),
+            Unneeded::SameSpec => format!("every dependent already asks for {}", o.value),
+            Unneeded::FloorMet(v) => format!("every dependent already requires ≥ {v}"),
+        }
+    }
+}
+
+/// Decides whether `o` still changes anything, given the ranges that every installed
+/// package (and the project itself) declares for the overridden package. Conservative:
+/// returns `None` unless the evidence is clear.
+pub fn assess(o: &Override, requested: &[String]) -> Option<Unneeded> {
+    if o.value.starts_with('$') {
+        return None; // a reference to a direct dependency's spec
+    }
+    if requested.is_empty() {
+        return Some(Unneeded::Unused);
+    }
+    if requested.iter().all(|r| *r == o.value) {
+        return Some(Unneeded::SameSpec);
+    }
+    let floor = min_version(&o.value)?;
+    requested
+        .iter()
+        .all(|r| min_version(r).is_some_and(|m| m >= floor))
+        .then_some(Unneeded::FloorMet(floor))
+}
+
+/// Lowest version an npm-style range can select. For `||` the lowest alternative counts, so
+/// the answer is a guaranteed lower bound. `None` for anything not understood.
+pub fn min_version(range: &str) -> Option<Version> {
+    range
+        .split("||")
+        .map(|alt| alt_min(alt.trim()))
+        .collect::<Option<Vec<_>>>()?
+        .into_iter()
+        .min()
+}
+
+fn alt_min(alt: &str) -> Option<Version> {
+    let mut lower = Version::new(0, 0, 0);
+    let mut pending_op = String::new();
+    let mut it = alt.split_whitespace();
+    while let Some(t) = it.next() {
+        if t == "-" {
+            // Hyphen range "a - b": `a` was the lower bound, the next token is the upper one.
+            it.next();
+            continue;
+        }
+        if t.chars().all(|c| "<>=~^".contains(c)) {
+            pending_op.push_str(t);
+            continue;
+        }
+        let full = format!("{pending_op}{t}");
+        pending_op.clear();
+        let split = full.find(|c: char| c.is_ascii_digit() || c == 'x' || c == 'X' || c == '*')?;
+        let (op, ver) = full.split_at(split);
+        if op.starts_with('<') {
+            continue; // upper bound only
+        }
+        if !matches!(op, "" | "=" | "^" | "~" | ">" | ">=") {
+            return None;
+        }
+        let v = partial_version(ver)?;
+        if v > lower {
+            lower = v;
+        }
+    }
+    if !pending_op.is_empty() {
+        return None;
+    }
+    Some(lower)
+}
+
+/// `1`, `1.2`, `1.x`, `1.2.3`, `1.2.3-beta.1` (missing or wildcard parts become 0).
+fn partial_version(s: &str) -> Option<Version> {
+    if let Ok(v) = Version::parse(s) {
+        return Some(v);
+    }
+    let mut nums = [0u64; 3];
+    let mut wildcard = false;
+    for (i, part) in s.split('.').enumerate() {
+        if i >= 3 {
+            return None;
+        }
+        if matches!(part, "x" | "X" | "*") {
+            wildcard = true;
+        } else if wildcard {
+            return None;
+        } else {
+            nums[i] = part.parse().ok()?;
+        }
+    }
+    Some(Version::new(nums[0], nums[1], nums[2]))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -315,6 +425,52 @@ mod tests {
 
     fn v(s: &str) -> Version {
         Version::parse(s).unwrap()
+    }
+
+    #[test]
+    fn lowest_selectable_version() {
+        let m = |r: &str| min_version(r).map(|v| v.to_string());
+        assert_eq!(m("5.0.5").as_deref(), Some("5.0.5"));
+        assert_eq!(m("^5.0.5").as_deref(), Some("5.0.5"));
+        assert_eq!(m("~1.2").as_deref(), Some("1.2.0"));
+        assert_eq!(m("1.x").as_deref(), Some("1.0.0"));
+        assert_eq!(m(">=1.2.3 <2").as_deref(), Some("1.2.3"));
+        assert_eq!(m("< 2").as_deref(), Some("0.0.0"));
+        assert_eq!(m("1.2.3 - 2.0.0").as_deref(), Some("1.2.3"));
+        assert_eq!(m("^4 || ^5.1.0").as_deref(), Some("4.0.0")); // lowest alternative
+        assert_eq!(m("*").as_deref(), Some("0.0.0"));
+        assert_eq!(m("github:a/b"), None);
+        assert_eq!(m("workspace:*"), None);
+        assert_eq!(m("npm:foo@1"), None);
+    }
+
+    fn named(value: &str) -> Override {
+        ovr(value).remove(0)
+    }
+
+    fn reqs(r: &[&str]) -> Vec<String> {
+        r.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn detects_unneeded_overrides() {
+        let o = named("5.0.5");
+        assert_eq!(assess(&o, &[]), Some(Unneeded::Unused));
+        assert_eq!(
+            assess(&o, &reqs(&["5.0.5", "5.0.5"])),
+            Some(Unneeded::SameSpec)
+        );
+        // every dependent already requires at least the pinned version
+        assert_eq!(
+            assess(&o, &reqs(&["^5.0.5", "^5.1.0"])),
+            Some(Unneeded::FloorMet(Version::new(5, 0, 5)))
+        );
+        // one dependent still allows a lower (vulnerable) version: still needed
+        assert_eq!(assess(&o, &reqs(&["^5.0.5", "^5.0.0"])), None);
+        // unparseable declared range: no verdict
+        assert_eq!(assess(&o, &reqs(&["^5.0.5", "github:a/b"])), None);
+        // references are never judged
+        assert_eq!(assess(&named("$foo"), &[]), None);
     }
 
     #[test]
