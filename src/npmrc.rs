@@ -31,6 +31,10 @@ impl Npmrc {
         rc
     }
 
+    pub fn set(&mut self, key: &str, value: &str) {
+        self.values.insert(key.to_string(), value.to_string());
+    }
+
     fn merge_file(&mut self, path: &Path) {
         if let Ok(text) = std::fs::read_to_string(path) {
             self.merge_str(&text);

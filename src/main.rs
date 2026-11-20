@@ -1,4 +1,5 @@
 mod app;
+mod bunfig;
 mod npmrc;
 mod package;
 mod pm;
@@ -52,9 +53,14 @@ fn main() -> Result<()> {
     let dir = dir.canonicalize()?;
     let manifest = package::read_manifest(&dir.join("package.json"))?;
     let pm = forced_pm.unwrap_or_else(|| pm::Pm::detect(&dir, manifest.package_manager.as_deref()));
-    let rc = npmrc::Npmrc::load(&dir);
+    let mut rc = npmrc::Npmrc::load(&dir);
+    // Bun reads bunfig.toml (taking precedence over .npmrc), so honour it for bun projects.
+    let warnings = if pm == pm::Pm::Bun { bunfig::merge_into(&mut rc, &dir) } else { Vec::new() };
 
     let mut app = app::App::start(dir, pm, manifest.deps, rc);
+    for w in warnings {
+        app.push_log(w);
+    }
     let mut terminal = ratatui::init();
     let result = run(&mut terminal, &mut app);
     ratatui::restore();
