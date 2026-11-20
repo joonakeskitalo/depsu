@@ -10,6 +10,10 @@ const DEFAULT_REGISTRY: &str = "https://registry.npmjs.org/";
 #[derive(Debug, Default)]
 pub struct Npmrc {
     values: HashMap<String, String>,
+    /// `Authorization` value for packages of a scope (`@scope`), whichever registry they use.
+    scope_auth: HashMap<String, String>,
+    /// Used for registries without credentials of their own (Yarn's top-level `npmAuthToken`).
+    fallback_auth: Option<String>,
 }
 
 impl Npmrc {
@@ -29,6 +33,31 @@ impl Npmrc {
             }
         }
         rc
+    }
+
+    pub fn set_scope_auth(&mut self, scope: &str, header: String) {
+        self.scope_auth.insert(scope.to_string(), header);
+    }
+
+    pub fn set_fallback_auth(&mut self, header: String) {
+        self.fallback_auth = Some(header);
+    }
+
+    /// The `Authorization` header to use for `package` on `registry_url`: credentials of the
+    /// package's scope, then of the registry, then the fallback. The fallback is never sent to
+    /// the public registries, so a private token can't leak to them.
+    pub fn auth_for(&self, package: &str, registry_url: &str) -> Option<String> {
+        if let Some((scope, _)) = package.split_once('/')
+            && scope.starts_with('@')
+            && let Some(h) = self.scope_auth.get(scope)
+        {
+            return Some(h.clone());
+        }
+        self.auth_header(registry_url).or_else(|| {
+            let host = registry_url.split_once("://")?.1.split('/').next()?;
+            let public = matches!(host, "registry.npmjs.org" | "registry.yarnpkg.com");
+            self.fallback_auth.clone().filter(|_| !public)
+        })
     }
 
     pub fn set(&mut self, key: &str, value: &str) {

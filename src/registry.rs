@@ -28,7 +28,7 @@ pub fn latest_version(rc: &Npmrc, agent: &ureq::Agent, name: &str) -> Result<Ver
     let registry = rc.registry_for(name);
     // Scoped names need the slash encoded, keeping the leading @: @scope%2fname
     let url = format!("{registry}{}", name.replacen('/', "%2f", 1));
-    let auth = rc.auth_header(&registry);
+    let auth = rc.auth_for(name, &registry);
 
     let tags = match dist_tags(agent, &url, auth.as_deref(), CORGI) {
         // Some registries don't serve the abbreviated document.

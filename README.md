@@ -23,7 +23,7 @@ Illustrative output:
 - **Stays open.** Press `i` to install, keep browsing, press `i` again. Installs run in the
   background, one at a time.
 - **Uses your package manager.** npm, yarn, pnpm or bun, detected from the project.
-- **Uses your registry.** Reads `.npmrc` and, for bun projects, `bunfig.toml`, including private
+- **Uses your registry.** Reads `.npmrc`, `.yarnrc.yml` for Yarn 2+ and `bunfig.toml` for bun, including private
   registries and auth tokens.
 - **Selection, grouping, filtering.** Group by release type (patch, minor, major) or by name
   prefix, and filter by name.
@@ -98,6 +98,17 @@ Per-package, `depsu` picks the registry like npm does and sends the matching tok
 - For bun projects, `bunfig.toml` (project, then `~/.bunfig.toml`) takes precedence:
   `[install] registry`, `[install.registry]` with `url` / `token` / `username` / `password`, and
   `[install.scopes]`, with `$VAR` / `${VAR}`.
+- For Yarn 2+ projects (a `.yarnrc.yml` in the project directory or a parent), `.yarnrc.yml` is
+  used **instead of** `.npmrc`, which Yarn Modern ignores as well. Files are merged from `~/.yarnrc.yml`
+  down to the nearest one, which wins. Supported: `npmRegistryServer`, `npmAuthToken`,
+  `npmAuthIdent`, `npmScopes.<scope>.{npmRegistryServer,npmAuthToken,npmAuthIdent}` and
+  `npmRegistries.<url>.{npmAuthToken,npmAuthIdent}`, plus `YARN_NPM_REGISTRY_SERVER`,
+  `YARN_NPM_AUTH_TOKEN` and `YARN_NPM_AUTH_IDENT`. Credentials are picked like Yarn does: the
+  package's scope, then the registry's own `npmRegistries` entry, then the top-level ones. The
+  top-level credentials are never sent to `registry.npmjs.org` or `registry.yarnpkg.com`. Yarn's
+  `${VAR}`, `${VAR:-fallback}` and `${VAR-fallback}` expansions work. A variable that isn't set
+  drops that setting and shows a warning in the log. `npmAlwaysAuth` is not needed: credentials
+  are sent whenever they are configured.
 
 Versions are fetched the way `npm-check-updates` does it: the package document is requested with
 the abbreviated (corgi) `Accept` header and reading stops as soon as `dist-tags` has been seen,
@@ -183,7 +194,7 @@ Source layout:
 | `main.rs` | Argument parsing, startup |
 | `app.rs` | State, key handling, background workers (fetching, installing, analysis) |
 | `ui.rs`, `view.rs` | Rendering, and the list model (grouping, filtering, nested lines) |
-| `registry.rs`, `npmrc.rs`, `bunfig.rs` | Registry access and configuration |
+| `registry.rs`, `npmrc.rs`, `bunfig.rs`, `yarnrc.rs` | Registry access and configuration |
 | `pm.rs`, `package.rs`, `edit.rs` | Package manager detection and commands, `package.json` reading and editing |
 | `overrides.rs`, `tree.rs` | Override parsing, compatibility, unneeded detection, dependency tree walk |
 | `snyk.rs` | Snyk CLI integration. `tests/fixtures/` holds real and hand-written Snyk output |
@@ -191,7 +202,8 @@ Source layout:
 ## Limitations
 
 - Only the `latest` dist-tag is considered. There is no `--target minor` / `patch`.
-- `yarn` Berry settings in `.yarnrc.yml` and overrides in `pnpm-workspace.yaml` are not read.
+- Yarn Classic's `.yarnrc` (`registry "…"`) and overrides in `pnpm-workspace.yaml` are not read.
+  Yarn Classic still gets its registry from `.npmrc`.
 - Override analysis reads `node_modules`, so it finds nothing with Yarn Plug'n'Play or before the
   first install, and it does not predict the dependency tree of a new version.
 - Not tested on Windows.

@@ -10,6 +10,7 @@ mod snyk;
 mod tree;
 mod ui;
 mod view;
+mod yarnrc;
 
 use anyhow::{Result, bail};
 use ratatui::crossterm::event::{self, Event, KeyEventKind};
@@ -79,14 +80,20 @@ fn main() -> Result<()> {
     let manifest = package::read_manifest(&dir.join("package.json"))?;
     let pm = forced_pm.unwrap_or_else(|| pm::Pm::detect(&dir, manifest.package_manager.as_deref()));
     let overrides = overrides::collect(&manifest.raw, pm);
-    let mut rc = npmrc::Npmrc::load(&dir);
-    // Bun reads bunfig.toml (taking precedence over .npmrc), so honour it for bun projects.
-    let warnings = if pm == pm::Pm::Bun {
-        bunfig::merge_into(&mut rc, &dir)
+    // Each package manager has its own idea of where the registry settings live.
+    let (rc, warnings) = if pm == pm::Pm::Yarn && yarnrc::is_yarn_modern(&dir) {
+        // Yarn 2+ reads `.yarnrc.yml` only and ignores `.npmrc` completely.
+        yarnrc::load(&dir)
     } else {
-        Vec::new()
+        let mut rc = npmrc::Npmrc::load(&dir);
+        // Bun reads bunfig.toml (taking precedence over .npmrc), so honour it for bun projects.
+        let warnings = if pm == pm::Pm::Bun {
+            bunfig::merge_into(&mut rc, &dir)
+        } else {
+            Vec::new()
+        };
+        (rc, warnings)
     };
-
     let mut app = app::App::start(dir, pm, manifest.deps, rc, overrides);
     for w in warnings {
         app.push_log(w);
