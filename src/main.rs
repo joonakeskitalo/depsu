@@ -1,5 +1,6 @@
 mod app;
 mod bunfig;
+mod edit;
 mod npmrc;
 mod overrides;
 mod package;

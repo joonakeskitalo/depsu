@@ -1,16 +1,17 @@
 //! Application state, background workers and key handling.
 
+use crate::edit::{self, OverrideEdit};
 use crate::npmrc::Npmrc;
 use crate::overrides::{self, Compat, Override};
-use crate::package::{Dep, Kind, parse_spec};
+use crate::package::{self, Dep, Kind, parse_spec};
 use crate::pm::Pm;
 use crate::registry;
 use crate::tree::{Analyzer, Hit};
-use crate::view::{self, GroupBy, Item, Overrides, Release};
+use crate::view::{self, Child, GroupBy, Item, Overrides, Release};
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::widgets::ListState;
 use semver::Version;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::mpsc::{self, Receiver, Sender};
@@ -26,11 +27,20 @@ pub enum Event {
         name: String,
         hits: Vec<Hit>,
     },
-    InstallStarted(Vec<String>),
+    InstallStarted {
+        names: Vec<String>,
+    },
     InstallFinished {
         names: Vec<String>,
+        keys: Vec<String>,
         result: Result<(), String>,
     },
+}
+
+/// Messages for the dependency tree analysis thread.
+enum TreeMsg {
+    Analyze(String),
+    SetOverrides(Vec<Override>),
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -47,6 +57,8 @@ pub struct Row {
     pub prefix: &'static str,
     pub current: Version,
     pub latest: Version,
+    /// False for packages listed only because they have overrides.
+    pub outdated: bool,
     pub selected: bool,
     pub status: Status,
     /// Overrides targeting this package, and whether the update is compatible with them.
@@ -60,17 +72,37 @@ impl Row {
     pub fn new_spec(&self) -> String {
         format!("{}{}", self.prefix, self.latest)
     }
+
     pub fn release(&self) -> Release {
         Release::of(&self.current, &self.latest)
     }
+
     pub fn busy(&self) -> bool {
         matches!(self.status, Status::Queued | Status::Installing)
     }
+
+    /// Can be selected for install.
+    pub fn actionable(&self) -> bool {
+        self.outdated && !self.busy()
+    }
+
+    fn has_overrides(&self) -> bool {
+        !self.overrides.is_empty() || !self.tree_hits.is_empty()
+    }
+}
+
+/// A newer value for an override entry.
+pub struct Update {
+    pub value: String,
+    pub release: Release,
 }
 
 struct Job {
     /// (name, spec, kind, exact)
     items: Vec<(String, String, Kind, bool)>,
+    edits: Vec<OverrideEdit>,
+    /// Keys of the overrides being edited.
+    keys: Vec<String>,
 }
 
 pub struct App {
@@ -78,6 +110,7 @@ pub struct App {
     pub rows: Vec<Row>,
     pub table: ListState,
     pub show_overrides: Overrides,
+    pub show_uptodate: bool,
     pub view: Vec<Item>,
     pub group_by: GroupBy,
     pub filter: String,
@@ -87,9 +120,18 @@ pub struct App {
     pub total: usize,
     pub registry: String,
     pub quit: bool,
+    dir: PathBuf,
     current: HashMap<String, (Kind, &'static str, Version)>,
+    /// Names of all direct dependencies, parseable or not.
+    direct: HashSet<String>,
     overrides: Vec<Override>,
-    tree_tx: Option<Sender<String>>,
+    /// Latest published version of each overridden package.
+    override_latest: HashMap<String, Version>,
+    selected_overrides: HashSet<String>,
+    busy_overrides: HashSet<String>,
+    /// Up-to-date packages waiting for the tree analysis to decide if they have overrides.
+    pending_uptodate: HashMap<String, (Kind, &'static str, Version, Version)>,
+    tree_tx: Option<Sender<TreeMsg>>,
     confirm_conflicts: bool,
     quit_warned: bool,
     rx: Receiver<Event>,
@@ -102,11 +144,19 @@ impl App {
         let (jobs, job_rx) = mpsc::channel::<Job>();
 
         let mut current = HashMap::new();
+        let mut direct = HashSet::new();
         let mut names = VecDeque::new();
         for d in deps {
+            direct.insert(d.name.clone());
             if let Some((prefix, v)) = parse_spec(&d.spec) {
                 names.push_back(d.name.clone());
                 current.insert(d.name, (d.kind, prefix, v));
+            }
+        }
+        // Overridden packages with a literal version also need their latest version looked up.
+        for o in &overrides {
+            if parse_spec(&o.value).is_some() && !names.contains(&o.name) {
+                names.push_back(o.name.clone());
             }
         }
         let total = names.len();
@@ -127,31 +177,39 @@ impl App {
             });
         }
 
-        // One install worker: package managers don't tolerate parallel installs.
         // Dependency tree analysis is only needed when the project defines overrides.
         let tree_tx = if overrides.is_empty() {
             None
         } else {
-            let (name_tx, name_rx) = mpsc::channel::<String>();
+            let (msg_tx, msg_rx) = mpsc::channel::<TreeMsg>();
             let (dir, ev_tx, ovr) = (dir.clone(), tx.clone(), overrides.clone());
             thread::spawn(move || {
                 let mut analyzer = Analyzer::new(dir, ovr);
-                while let Ok(name) = name_rx.recv() {
-                    let hits = analyzer.analyze(&name);
-                    if ev_tx.send(Event::Tree { name, hits }).is_err() {
-                        break;
+                while let Ok(msg) = msg_rx.recv() {
+                    match msg {
+                        TreeMsg::SetOverrides(o) => analyzer.set_overrides(o),
+                        TreeMsg::Analyze(name) => {
+                            let hits = analyzer.analyze(&name);
+                            if ev_tx.send(Event::Tree { name, hits }).is_err() {
+                                break;
+                            }
+                        }
                     }
                 }
             });
-            Some(name_tx)
+            Some(msg_tx)
         };
-        thread::spawn(move || install_worker(dir, pm, job_rx, tx));
+
+        // One install worker: package managers don't tolerate parallel installs.
+        let worker_dir = dir.clone();
+        thread::spawn(move || install_worker(worker_dir, pm, job_rx, tx));
 
         App {
             pm,
             rows: Vec::new(),
             table: ListState::default(),
             show_overrides: Overrides::Compact,
+            show_uptodate: true,
             view: Vec::new(),
             group_by: GroupBy::None,
             filter: String::new(),
@@ -161,8 +219,14 @@ impl App {
             total,
             registry,
             quit: false,
+            dir,
             current,
+            direct,
             overrides,
+            override_latest: HashMap::new(),
+            selected_overrides: HashSet::new(),
+            busy_overrides: HashSet::new(),
+            pending_uptodate: HashMap::new(),
             tree_tx,
             confirm_conflicts: false,
             quit_warned: false,
@@ -176,7 +240,7 @@ impl App {
     }
 
     pub fn installing(&self) -> bool {
-        self.rows.iter().any(Row::busy)
+        !self.busy_overrides.is_empty() || self.rows.iter().any(Row::busy)
     }
 
     pub fn push_log(&mut self, msg: impl Into<String>) {
@@ -193,83 +257,186 @@ impl App {
                 Event::Fetched { name, result } => {
                     self.pending = self.pending.saturating_sub(1);
                     match result {
-                        Ok(latest) => {
-                            if let Some((kind, prefix, cur)) = self.current.get(&name).cloned()
-                                && latest > cur
-                                && latest.pre.is_empty()
-                            {
-                                let overrides: Vec<Override> = self
-                                    .overrides
-                                    .iter()
-                                    .filter(|o| o.name == name)
-                                    .cloned()
-                                    .collect();
-                                let compat = overrides::check(
-                                    &overrides,
-                                    self.pm,
-                                    &format!("{prefix}{latest}"),
-                                    &latest,
-                                );
-                                if let Some(tx) = &self.tree_tx {
-                                    let _ = tx.send(name.clone());
-                                }
-                                self.insert_row(Row {
-                                    name,
-                                    kind,
-                                    prefix,
-                                    current: cur,
-                                    latest,
-                                    selected: false,
-                                    status: Status::Idle,
-                                    overrides,
-                                    compat,
-                                    tree_hits: Vec::new(),
-                                });
-                            }
-                        }
+                        Ok(latest) => self.on_fetched(name, latest),
                         Err(e) => self.push_log(format!("! {name}: {e}")),
                     }
                 }
-                Event::Tree { name, hits } => {
-                    if let Some(r) = self.rows.iter_mut().find(|r| r.name == name) {
-                        // Risky hits first, so they survive the compact view's cut-off.
-                        let mut hits = hits;
-                        hits.sort_by_key(|h| std::cmp::Reverse(h.risk));
-                        r.tree_hits = hits;
-                        self.rebuild_view();
-                    }
-                }
-                Event::InstallStarted(names) => {
+                Event::Tree { name, hits } => self.on_tree(name, hits),
+                Event::InstallStarted { names } => {
                     for r in self.rows.iter_mut().filter(|r| names.contains(&r.name)) {
                         r.status = Status::Installing;
                     }
                 }
-                Event::InstallFinished { names, result } => match result {
-                    Ok(()) => {
-                        self.push_log(format!("✔ installed {}", names.join(", ")));
-                        // Installed packages are now up to date: drop them from the list.
-                        self.rows.retain(|r| !names.contains(&r.name));
-                        self.rebuild_view();
-                    }
-                    Err(e) => {
-                        for r in self.rows.iter_mut().filter(|r| names.contains(&r.name)) {
-                            r.status = Status::Failed;
-                        }
-                        self.push_log(format!("✘ failed {}:", names.join(", ")));
-                        for line in e
-                            .lines()
-                            .rev()
-                            .take(6)
-                            .collect::<Vec<_>>()
-                            .into_iter()
-                            .rev()
-                        {
-                            self.push_log(format!("  {line}"));
-                        }
-                    }
-                },
+                Event::InstallFinished {
+                    names,
+                    keys,
+                    result,
+                } => self.on_install_finished(names, keys, result),
             }
         }
+    }
+
+    fn own_overrides(&self, name: &str) -> Vec<Override> {
+        self.overrides
+            .iter()
+            .filter(|o| o.name == name)
+            .cloned()
+            .collect()
+    }
+
+    fn analyze(&self, name: &str) {
+        if let Some(tx) = &self.tree_tx {
+            let _ = tx.send(TreeMsg::Analyze(name.to_string()));
+        }
+    }
+
+    fn on_fetched(&mut self, name: String, latest: Version) {
+        if self.overrides.iter().any(|o| o.name == name) {
+            self.override_latest.insert(name.clone(), latest.clone());
+            self.rebuild_view();
+        }
+        let Some((kind, prefix, cur)) = self.current.get(&name).cloned() else {
+            return;
+        };
+        let outdated = latest > cur && latest.pre.is_empty();
+        let own = self.own_overrides(&name);
+        let row = |own: Vec<Override>, compat| Row {
+            name: name.clone(),
+            kind,
+            prefix,
+            current: cur.clone(),
+            latest: latest.clone(),
+            outdated,
+            selected: false,
+            status: Status::Idle,
+            overrides: own,
+            compat,
+            tree_hits: Vec::new(),
+        };
+        if outdated {
+            let compat = overrides::check(&own, self.pm, &format!("{prefix}{latest}"), &latest);
+            self.analyze(&name);
+            let r = row(own, compat);
+            self.insert_row(r);
+        } else if !own.is_empty() {
+            // Up to date, but listed so its overrides are visible.
+            self.analyze(&name);
+            let r = row(own, Compat::Ok);
+            self.insert_row(r);
+        } else if self.tree_tx.is_some() {
+            // Only listed if something in its dependency tree is overridden.
+            self.pending_uptodate
+                .insert(name.clone(), (kind, prefix, cur, latest));
+            self.analyze(&name);
+        }
+    }
+
+    fn on_tree(&mut self, name: String, mut hits: Vec<Hit>) {
+        // Risky hits first, so they survive the compact view's cut-off.
+        hits.sort_by_key(|h| std::cmp::Reverse(h.risk));
+        if let Some((kind, prefix, current, latest)) = self.pending_uptodate.remove(&name) {
+            if !hits.is_empty() {
+                self.insert_row(Row {
+                    name,
+                    kind,
+                    prefix,
+                    current,
+                    latest,
+                    outdated: false,
+                    selected: false,
+                    status: Status::Idle,
+                    overrides: Vec::new(),
+                    compat: Compat::Ok,
+                    tree_hits: hits,
+                });
+            }
+        } else if let Some(r) = self.rows.iter_mut().find(|r| r.name == name) {
+            r.tree_hits = hits;
+            self.rebuild_view();
+        }
+    }
+
+    fn on_install_finished(
+        &mut self,
+        names: Vec<String>,
+        keys: Vec<String>,
+        result: Result<(), String>,
+    ) {
+        for k in &keys {
+            self.busy_overrides.remove(k);
+        }
+        let what: Vec<String> = names
+            .iter()
+            .cloned()
+            .chain(keys.iter().map(|k| override_label(k)))
+            .collect();
+        match result {
+            Ok(()) => {
+                self.push_log(format!("✔ installed {}", what.join(", ")));
+                // Updated packages are up to date now. Keep the ones with overrides in the
+                // list (so the overrides stay visible) and drop the rest.
+                for r in self.rows.iter_mut().filter(|r| names.contains(&r.name)) {
+                    r.outdated = false;
+                    r.current = r.latest.clone();
+                    r.compat = Compat::Ok;
+                    r.status = Status::Idle;
+                }
+                self.rows.retain(|r| r.outdated || r.has_overrides());
+            }
+            Err(e) => {
+                for r in self.rows.iter_mut().filter(|r| names.contains(&r.name)) {
+                    r.status = Status::Failed;
+                }
+                self.push_log(format!("✘ failed {}:", what.join(", ")));
+                for line in e
+                    .lines()
+                    .rev()
+                    .take(6)
+                    .collect::<Vec<_>>()
+                    .into_iter()
+                    .rev()
+                {
+                    self.push_log(format!("  {line}"));
+                }
+            }
+        }
+        if keys.is_empty() {
+            self.rebuild_view();
+        } else {
+            // package.json may have changed even if the install afterwards failed.
+            self.reload_overrides();
+        }
+    }
+
+    /// Re-reads the overrides from `package.json` and refreshes everything derived from them.
+    fn reload_overrides(&mut self) {
+        let manifest = match package::read_manifest(&self.dir.join("package.json")) {
+            Ok(m) => m,
+            Err(e) => {
+                self.push_log(format!("! could not reload package.json: {e:#}"));
+                self.rebuild_view();
+                return;
+            }
+        };
+        self.overrides = overrides::collect(&manifest.raw, self.pm);
+        self.selected_overrides.clear();
+        for i in 0..self.rows.len() {
+            let own = self.own_overrides(&self.rows[i].name);
+            let r = &mut self.rows[i];
+            r.compat = if r.outdated {
+                overrides::check(&own, self.pm, &r.new_spec(), &r.latest)
+            } else {
+                Compat::Ok
+            };
+            r.overrides = own;
+        }
+        if let Some(tx) = &self.tree_tx {
+            let _ = tx.send(TreeMsg::SetOverrides(self.overrides.clone()));
+            for r in &self.rows {
+                let _ = tx.send(TreeMsg::Analyze(r.name.clone()));
+            }
+        }
+        self.rebuild_view();
     }
 
     fn insert_row(&mut self, row: Row) {
@@ -284,11 +451,17 @@ impl App {
     fn rebuild_view(&mut self) {
         let anchor = self.cursor_item().map(anchor_of);
         let prev = self.table.selected().unwrap_or(0);
-        self.view = view::build(&self.rows, self.group_by, &self.filter, self.show_overrides);
+        self.view = view::build(
+            &self.rows,
+            self.group_by,
+            &self.filter,
+            self.show_overrides,
+            self.show_uptodate,
+        );
         let pos = anchor.and_then(|a| self.view.iter().position(|it| anchor_of(it) == a));
         let mut sel = pos.unwrap_or_else(|| prev.min(self.view.len().saturating_sub(1)));
-        // Override lines can't be selected: fall back to the package they belong to.
-        while sel > 0 && matches!(self.view.get(sel), Some(Item::Detail { .. })) {
+        // Fall back to the nearest selectable item above.
+        while sel > 0 && !self.selectable(sel) {
             sel -= 1;
         }
         self.table.select((!self.view.is_empty()).then_some(sel));
@@ -298,13 +471,85 @@ impl App {
         self.table.selected().and_then(|i| self.view.get(i))
     }
 
-    /// Number of rows currently shown (excluding group headers).
+    /// Number of outdated packages currently shown.
     pub fn shown(&self) -> usize {
-        self.view
-            .iter()
-            .filter(|i| matches!(i, Item::Row { .. }))
+        self.visible_rows()
+            .into_iter()
+            .filter(|&i| self.rows[i].outdated)
             .count()
     }
+
+    /// Number of up-to-date packages currently shown.
+    pub fn shown_up_to_date(&self) -> usize {
+        self.visible_rows()
+            .into_iter()
+            .filter(|&i| !self.rows[i].outdated)
+            .count()
+    }
+
+    // ---- overrides -------------------------------------------------------------------
+
+    /// The override an item refers to, if it is an override line.
+    fn detail_override<'a>(&'a self, item: &Item) -> Option<&'a Override> {
+        let Item::Detail { idx, child, .. } = item else {
+            return None;
+        };
+        let r = self.rows.get(*idx)?;
+        match child {
+            Child::Own(i) => r.overrides.get(*i),
+            Child::Tree(i) => r.tree_hits.get(*i).map(|h| &h.over),
+            Child::More(_) => None,
+        }
+    }
+
+    /// A newer value for the override, if its value is a plain version or range and a newer
+    /// version of the overridden package exists.
+    pub fn update_target(&self, o: &Override) -> Option<Update> {
+        // npm requires an override on a direct dependency to match the dependency's own spec,
+        // so it can only change together with the dependency.
+        if self.pm == Pm::Npm && o.global() && self.direct.contains(&o.name) {
+            return None;
+        }
+        let latest = self.override_latest.get(&o.name)?;
+        let (prefix, cur) = parse_spec(&o.value)?;
+        (*latest > cur && latest.pre.is_empty()).then(|| Update {
+            value: format!("{prefix}{latest}"),
+            release: Release::of(&cur, latest),
+        })
+    }
+
+    pub fn override_selected(&self, o: &Override) -> bool {
+        self.selected_overrides.contains(&o.key())
+    }
+
+    pub fn override_busy(&self, o: &Override) -> bool {
+        self.busy_overrides.contains(&o.key())
+    }
+
+    /// Whether the cursor may rest on `view[i]`.
+    fn selectable(&self, i: usize) -> bool {
+        match self.view.get(i) {
+            Some(Item::Detail { .. }) => self
+                .view
+                .get(i)
+                .and_then(|it| self.detail_override(it))
+                .is_some_and(|o| self.update_target(o).is_some()),
+            Some(_) => true,
+            None => false,
+        }
+    }
+
+    /// Distinct overrides in the visible override lines.
+    fn visible_overrides(&self) -> Vec<&Override> {
+        let mut seen = HashSet::new();
+        self.view
+            .iter()
+            .filter_map(|it| self.detail_override(it))
+            .filter(|o| seen.insert(o.key()))
+            .collect()
+    }
+
+    // ---- keys ------------------------------------------------------------------------
 
     pub fn on_key(&mut self, key: KeyEvent) {
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
@@ -339,6 +584,10 @@ impl App {
                 self.show_overrides = self.show_overrides.next();
                 self.rebuild_view();
             }
+            KeyCode::Char('u') => {
+                self.show_uptodate = !self.show_uptodate;
+                self.rebuild_view();
+            }
             KeyCode::Char('g') => {
                 self.group_by = self.group_by.next();
                 self.rebuild_view();
@@ -347,23 +596,19 @@ impl App {
             KeyCode::Up | KeyCode::Char('k') => self.move_cursor(-1),
             KeyCode::Home => self.table.select((!self.view.is_empty()).then_some(0)),
             KeyCode::End => {
-                let last = self
-                    .view
-                    .iter()
-                    .rposition(|i| !matches!(i, Item::Detail { .. }));
+                let last = (0..self.view.len()).rev().find(|&i| self.selectable(i));
                 self.table.select(last);
             }
             KeyCode::Char(' ') => self.toggle_cursor(),
             KeyCode::Char('a') => {
-                let visible = self.visible_rows();
-                let all = visible
-                    .iter()
-                    .filter(|&&i| !self.rows[i].busy())
-                    .all(|&i| self.rows[i].selected);
+                let visible: Vec<usize> = self
+                    .visible_rows()
+                    .into_iter()
+                    .filter(|&i| self.rows[i].actionable())
+                    .collect();
+                let all = visible.iter().all(|&i| self.rows[i].selected);
                 for i in visible {
-                    if !self.rows[i].busy() {
-                        self.rows[i].selected = !all;
-                    }
+                    self.rows[i].selected = !all;
                 }
             }
             KeyCode::Char('i') | KeyCode::Enter => self.install_selected(),
@@ -399,36 +644,51 @@ impl App {
             .iter()
             .filter_map(|it| match it {
                 Item::Row { idx, .. } => Some(*idx),
-                Item::Header { .. } | Item::Detail { .. } => None,
+                _ => None,
             })
             .collect()
     }
 
-    /// Space on a row toggles it and moves down; on a group header it toggles the whole group.
+    /// Space on a package toggles it and moves down; on a group header it toggles the whole
+    /// group; on an updatable override line it toggles that override.
     fn toggle_cursor(&mut self) {
-        match self.cursor_item().cloned() {
-            Some(Item::Row { idx, .. }) => {
-                if !self.rows[idx].busy() {
+        let Some(item) = self.cursor_item().cloned() else {
+            return;
+        };
+        match item {
+            Item::Row { idx, .. } => {
+                if self.rows[idx].actionable() {
                     self.rows[idx].selected = !self.rows[idx].selected;
                 }
                 self.move_cursor(1);
             }
-            Some(Item::Header { members, .. }) => {
-                let all = members
-                    .iter()
-                    .filter(|&&i| !self.rows[i].busy())
-                    .all(|&i| self.rows[i].selected);
+            Item::Header { members, .. } => {
+                let members: Vec<usize> = members
+                    .into_iter()
+                    .filter(|&i| self.rows[i].actionable())
+                    .collect();
+                let all = members.iter().all(|&i| self.rows[i].selected);
                 for i in members {
-                    if !self.rows[i].busy() {
-                        self.rows[i].selected = !all;
-                    }
+                    self.rows[i].selected = !all;
                 }
             }
-            None | Some(Item::Detail { .. }) => {}
+            Item::Detail { .. } => {
+                let Some(o) = self.detail_override(&item) else {
+                    return;
+                };
+                let key = o.key();
+                if self.override_busy(o) || self.update_target(o).is_none() {
+                    return;
+                }
+                if !self.selected_overrides.remove(&key) {
+                    self.selected_overrides.insert(key);
+                }
+                self.move_cursor(1);
+            }
         }
     }
 
-    /// Moves to the next selectable item in the direction of `delta`, skipping override lines.
+    /// Moves to the next selectable item in the direction of `delta`.
     fn move_cursor(&mut self, delta: isize) {
         let len = self.view.len() as isize;
         let step = delta.signum();
@@ -436,9 +696,7 @@ impl App {
         let mut remaining = delta.abs();
         while remaining > 0 {
             let mut next = i + step;
-            while (0..len).contains(&next)
-                && matches!(self.view[next as usize], Item::Detail { .. })
-            {
+            while (0..len).contains(&next) && !self.selectable(next as usize) {
                 next += step;
             }
             if !(0..len).contains(&next) {
@@ -452,25 +710,41 @@ impl App {
         }
     }
 
-    /// Queues all checked visible rows. If none are checked, queues the row under the cursor,
-    /// or every row of the group when the cursor is on a group header.
+    /// Queues the checked packages and overrides. If nothing is checked, queues the item under
+    /// the cursor: a package, every package of a group, or an override.
     fn install_selected(&mut self) {
         let mut idx: Vec<usize> = self
             .visible_rows()
             .into_iter()
-            .filter(|&i| self.rows[i].selected && !self.rows[i].busy())
+            .filter(|&i| self.rows[i].selected && self.rows[i].actionable())
             .collect();
-        if idx.is_empty() {
-            match self.cursor_item() {
-                Some(Item::Row { idx: i, .. }) => idx.push(*i),
+        let mut ovr: Vec<(Override, String)> = self
+            .visible_overrides()
+            .into_iter()
+            .filter(|o| self.selected_overrides.contains(&o.key()) && !self.override_busy(o))
+            .filter_map(|o| Some((o.clone(), self.update_target(o)?.value)))
+            .collect();
+
+        if idx.is_empty() && ovr.is_empty() {
+            match self.cursor_item().cloned() {
+                Some(Item::Row { idx: i, .. }) => idx.push(i),
                 Some(Item::Header { members, .. }) => idx.extend(members),
-                None | Some(Item::Detail { .. }) => {}
+                Some(item @ Item::Detail { .. }) => {
+                    if let Some(o) = self.detail_override(&item)
+                        && !self.override_busy(o)
+                        && let Some(u) = self.update_target(o)
+                    {
+                        ovr.push((o.clone(), u.value));
+                    }
+                }
+                None => {}
             }
-            idx.retain(|&i| !self.rows[i].busy());
+            idx.retain(|&i| self.rows[i].actionable());
         }
-        if idx.is_empty() {
+        if idx.is_empty() && ovr.is_empty() {
             return;
         }
+
         // Updates that clash with an override need an explicit second press.
         let conflicts: Vec<&str> = idx
             .iter()
@@ -487,6 +761,7 @@ impl App {
             return;
         }
         self.confirm_conflicts = false;
+
         let mut items = Vec::new();
         for i in idx {
             let r = &mut self.rows[i];
@@ -494,71 +769,109 @@ impl App {
             r.status = Status::Queued;
             items.push((r.name.clone(), r.new_spec(), r.kind, r.prefix.is_empty()));
         }
-        let names: Vec<_> = items.iter().map(|i| i.0.as_str()).collect();
-        let msg = format!("… queued {}", names.join(", "));
-        self.push_log(msg);
-        let _ = self.jobs.send(Job { items });
+        let mut edits = Vec::new();
+        let mut keys = Vec::new();
+        for (o, new) in ovr {
+            keys.push(o.key());
+            self.selected_overrides.remove(&o.key());
+            self.busy_overrides.insert(o.key());
+            edits.push(OverrideEdit {
+                loc: o.loc.clone(),
+                old: o.value.clone(),
+                new,
+            });
+        }
+        let mut what: Vec<String> = items.iter().map(|i| i.0.clone()).collect();
+        what.extend(keys.iter().map(|k| override_label(k)));
+        self.push_log(format!("… queued {}", what.join(", ")));
+        let _ = self.jobs.send(Job { items, edits, keys });
     }
 }
 
-/// Identity of a list item that survives index changes: (is_header, label or name).
+/// Human-readable name of an override from its key (the last path element).
+fn override_label(key: &str) -> String {
+    format!("override {}", key.rsplit('\u{1f}').next().unwrap_or(key))
+}
+
+/// Identity of a list item that survives index changes.
 fn anchor_of(item: &Item) -> (u8, String) {
     match item {
         Item::Header { label, .. } => (0, label.clone()),
         Item::Row { name, .. } => (1, name.clone()),
-        Item::Detail { .. } => (2, String::new()),
+        Item::Detail {
+            row, key, child, ..
+        } => (
+            2,
+            match child {
+                Child::More(_) => format!("{row}\u{0}more"),
+                _ => format!("{row}\u{0}{key}"),
+            },
+        ),
     }
 }
 
 fn install_worker(dir: PathBuf, pm: Pm, jobs: Receiver<Job>, tx: Sender<Event>) {
     while let Ok(job) = jobs.recv() {
-        let all: Vec<String> = job.items.iter().map(|i| i.0.clone()).collect();
-        let _ = tx.send(Event::InstallStarted(all.clone()));
-
-        // One command per (kind, exact) group.
-        let mut groups: Vec<((Kind, bool), Vec<String>)> = Vec::new();
-        for (name, spec, kind, exact) in &job.items {
-            let arg = format!("{name}@{spec}");
-            match groups.iter_mut().find(|(k, _)| *k == (*kind, *exact)) {
-                Some((_, v)) => v.push(arg),
-                None => groups.push(((*kind, *exact), vec![arg])),
-            }
-        }
-
-        let mut result = Ok(());
-        for ((kind, exact), specs) in groups {
-            let args = pm.install_args(&specs, kind, exact);
-            let out = Command::new(pm.program())
-                .args(&args)
-                .current_dir(&dir)
-                .output();
-            match out {
-                Ok(o) if o.status.success() => {}
-                Ok(o) => {
-                    let mut text = String::from_utf8_lossy(&o.stderr).into_owned();
-                    if text.trim().is_empty() {
-                        text = String::from_utf8_lossy(&o.stdout).into_owned();
-                    }
-                    result = Err(format!(
-                        "`{} {}` exited with {}\n{}",
-                        pm.name(),
-                        args.join(" "),
-                        o.status,
-                        text.trim()
-                    ));
-                    break;
-                }
-                Err(e) => {
-                    result = Err(format!("could not run {}: {e}", pm.name()));
-                    break;
-                }
-            }
-        }
+        let names: Vec<String> = job.items.iter().map(|i| i.0.clone()).collect();
+        let _ = tx.send(Event::InstallStarted {
+            names: names.clone(),
+        });
+        let result = run_job(&dir, pm, &job);
         if tx
-            .send(Event::InstallFinished { names: all, result })
+            .send(Event::InstallFinished {
+                names,
+                keys: job.keys,
+                result,
+            })
             .is_err()
         {
             break;
         }
+    }
+}
+
+fn run_job(dir: &std::path::Path, pm: Pm, job: &Job) -> Result<(), String> {
+    // One command per (kind, exact) group.
+    let mut groups: Vec<((Kind, bool), Vec<String>)> = Vec::new();
+    for (name, spec, kind, exact) in &job.items {
+        let arg = format!("{name}@{spec}");
+        match groups.iter_mut().find(|(k, _)| *k == (*kind, *exact)) {
+            Some((_, v)) => v.push(arg),
+            None => groups.push(((*kind, *exact), vec![arg])),
+        }
+    }
+    for ((kind, exact), specs) in groups {
+        run_pm(dir, pm, &pm.install_args(&specs, kind, exact))?;
+    }
+
+    if !job.edits.is_empty() {
+        edit::apply(&dir.join("package.json"), &job.edits).map_err(|e| format!("{e:#}"))?;
+        run_pm(dir, pm, &["install".to_string()])
+            .map_err(|e| format!("package.json was updated, but the install failed:\n{e}"))?;
+    }
+    Ok(())
+}
+
+fn run_pm(dir: &std::path::Path, pm: Pm, args: &[String]) -> Result<(), String> {
+    match Command::new(pm.program())
+        .args(args)
+        .current_dir(dir)
+        .output()
+    {
+        Ok(o) if o.status.success() => Ok(()),
+        Ok(o) => {
+            let mut text = String::from_utf8_lossy(&o.stderr).into_owned();
+            if text.trim().is_empty() {
+                text = String::from_utf8_lossy(&o.stdout).into_owned();
+            }
+            Err(format!(
+                "`{} {}` exited with {}\n{}",
+                pm.name(),
+                args.join(" "),
+                o.status,
+                text.trim()
+            ))
+        }
+        Err(e) => Err(format!("could not run {}: {e}", pm.name())),
     }
 }

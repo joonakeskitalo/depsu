@@ -23,6 +23,8 @@ pub struct Override {
     pub source: &'static str,
     /// Parent packages the override is limited to. Empty means it applies everywhere.
     pub path: Vec<String>,
+    /// Location of the value in `package.json`, as a path of keys.
+    pub loc: Vec<String>,
 }
 
 impl Override {
@@ -39,7 +41,12 @@ impl Override {
         format!("{}: {key} → {}", self.source, self.value)
     }
 
-    fn global(&self) -> bool {
+    /// Stable identity of the entry in `package.json`.
+    pub fn key(&self) -> String {
+        self.loc.join("\u{1f}")
+    }
+
+    pub fn global(&self) -> bool {
         self.path.is_empty()
     }
 
@@ -70,14 +77,27 @@ pub fn collect(manifest: &Value, pm: Pm) -> Vec<Override> {
         Pm::Npm => npm_style(top("overrides"), "overrides", &mut out),
         Pm::Bun => {
             npm_style(top("overrides"), "overrides", &mut out);
-            flat(top("resolutions"), "resolutions", '/', &mut out);
+            flat(
+                top("resolutions"),
+                &["resolutions"],
+                "resolutions",
+                '/',
+                &mut out,
+            );
         }
-        Pm::Yarn => flat(top("resolutions"), "resolutions", '/', &mut out),
+        Pm::Yarn => flat(
+            top("resolutions"),
+            &["resolutions"],
+            "resolutions",
+            '/',
+            &mut out,
+        ),
         Pm::Pnpm => flat(
             manifest
                 .get("pnpm")
                 .and_then(|p| p.get("overrides"))
                 .and_then(Value::as_object),
+            &["pnpm", "overrides"],
             "pnpm.overrides",
             '>',
             &mut out,
@@ -96,49 +116,67 @@ fn split_name(key: &str) -> (String, Option<String>) {
 
 /// npm: nested objects, `"."` holds the override for the package itself.
 fn npm_style(obj: Option<&Map<String, Value>>, source: &'static str, out: &mut Vec<Override>) {
-    fn walk(
-        obj: &Map<String, Value>,
-        path: &mut Vec<String>,
+    struct Ctx<'a> {
         source: &'static str,
-        out: &mut Vec<Override>,
-    ) {
+        /// Parent package names the current object is nested under.
+        path: Vec<String>,
+        /// Raw keys from the document root to the current object.
+        loc: Vec<String>,
+        out: &'a mut Vec<Override>,
+    }
+
+    fn walk(obj: &Map<String, Value>, cx: &mut Ctx) {
         for (key, val) in obj {
             if key == "." {
                 continue;
             }
             let (name, range) = split_name(key);
-            let mut push = |value: &str| {
-                out.push(Override {
+            let mut push = |value: &str, extra: Option<&str>| {
+                let mut loc = cx.loc.clone();
+                loc.push(key.clone());
+                loc.extend(extra.map(String::from));
+                cx.out.push(Override {
                     name: name.clone(),
                     range: range.clone(),
                     value: value.to_string(),
-                    source,
-                    path: path.clone(),
+                    source: cx.source,
+                    path: cx.path.clone(),
+                    loc,
                 })
             };
             match val {
-                Value::String(s) => push(s),
+                Value::String(s) => push(s, None),
                 Value::Object(o) => {
                     if let Some(Value::String(s)) = o.get(".") {
-                        push(s);
+                        push(s, Some("."));
                     }
-                    path.push(key.clone());
-                    walk(o, path, source, out);
-                    path.pop();
+                    cx.path.push(key.clone());
+                    cx.loc.push(key.clone());
+                    walk(o, cx);
+                    cx.loc.pop();
+                    cx.path.pop();
                 }
                 _ => {}
             }
         }
     }
+
     if let Some(o) = obj {
-        walk(o, &mut Vec::new(), source, out);
+        let mut cx = Ctx {
+            source,
+            path: Vec::new(),
+            loc: vec![source.to_string()],
+            out,
+        };
+        walk(o, &mut cx);
     }
 }
 
 /// yarn/pnpm/bun-resolutions: flat keys such as `foo`, `**/foo`, `a/foo` (yarn, `/`) or
-/// `a>foo@^1` (pnpm, `>`).
+/// `a>foo@^1` (pnpm, `>`). `root` is the path of keys to the object in `package.json`.
 fn flat(
     obj: Option<&Map<String, Value>>,
+    root: &[&str],
     source: &'static str,
     sep: char,
     out: &mut Vec<Override>,
@@ -162,12 +200,15 @@ fn flat(
         let Some(last) = parts.pop() else { continue };
         let (name, range) = split_name(&last);
         parts.retain(|p| p != "**");
+        let mut loc: Vec<String> = root.iter().map(|s| s.to_string()).collect();
+        loc.push(key.clone());
         out.push(Override {
             name,
             range,
             value: value.to_string(),
             source,
             path: parts,
+            loc,
         });
     }
 }
@@ -307,6 +348,27 @@ mod tests {
     }
 
     #[test]
+    fn records_where_each_value_lives() {
+        let m = json!({
+            "overrides": {"foo": "1.0.0", "bar": {".": "2.0.0", "baz@^1": "3.0.0"}},
+            "resolutions": {"a/b": "4.0.0"},
+            "pnpm": {"overrides": {"p>q": "5.0.0"}}
+        });
+        let loc = |pm, value: &str| {
+            collect(&m, pm)
+                .into_iter()
+                .find(|o| o.value == value)
+                .unwrap()
+                .loc
+        };
+        assert_eq!(loc(Pm::Npm, "1.0.0"), ["overrides", "foo"]);
+        assert_eq!(loc(Pm::Npm, "2.0.0"), ["overrides", "bar", "."]);
+        assert_eq!(loc(Pm::Npm, "3.0.0"), ["overrides", "bar", "baz@^1"]);
+        assert_eq!(loc(Pm::Yarn, "4.0.0"), ["resolutions", "a/b"]);
+        assert_eq!(loc(Pm::Pnpm, "5.0.0"), ["pnpm", "overrides", "p>q"]);
+    }
+
+    #[test]
     fn collects_per_package_manager() {
         let m = json!({
             "overrides": {"a": "1.0.0"},
@@ -345,6 +407,7 @@ mod tests {
             value: value.into(),
             source: "overrides",
             path: vec![],
+            loc: vec!["overrides".into(), "foo".into()],
         }]
     }
 

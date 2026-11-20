@@ -108,11 +108,15 @@ pub enum Item {
         idx: usize,
         name: String,
     },
-    /// Override line nested under the package `rows[idx]`. Never selectable.
+    /// Override line nested under the package `rows[idx]`. It can hold the cursor only when
+    /// the override can be updated (decided by the app).
     Detail {
         idx: usize,
         child: Child,
         last: bool,
+        /// Package name and override key: identity that survives list rebuilds.
+        row: String,
+        key: String,
     },
 }
 
@@ -137,11 +141,18 @@ fn children(r: &Row, idx: usize, mode: Overrides) -> Vec<Item> {
             idx,
             child,
             last: i + 1 == n,
+            row: r.name.clone(),
+            key: match child {
+                Child::Own(i) => r.overrides[i].key(),
+                Child::Tree(i) => r.tree_hits[i].over.key(),
+                Child::More(_) => String::new(),
+            },
         })
         .collect()
 }
 
 const OTHER: &str = "(other)";
+pub const UP_TO_DATE: &str = "Up to date";
 
 /// Group label for a package name. Scoped packages group by scope; unscoped ones by the
 /// text before the first `-`, but only when at least two outdated packages share it.
@@ -159,11 +170,21 @@ fn prefix_label(name: &str, counts: &HashMap<&str, usize>) -> String {
     }
 }
 
-pub fn build(rows: &[Row], mode: GroupBy, filter: &str, ov: Overrides) -> Vec<Item> {
+/// Builds the list. Up-to-date packages (shown only because they have overrides) are
+/// hidden unless `uptodate` is set; they sort after outdated ones.
+pub fn build(
+    rows: &[Row],
+    mode: GroupBy,
+    filter: &str,
+    ov: Overrides,
+    uptodate: bool,
+) -> Vec<Item> {
     let needle = filter.trim().to_lowercase();
-    let visible: Vec<usize> = (0..rows.len())
+    let mut visible: Vec<usize> = (0..rows.len())
+        .filter(|&i| uptodate || rows[i].outdated)
         .filter(|&i| needle.is_empty() || rows[i].name.to_lowercase().contains(&needle))
         .collect();
+    visible.sort_by_key(|&i| !rows[i].outdated); // stable: outdated first
     // A package row followed by its nested override lines.
     let item = |i: usize| {
         let mut v = vec![Item::Row {
@@ -191,6 +212,7 @@ pub fn build(rows: &[Row], mode: GroupBy, filter: &str, ov: Overrides) -> Vec<It
     }
     for i in visible {
         let key = match mode {
+            GroupBy::Release if !rows[i].outdated => (3, UP_TO_DATE.to_string()),
             GroupBy::Release => {
                 let rel = rows[i].release();
                 (rel as u8, rel.label().to_string())
@@ -238,6 +260,7 @@ mod tests {
             overrides: Vec::new(),
             compat: Compat::Ok,
             tree_hits: Vec::new(),
+            outdated: true,
         }
     }
 
@@ -272,7 +295,7 @@ mod tests {
 
     #[test]
     fn groups_by_release_patch_first() {
-        let items = build(&sample(), GroupBy::Release, "", Overrides::Compact);
+        let items = build(&sample(), GroupBy::Release, "", Overrides::Compact, true);
         assert_eq!(
             labels(&items),
             [
@@ -290,7 +313,7 @@ mod tests {
 
     #[test]
     fn groups_by_prefix() {
-        let items = build(&sample(), GroupBy::Prefix, "", Overrides::Compact);
+        let items = build(&sample(), GroupBy::Prefix, "", Overrides::Compact, true);
         assert_eq!(
             labels(&items),
             [
@@ -308,9 +331,15 @@ mod tests {
 
     #[test]
     fn filter_is_case_insensitive_and_drops_empty_groups() {
-        let items = build(&sample(), GroupBy::Prefix, "ESLINT", Overrides::Compact);
+        let items = build(
+            &sample(),
+            GroupBy::Prefix,
+            "ESLINT",
+            Overrides::Compact,
+            true,
+        );
         assert_eq!(labels(&items), ["# eslint-*", "eslint", "eslint-plugin-a"]);
-        assert!(build(&sample(), GroupBy::None, "zzz", Overrides::Compact).is_empty());
+        assert!(build(&sample(), GroupBy::None, "zzz", Overrides::Compact, true).is_empty());
     }
 
     fn hit(name: &str, risk: crate::overrides::Compat) -> crate::tree::Hit {
@@ -321,6 +350,7 @@ mod tests {
                 value: "1.0.0".into(),
                 source: "overrides",
                 path: vec![],
+                loc: vec!["overrides".into(), name.into()],
             },
             via: vec![name.into()],
             installed: None,
@@ -337,7 +367,7 @@ mod tests {
         rows[0].tree_hits = (0..7).map(|i| hit(&format!("t{i}"), Compat::Ok)).collect();
 
         let kinds = |mode| -> Vec<String> {
-            build(&rows, GroupBy::None, "", mode)
+            build(&rows, GroupBy::None, "", mode, true)
                 .iter()
                 .map(|i| match i {
                     Item::Row { name, .. } => name.clone(),
@@ -358,5 +388,32 @@ mod tests {
         let full = kinds(Overrides::Full);
         assert_eq!(full.len(), 1 + 1 + 7 + 1);
         assert_eq!(full[8], "Tree(6)$");
+    }
+
+    #[test]
+    fn up_to_date_rows_sort_last_group_separately_and_can_be_hidden() {
+        let mut rows = sample();
+        rows[0].outdated = false; // @babel/core
+        let names = |items: &[Item]| -> Vec<String> {
+            items
+                .iter()
+                .map(|i| match i {
+                    Item::Row { name, .. } => name.clone(),
+                    Item::Header { label, .. } => format!("# {label}"),
+                    Item::Detail { .. } => "-".into(),
+                })
+                .collect()
+        };
+        let flat = names(&build(&rows, GroupBy::None, "", Overrides::Off, true));
+        assert_eq!(flat.last().unwrap(), "@babel/core");
+        assert_eq!(flat.len(), 5);
+        let grouped = names(&build(&rows, GroupBy::Release, "", Overrides::Off, true));
+        assert_eq!(
+            &grouped[grouped.len() - 2..],
+            ["# Up to date", "@babel/core"]
+        );
+        let hidden = names(&build(&rows, GroupBy::None, "", Overrides::Off, false));
+        assert!(!hidden.contains(&"@babel/core".to_string()));
+        assert_eq!(hidden.len(), 4);
     }
 }

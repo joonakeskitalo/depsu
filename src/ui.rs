@@ -1,7 +1,7 @@
 use crate::app::{App, Row as AppRow, Status};
 use crate::overrides::{self, Compat};
 use crate::pm::Pm;
-use crate::tree::Hit;
+use crate::tree::{self, Hit};
 use crate::view::{Child, GroupBy, Item, Overrides, Release};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout};
@@ -19,21 +19,31 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     ])
     .areas(f.area());
 
-    let state = if app.loading() {
+    let outdated_total = app.rows.iter().filter(|r| r.outdated).count();
+    let mut state = if app.loading() {
         format!("checking {}/{}…", app.total - app.pending, app.total)
-    } else if app.rows.is_empty() {
+    } else if outdated_total == 0 {
         "all dependencies are up to date".to_string()
-    } else if app.shown() != app.rows.len() {
-        format!("{} of {} outdated", app.shown(), app.rows.len())
+    } else if app.shown() != outdated_total {
+        format!("{} of {outdated_total} outdated", app.shown())
     } else {
-        format!("{} outdated", app.rows.len())
+        format!("{outdated_total} outdated")
     };
+    if app.shown_up_to_date() > 0 {
+        state.push_str(&format!(
+            " · {} up to date with overrides",
+            app.shown_up_to_date()
+        ));
+    }
     let mut info = format!(" {} · {} · {}", app.pm.name(), app.registry, state);
     if app.group_by != GroupBy::None {
         info.push_str(&format!(" · group: {}", app.group_by.label()));
     }
     if app.show_overrides != Overrides::Compact {
         info.push_str(&format!(" · overrides: {}", app.show_overrides.label()));
+    }
+    if !app.show_uptodate {
+        info.push_str(" · up-to-date hidden");
     }
     f.render_widget(
         Line::from(vec![" depsu ".black().on_cyan().bold(), info.into()]),
@@ -56,9 +66,9 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         .map(|item| match item {
             Item::Header { label, members } => header_line(app, label, members),
             Item::Row { idx, .. } => row_line(&app.rows[*idx], indent, name_w),
-            Item::Detail { idx, child, last } => {
-                detail_line(app, &app.rows[*idx], *child, *last, indent)
-            }
+            Item::Detail {
+                idx, child, last, ..
+            } => detail_line(app, &app.rows[*idx], *child, *last, indent),
         })
         .map(ListItem::new)
         .collect();
@@ -98,12 +108,12 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     } else if !app.filter.is_empty() {
         Line::from(vec![
             format!(" filter: {}", app.filter).cyan(),
-            "   / edit   esc clear   space select   a all   i install   g group   o overrides"
+            "   / edit   esc clear   space select   a all   i install   g group   o overrides   u up-to-date"
                 .dark_gray(),
         ])
     } else {
         Line::from(
-            " ↑/↓ move   space select   a all   i install   / filter   g group   o overrides   q quit"
+            " ↑/↓ move   space select   a all   i install   / filter   g group   o overrides   u up-to-date   q quit"
                 .dark_gray(),
         )
     };
@@ -123,6 +133,7 @@ fn header_line(app: &App, label: &str, members: &[usize]) -> Line<'static> {
         "Patch" => Color::Green,
         "Minor" => Color::Yellow,
         "Major" => Color::Red,
+        crate::view::UP_TO_DATE => Color::DarkGray,
         _ => Color::Cyan,
     };
     Line::from(format!("{mark} {label} ({})", members.len()))
@@ -134,6 +145,7 @@ fn row_line(r: &AppRow, indent: usize, name_w: usize) -> Line<'static> {
         Status::Queued => "…",
         Status::Installing => "⟳",
         Status::Failed => "✘",
+        Status::Idle if !r.outdated => "·",
         Status::Idle if r.selected => "●",
         Status::Idle => "○",
     };
@@ -159,10 +171,14 @@ fn row_line(r: &AppRow, indent: usize, name_w: usize) -> Line<'static> {
         "{:<14}",
         format!("{}{}", r.prefix, r.current)
     )));
-    spans.push(Span::raw("→ "));
-    spans.push(Span::styled(r.new_spec(), Style::new().fg(color)));
+    if r.outdated {
+        spans.push(Span::raw("→ "));
+        spans.push(Span::styled(r.new_spec(), Style::new().fg(color)));
+    } else {
+        spans.push(Span::styled("✓ up to date", Style::new().fg(Color::Green)));
+    }
     let line = Line::from(spans);
-    if r.busy() {
+    if r.busy() || !r.outdated {
         line.style(Style::new().add_modifier(Modifier::DIM))
     } else {
         line
@@ -211,12 +227,38 @@ fn override_marker(r: &AppRow) -> (Vec<Span<'static>>, usize) {
 fn detail_line(app: &App, r: &AppRow, child: Child, last: bool, indent: usize) -> Line<'static> {
     let branch = if last { "└─" } else { "├─" };
     let prefix = format!("  {}   {branch} ", " ".repeat(indent));
-    let (text, color) = match child {
+
+    let o = match child {
+        Child::Own(i) => r.overrides.get(i),
+        Child::Tree(i) => r.tree_hits.get(i).map(|h| &h.over),
+        Child::More(_) => None,
+    };
+    let update = o.and_then(|o| app.update_target(o));
+    // Selection mark, only on override lines that can be updated.
+    let mark = match (o, &update) {
+        (Some(o), Some(_)) if app.override_busy(o) => "⟳ ",
+        (Some(o), Some(_)) if app.override_selected(o) => "● ",
+        (Some(_), Some(_)) => "○ ",
+        _ => "",
+    };
+    let new_value = update.as_ref().map(|u| {
+        let color = match u.release {
+            Release::Major => Color::Red,
+            Release::Minor => Color::Yellow,
+            Release::Patch => Color::Green,
+        };
+        Span::styled(format!("  ⇢ {}", u.value), Style::new().fg(color))
+    });
+
+    let (text, tail, color) = match child {
         Child::Own(i) => {
             let o = &r.overrides[i];
             let c = overrides::check(std::slice::from_ref(o), app.pm, &r.new_spec(), &r.latest);
+            // Up-to-date packages have no pending update to be compatible with.
             let note = if !o.path.is_empty() {
                 "only applies below another package".to_string()
+            } else if !r.outdated {
+                String::new()
             } else {
                 match c {
                     Compat::Ok => format!("compatible with {}", r.latest),
@@ -233,8 +275,15 @@ fn detail_line(app: &App, r: &AppRow, child: Child, last: bool, indent: usize) -
                     }
                 }
             };
+            let c = if r.outdated { c } else { Compat::Ok };
+            let tail = if note.is_empty() {
+                String::new()
+            } else {
+                format!("  ({note})")
+            };
             (
-                format!("{} {}  ({note})", compat_symbol(c), o.describe()),
+                format!("{} {}", compat_symbol(c), o.describe()),
+                tail,
                 compat_color(c),
             )
         }
@@ -245,14 +294,45 @@ fn detail_line(app: &App, r: &AppRow, child: Child, last: bool, indent: usize) -
             } else {
                 Color::Cyan
             };
-            (format!("↳ {}", hit_text(h)), color)
+            // Would the new override value still satisfy the parent's declared range?
+            let mut tail = String::new();
+            if let Some(u) = &update {
+                let mut moved = h.over.clone();
+                moved.value = u.value.clone();
+                if tree::risk(&moved, &h.requested) == Compat::Conflict {
+                    tail = format!("  ⚠ outside {} wanted by the parent", h.requested);
+                }
+            }
+            (format!("↳ {}", hit_text(h)), tail, color)
         }
-        Child::More(n) => (format!("… +{n} more (press o for all)"), Color::DarkGray),
+        Child::More(n) => (
+            format!("… +{n} more (press o for all)"),
+            String::new(),
+            Color::DarkGray,
+        ),
     };
-    Line::from(vec![
+
+    // The new value goes right after the override itself, before via/notes.
+    let (head, rest) = match child {
+        Child::Tree(i) => {
+            let h = &r.tree_hits[i];
+            let head = format!("↳ {} → {}", h.over.name, h.over.value);
+            let rest = text[head.len().min(text.len())..].to_string();
+            (head, rest)
+        }
+        _ => (text, String::new()),
+    };
+    let mut spans = vec![
         Span::styled(prefix, Style::new().fg(Color::DarkGray)),
-        Span::styled(text, Style::new().fg(color)),
-    ])
+        Span::styled(mark.to_string(), Style::new().fg(Color::White)),
+        Span::styled(head, Style::new().fg(color)),
+    ];
+    spans.extend(new_value);
+    spans.push(Span::styled(
+        format!("{rest}{tail}"),
+        Style::new().fg(color),
+    ));
+    Line::from(spans)
 }
 
 fn hit_text(h: &Hit) -> String {

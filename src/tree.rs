@@ -40,6 +40,11 @@ pub struct Analyzer {
 }
 
 impl Analyzer {
+    /// Replaces the overrides, e.g. after `package.json` was edited.
+    pub fn set_overrides(&mut self, overrides: Vec<Override>) {
+        self.overrides = overrides;
+    }
+
     pub fn new(dir: PathBuf, overrides: Vec<Override>) -> Self {
         Analyzer {
             dir,
@@ -173,7 +178,7 @@ struct Walk {
 }
 
 /// Does the override force a version the parent didn't ask for?
-fn risk(o: &Override, requested: &str) -> Compat {
+pub fn risk(o: &Override, requested: &str) -> Compat {
     if o.value.starts_with('$') || o.value == requested {
         return Compat::Ok;
     }
