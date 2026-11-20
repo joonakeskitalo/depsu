@@ -1,4 +1,5 @@
 use crate::app::{App, Status};
+use crate::view::{GroupBy, Item, Release};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout};
 use ratatui::style::{Color, Modifier, Style, Stylize};
@@ -19,48 +20,79 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         format!("checking {}/{}…", app.total - app.pending, app.total)
     } else if app.rows.is_empty() {
         "all dependencies are up to date".to_string()
+    } else if app.shown() != app.rows.len() {
+        format!("{} of {} outdated", app.shown(), app.rows.len())
     } else {
         format!("{} outdated", app.rows.len())
     };
+    let mut info = format!(" {} · {} · {}", app.pm.name(), app.registry, state);
+    if app.group_by != GroupBy::None {
+        info.push_str(&format!(" · group: {}", app.group_by.label()));
+    }
     f.render_widget(
-        Line::from(vec![
-            " depsu ".black().on_cyan().bold(),
-            format!(" {} · {} · {}", app.pm.name(), app.registry, state).into(),
-        ]),
+        Line::from(vec![" depsu ".black().on_cyan().bold(), info.into()]),
         header,
     );
 
+    let grouped = app.group_by != GroupBy::None;
     let rows: Vec<Row> = app
-        .rows
+        .view
         .iter()
-        .map(|r| {
-            let mark = match r.status {
-                Status::Queued => "…",
-                Status::Installing => "⟳",
-                Status::Failed => "✘",
-                Status::Idle if r.selected => "●",
-                Status::Idle => "○",
-            };
-            let color = if r.latest.major > r.current.major {
-                Color::Red
-            } else if r.latest.minor > r.current.minor {
-                Color::Yellow
-            } else {
-                Color::Green
-            };
-            let mut style = Style::default();
-            if r.busy() {
-                style = style.add_modifier(Modifier::DIM);
+        .map(|item| match item {
+            Item::Header { label, members } => {
+                let sel = members.iter().filter(|&&i| app.rows[i].selected).count();
+                let mark = if sel == 0 {
+                    "○"
+                } else if sel == members.len() {
+                    "●"
+                } else {
+                    "◐"
+                };
+                let color = match label.as_str() {
+                    "Patch" => Color::Green,
+                    "Minor" => Color::Yellow,
+                    "Major" => Color::Red,
+                    _ => Color::Cyan,
+                };
+                Row::new(vec![
+                    Cell::from(mark),
+                    Cell::from(format!("{label} ({})", members.len())),
+                ])
+                .style(Style::new().fg(color).add_modifier(Modifier::BOLD))
             }
-            Row::new(vec![
-                Cell::from(mark),
-                Cell::from(r.name.clone()),
-                Cell::from(r.kind.label()).style(Style::new().fg(Color::DarkGray)),
-                Cell::from(format!("{}{}", r.prefix, r.current)),
-                Cell::from("→"),
-                Cell::from(r.new_spec()).style(Style::new().fg(color)),
-            ])
-            .style(style)
+            Item::Row { idx, .. } => {
+                let r = &app.rows[*idx];
+                let mark = match r.status {
+                    Status::Queued => "…",
+                    Status::Installing => "⟳",
+                    Status::Failed => "✘",
+                    Status::Idle if r.selected => "●",
+                    Status::Idle => "○",
+                };
+                let color = match r.release() {
+                    Release::Major => Color::Red,
+                    Release::Minor => Color::Yellow,
+                    Release::Patch => Color::Green,
+                };
+                let mut style = Style::default();
+                if r.busy() {
+                    style = style.add_modifier(Modifier::DIM);
+                }
+                let name = if grouped {
+                    format!("  {}", r.name)
+                } else {
+                    r.name.clone()
+                };
+                Row::new(vec![
+                    Cell::from(mark),
+                    Cell::from(name),
+                    Cell::from(r.kind.label()).style(Style::new().fg(Color::DarkGray)),
+                    Cell::from(format!("{}{}", r.prefix, r.current)),
+                    Cell::from("→"),
+                    Cell::from(r.new_spec()).style(Style::new().fg(color)),
+                ])
+                .style(style)
+            }
         })
         .collect();
     let table = Table::new(
@@ -98,8 +130,23 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         log,
     );
 
-    f.render_widget(
-        Paragraph::new(" ↑/↓ move   space select   a all   i install   q quit").dark_gray(),
-        help,
-    );
+    let footer: Line = if app.filter_mode {
+        Line::from(vec![
+            " /".cyan().bold(),
+            app.filter.clone().into(),
+            "█".cyan(),
+            "   enter keep   esc clear".dark_gray(),
+        ])
+    } else if !app.filter.is_empty() {
+        Line::from(vec![
+            format!(" filter: {}", app.filter).cyan(),
+            "   / edit   esc clear   space select   a all   i install   g group".dark_gray(),
+        ])
+    } else {
+        Line::from(
+            " ↑/↓ move   space select   a all   i install   / filter   g group   q quit"
+                .dark_gray(),
+        )
+    };
+    f.render_widget(footer, help);
 }

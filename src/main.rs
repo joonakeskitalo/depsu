@@ -5,6 +5,7 @@ mod package;
 mod pm;
 mod registry;
 mod ui;
+mod view;
 
 use anyhow::{Result, bail};
 use ratatui::crossterm::event::{self, Event, KeyEventKind};
@@ -24,6 +25,8 @@ OPTIONS:
 
 KEYS:
     up/down, j/k   move        space  select one       a  select all / none
+    /              filter by name (enter keeps it, esc clears it)
+    g              cycle grouping: none, release type, name prefix
     i, enter       install selected (or the highlighted row)
     q, esc         quit";
 

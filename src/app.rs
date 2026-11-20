@@ -4,6 +4,7 @@ use crate::npmrc::Npmrc;
 use crate::package::{Dep, Kind, parse_spec};
 use crate::pm::Pm;
 use crate::registry;
+use crate::view::{self, GroupBy, Item, Release};
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::widgets::TableState;
 use semver::Version;
@@ -48,6 +49,9 @@ impl Row {
     pub fn new_spec(&self) -> String {
         format!("{}{}", self.prefix, self.latest)
     }
+    pub fn release(&self) -> Release {
+        Release::of(&self.current, &self.latest)
+    }
     pub fn busy(&self) -> bool {
         matches!(self.status, Status::Queued | Status::Installing)
     }
@@ -62,6 +66,10 @@ pub struct App {
     pub pm: Pm,
     pub rows: Vec<Row>,
     pub table: TableState,
+    pub view: Vec<Item>,
+    pub group_by: GroupBy,
+    pub filter: String,
+    pub filter_mode: bool,
     pub log: Vec<String>,
     pub pending: usize,
     pub total: usize,
@@ -111,6 +119,10 @@ impl App {
             pm,
             rows: Vec::new(),
             table: TableState::default(),
+            view: Vec::new(),
+            group_by: GroupBy::None,
+            filter: String::new(),
+            filter_mode: false,
             log: Vec::new(),
             pending: total,
             total,
@@ -174,7 +186,7 @@ impl App {
                         self.push_log(format!("✔ installed {}", names.join(", ")));
                         // Installed packages are now up to date: drop them from the list.
                         self.rows.retain(|r| !names.contains(&r.name));
-                        self.clamp_cursor();
+                        self.rebuild_view();
                     }
                     Err(e) => {
                         for r in self.rows.iter_mut().filter(|r| names.contains(&r.name)) {
@@ -202,18 +214,29 @@ impl App {
         let key = |r: &Row| (r.kind.label(), r.name.clone());
         let pos = self.rows.partition_point(|r| key(r) < key(&row));
         self.rows.insert(pos, row);
-        if self.table.selected().is_none() {
-            self.table.select(Some(0));
-        }
+        self.rebuild_view();
     }
 
-    fn clamp_cursor(&mut self) {
-        if self.rows.is_empty() {
-            self.table.select(None);
-        } else {
-            let i = self.table.selected().unwrap_or(0).min(self.rows.len() - 1);
-            self.table.select(Some(i));
-        }
+    /// Recomputes the displayed list, keeping the cursor on the same item when it still exists.
+    fn rebuild_view(&mut self) {
+        let anchor = self.cursor_item().map(anchor_of);
+        let prev = self.table.selected().unwrap_or(0);
+        self.view = view::build(&self.rows, self.group_by, &self.filter);
+        let pos = anchor.and_then(|a| self.view.iter().position(|it| anchor_of(it) == a));
+        let sel = pos.unwrap_or_else(|| prev.min(self.view.len().saturating_sub(1)));
+        self.table.select((!self.view.is_empty()).then_some(sel));
+    }
+
+    fn cursor_item(&self) -> Option<&Item> {
+        self.table.selected().and_then(|i| self.view.get(i))
+    }
+
+    /// Number of rows currently shown (excluding group headers).
+    pub fn shown(&self) -> usize {
+        self.view
+            .iter()
+            .filter(|i| matches!(i, Item::Row { .. }))
+            .count()
     }
 
     pub fn on_key(&mut self, key: KeyEvent) {
@@ -221,10 +244,18 @@ impl App {
             self.quit = true;
             return;
         }
+        if self.filter_mode {
+            self.on_filter_key(key);
+            return;
+        }
         if !matches!(key.code, KeyCode::Char('q') | KeyCode::Esc) {
             self.quit_warned = false;
         }
         match key.code {
+            KeyCode::Esc if !self.filter.is_empty() => {
+                self.filter.clear();
+                self.rebuild_view();
+            }
             KeyCode::Char('q') | KeyCode::Esc => {
                 if self.installing() && !self.quit_warned {
                     self.quit_warned = true;
@@ -233,26 +264,26 @@ impl App {
                     self.quit = true;
                 }
             }
+            KeyCode::Char('/') => self.filter_mode = true,
+            KeyCode::Char('g') => {
+                self.group_by = self.group_by.next();
+                self.rebuild_view();
+            }
             KeyCode::Down | KeyCode::Char('j') => self.move_cursor(1),
             KeyCode::Up | KeyCode::Char('k') => self.move_cursor(-1),
-            KeyCode::Home | KeyCode::Char('g') => {
-                self.table.select((!self.rows.is_empty()).then_some(0))
-            }
-            KeyCode::End | KeyCode::Char('G') => {
-                self.table.select(self.rows.len().checked_sub(1));
-            }
-            KeyCode::Char(' ') => {
-                if let Some(r) = self.table.selected().and_then(|i| self.rows.get_mut(i))
-                    && !r.busy()
-                {
-                    r.selected = !r.selected;
-                }
-                self.move_cursor(1);
-            }
+            KeyCode::Home => self.table.select((!self.view.is_empty()).then_some(0)),
+            KeyCode::End => self.table.select(self.view.len().checked_sub(1)),
+            KeyCode::Char(' ') => self.toggle_cursor(),
             KeyCode::Char('a') => {
-                let all = self.rows.iter().filter(|r| !r.busy()).all(|r| r.selected);
-                for r in self.rows.iter_mut().filter(|r| !r.busy()) {
-                    r.selected = !all;
+                let visible = self.visible_rows();
+                let all = visible
+                    .iter()
+                    .filter(|&&i| !self.rows[i].busy())
+                    .all(|&i| self.rows[i].selected);
+                for i in visible {
+                    if !self.rows[i].busy() {
+                        self.rows[i].selected = !all;
+                    }
                 }
             }
             KeyCode::Char('i') | KeyCode::Enter => self.install_selected(),
@@ -260,26 +291,88 @@ impl App {
         }
     }
 
+    fn on_filter_key(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Esc => {
+                self.filter.clear();
+                self.filter_mode = false;
+                self.rebuild_view();
+            }
+            KeyCode::Enter => self.filter_mode = false,
+            KeyCode::Backspace => {
+                self.filter.pop();
+                self.rebuild_view();
+            }
+            KeyCode::Down => self.move_cursor(1),
+            KeyCode::Up => self.move_cursor(-1),
+            KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.filter.push(c);
+                self.rebuild_view();
+            }
+            _ => {}
+        }
+    }
+
+    /// Indices (into `rows`) of the rows currently shown.
+    fn visible_rows(&self) -> Vec<usize> {
+        self.view
+            .iter()
+            .filter_map(|it| match it {
+                Item::Row { idx, .. } => Some(*idx),
+                Item::Header { .. } => None,
+            })
+            .collect()
+    }
+
+    /// Space on a row toggles it and moves down; on a group header it toggles the whole group.
+    fn toggle_cursor(&mut self) {
+        match self.cursor_item().cloned() {
+            Some(Item::Row { idx, .. }) => {
+                if !self.rows[idx].busy() {
+                    self.rows[idx].selected = !self.rows[idx].selected;
+                }
+                self.move_cursor(1);
+            }
+            Some(Item::Header { members, .. }) => {
+                let all = members
+                    .iter()
+                    .filter(|&&i| !self.rows[i].busy())
+                    .all(|&i| self.rows[i].selected);
+                for i in members {
+                    if !self.rows[i].busy() {
+                        self.rows[i].selected = !all;
+                    }
+                }
+            }
+            None => {}
+        }
+    }
+
     fn move_cursor(&mut self, delta: isize) {
-        if self.rows.is_empty() {
+        if self.view.is_empty() {
             return;
         }
-        let len = self.rows.len() as isize;
+        let len = self.view.len() as isize;
         let cur = self.table.selected().unwrap_or(0) as isize;
         self.table
             .select(Some((cur + delta).clamp(0, len - 1) as usize));
     }
 
-    /// Queues all checked rows, or the row under the cursor if none are checked.
+    /// Queues all checked visible rows. If none are checked, queues the row under the cursor,
+    /// or every row of the group when the cursor is on a group header.
     fn install_selected(&mut self) {
-        let mut idx: Vec<usize> = (0..self.rows.len())
+        let mut idx: Vec<usize> = self
+            .visible_rows()
+            .into_iter()
             .filter(|&i| self.rows[i].selected && !self.rows[i].busy())
             .collect();
-        if idx.is_empty()
-            && let Some(i) = self.table.selected()
-            && self.rows.get(i).is_some_and(|r| !r.busy())
-        {
-            idx.push(i);
+        if idx.is_empty() {
+            match self.cursor_item() {
+                Some(Item::Row { idx: i, .. }) => idx.push(*i),
+                Some(Item::Header { members, .. }) => idx.extend(members),
+                None => {}
+            }
+            idx.retain(|&i| !self.rows[i].busy());
         }
         if idx.is_empty() {
             return;
@@ -295,6 +388,14 @@ impl App {
         let msg = format!("… queued {}", names.join(", "));
         self.push_log(msg);
         let _ = self.jobs.send(Job { items });
+    }
+}
+
+/// Identity of a list item that survives index changes: (is_header, label or name).
+fn anchor_of(item: &Item) -> (bool, String) {
+    match item {
+        Item::Header { label, .. } => (true, label.clone()),
+        Item::Row { name, .. } => (false, name.clone()),
     }
 }
 
