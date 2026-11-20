@@ -36,11 +36,8 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     } else {
         format!("{outdated_total} outdated")
     };
-    if app.shown_up_to_date() > 0 {
-        state.push_str(&format!(
-            " · {} up to date with overrides",
-            app.shown_up_to_date()
-        ));
+    if outdated_total > 0 && app.shown_up_to_date() > 0 {
+        state.push_str(&format!(" · {} up to date", app.shown_up_to_date()));
     }
     let mut info = format!(" {} · {} · {}", app.pm.name(), app.registry, state);
     if app.group_by != GroupBy::None {

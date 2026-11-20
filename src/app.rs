@@ -89,10 +89,6 @@ impl Row {
     pub fn actionable(&self) -> bool {
         self.outdated && !self.busy()
     }
-
-    fn has_overrides(&self) -> bool {
-        !self.overrides.is_empty() || !self.tree_hits.is_empty()
-    }
 }
 
 /// A newer value for an override entry.
@@ -139,8 +135,6 @@ pub struct App {
     confirm_remove: bool,
     /// False until the first key press: the cursor then stays at the top of the package list.
     cursor_moved: bool,
-    /// Up-to-date packages waiting for the tree analysis to decide if they have overrides.
-    pending_uptodate: HashMap<String, (Kind, &'static str, Version, Version)>,
     tree_tx: Option<Sender<TreeMsg>>,
     confirm_conflicts: bool,
     quit_warned: bool,
@@ -249,7 +243,6 @@ impl App {
             root_deps,
             confirm_remove: false,
             cursor_moved: false,
-            pending_uptodate: HashMap::new(),
             tree_tx,
             confirm_conflicts: false,
             quit_warned: false,
@@ -340,44 +333,21 @@ impl App {
             compat,
             tree_hits: Vec::new(),
         };
-        if outdated {
-            let compat = overrides::check(&own, self.pm, &format!("{prefix}{latest}"), &latest);
-            self.analyze(&name);
-            let r = row(own, compat);
-            self.insert_row(r);
-        } else if !own.is_empty() {
-            // Up to date, but listed so its overrides are visible.
-            self.analyze(&name);
-            let r = row(own, Compat::Ok);
-            self.insert_row(r);
-        } else if self.tree_tx.is_some() {
-            // Only listed if something in its dependency tree is overridden.
-            self.pending_uptodate
-                .insert(name.clone(), (kind, prefix, cur, latest));
-            self.analyze(&name);
-        }
+        // Packages that are already up to date are listed too, so their overrides are visible.
+        let compat = if outdated {
+            overrides::check(&own, self.pm, &format!("{prefix}{latest}"), &latest)
+        } else {
+            Compat::Ok
+        };
+        self.analyze(&name);
+        let r = row(own, compat);
+        self.insert_row(r);
     }
 
     fn on_tree(&mut self, name: String, mut hits: Vec<Hit>) {
         // Risky hits first, so they survive the compact view's cut-off.
         hits.sort_by_key(|h| std::cmp::Reverse(h.risk));
-        if let Some((kind, prefix, current, latest)) = self.pending_uptodate.remove(&name) {
-            if !hits.is_empty() {
-                self.insert_row(Row {
-                    name,
-                    kind,
-                    prefix,
-                    current,
-                    latest,
-                    outdated: false,
-                    selected: false,
-                    status: Status::Idle,
-                    overrides: Vec::new(),
-                    compat: Compat::Ok,
-                    tree_hits: hits,
-                });
-            }
-        } else if let Some(r) = self.rows.iter_mut().find(|r| r.name == name) {
+        if let Some(r) = self.rows.iter_mut().find(|r| r.name == name) {
             r.tree_hits = hits;
             self.rebuild_view();
         }
@@ -400,15 +370,13 @@ impl App {
         match result {
             Ok(()) => {
                 self.push_log(format!("✔ done: {}", what.join(", ")));
-                // Updated packages are up to date now. Keep the ones with overrides in the
-                // list (so the overrides stay visible) and drop the rest.
+                // Updated packages are up to date now; they stay in the list as such.
                 for r in self.rows.iter_mut().filter(|r| names.contains(&r.name)) {
                     r.outdated = false;
                     r.current = r.latest.clone();
                     r.compat = Compat::Ok;
                     r.status = Status::Idle;
                 }
-                self.rows.retain(|r| r.outdated || r.has_overrides());
             }
             Err(e) => {
                 for r in self.rows.iter_mut().filter(|r| names.contains(&r.name)) {
