@@ -48,11 +48,63 @@ pub struct Vuln {
     /// Packages below the direct dependency down to the vulnerable one (empty if it is the
     /// direct dependency itself).
     pub path: Vec<String>,
-    /// Versions of the vulnerable package that fix it.
+    /// Versions of the vulnerable package that fix it, across all its release lines.
     pub fixed_in: Vec<String>,
-    /// Whether upgrading the direct dependency fixes it.
-    pub fixable: bool,
+    /// The version of the direct dependency that fixes this finding, if upgrading it does.
+    pub upgrade_to: Option<String>,
+    /// For a transitive finding: the version of the vulnerable package that upgrade brings in.
+    pub upgrade_brings: Option<String>,
     pub cve: Vec<String>,
+}
+
+impl Vuln {
+    /// Releases of the vulnerable package that fix this finding and are newer than the
+    /// installed one. Snyk lists the fixed version of every older release line too, which is
+    /// of no use here.
+    pub fn newer_fixes(&self) -> Vec<&str> {
+        let installed = Version::parse(&self.version).ok();
+        let mut fixes: Vec<(Option<Version>, &str)> = self
+            .fixed_in
+            .iter()
+            .map(|f| (Version::parse(f).ok(), f.as_str()))
+            .filter(|(v, _)| match (v, &installed) {
+                (Some(v), Some(i)) => v > i,
+                _ => true, // can't compare: keep it rather than hide a fix
+            })
+            .collect();
+        fixes.sort_by(|a, b| a.0.cmp(&b.0));
+        fixes.into_iter().map(|(_, s)| s).collect()
+    }
+
+    /// What to do about this finding, from the point of view of the direct dependency.
+    pub fn fix_summary(&self) -> String {
+        if let Some(to) = &self.upgrade_to {
+            return match &self.upgrade_brings {
+                None => format!("fixed in {} {to}", self.direct),
+                Some(nested) => format!(
+                    "fixed by upgrading {} to {to} (brings {} {nested})",
+                    self.direct, self.package
+                ),
+            };
+        }
+        let fixes = self.newer_fixes();
+        if fixes.is_empty() {
+            return "no fix available".to_string();
+        }
+        let shown: Vec<&str> = fixes.iter().take(3).copied().collect();
+        let more = if fixes.len() > 3 { " …" } else { "" };
+        let who = if self.path.is_empty() {
+            self.package.clone()
+        } else {
+            format!("{} (in {})", self.package, self.direct)
+        };
+        format!(
+            "{} {}{more} has the fix, but upgrading {} doesn't bring it in",
+            who,
+            shown.join(" / "),
+            self.direct
+        )
+    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -68,6 +120,18 @@ pub struct Report {
 fn split_pkg(s: &str) -> Option<(&str, &str)> {
     let i = s.get(1..)?.rfind('@')? + 1;
     Some((&s[..i], &s[i + 1..]))
+}
+
+/// Like `strings`, but entries that aren't strings (Snyk puts `false` first) are skipped
+/// instead of shifting the positions of the others.
+fn strings_or_false(v: Option<&Value>) -> Vec<String> {
+    v.and_then(Value::as_array)
+        .map(|a| {
+            a.iter()
+                .map(|x| x.as_str().unwrap_or("").to_string())
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 fn strings(v: Option<&Value>) -> Vec<String> {
@@ -125,6 +189,20 @@ pub fn parse(text: &str) -> Result<Report, String> {
             )) {
                 continue;
             }
+            // `upgradePath` is `[false, "direct@fixed", .., "vulnerable@fixed"]` when upgrading
+            // the direct dependency fixes it, and empty or `[false]` when nothing does.
+            let up = strings_or_false(v.get("upgradePath"));
+            let upgrade_to = up
+                .get(1)
+                .and_then(|s| split_pkg(s))
+                .map(|(_, v)| v.to_string());
+            let upgrade_brings = (up.len() > 2)
+                .then(|| {
+                    up.last()
+                        .and_then(|s| split_pkg(s))
+                        .map(|(_, v)| v.to_string())
+                })
+                .flatten();
             let severity = v
                 .get("severityWithCritical")
                 .or_else(|| v.get("severity"))
@@ -147,10 +225,8 @@ pub fn parse(text: &str) -> Result<Report, String> {
                     .map(|s| split_pkg(s).map_or(s.as_str(), |(n, _)| n).to_string())
                     .collect(),
                 fixed_in: strings(v.get("fixedIn")),
-                fixable: v
-                    .get("isUpgradable")
-                    .and_then(Value::as_bool)
-                    .unwrap_or(false),
+                upgrade_to,
+                upgrade_brings,
                 cve: strings(v.get("identifiers").and_then(|i| i.get("CVE"))),
             });
         }
@@ -274,7 +350,8 @@ mod tests {
             ("lodash", "4.17.15")
         );
         assert_eq!(v.cve, ["CVE-2021-23337"]);
-        assert!(v.fixable);
+        assert_eq!(v.upgrade_to.as_deref(), Some("4.17.21"));
+        assert_eq!(v.fix_summary(), "fixed in lodash 4.17.21");
     }
 
     #[test]
@@ -291,8 +368,82 @@ mod tests {
         assert_eq!(r.fixes["other"], Version::new(2, 1, 0));
         // unfixable issue in a scoped direct dependency: no suggestion
         let old = r.vulns.iter().find(|v| v.direct == "@scope/old").unwrap();
-        assert!(!old.fixable);
+        assert_eq!(old.fix_summary(), "no fix available");
         assert!(!r.fixes.contains_key("@scope/old"));
+    }
+
+    const TRANSITIVE_REAL: &str = include_str!("../tests/fixtures/snyk_transitive_real.json");
+
+    fn summary(r: &Report, direct: &str, id: &str) -> String {
+        r.vulns
+            .iter()
+            .find(|v| v.direct == direct && v.id == id)
+            .unwrap_or_else(|| panic!("{direct} {id}"))
+            .fix_summary()
+    }
+
+    #[test]
+    fn the_same_issue_gets_a_fix_text_specific_to_each_direct_dependency() {
+        let r = parse(TRANSITIVE_REAL).unwrap();
+        // qs 6.x is a dependency of both express and request. Upgrading express brings the
+        // fixed qs in, upgrading request doesn't. The text must say so, and name the package.
+        let via_express = summary(&r, "express", "SNYK-JS-QS-14724253");
+        let via_request = summary(&r, "request", "SNYK-JS-QS-14724253");
+        assert_ne!(via_express, via_request);
+        assert!(
+            via_express.starts_with("fixed by upgrading express to "),
+            "{via_express}"
+        );
+        assert!(via_express.contains("(brings qs "), "{via_express}");
+        assert_eq!(
+            via_request,
+            "qs (in request) 6.14.1 has the fix, but upgrading request doesn't bring it in"
+        );
+    }
+
+    #[test]
+    fn different_findings_of_one_package_give_different_upgrade_targets() {
+        let r = parse(TRANSITIVE_REAL).unwrap();
+        // Each finding needs a different minimum express version.
+        let targets: std::collections::HashSet<_> = r
+            .vulns
+            .iter()
+            .filter(|v| v.direct == "express")
+            .filter_map(|v| v.upgrade_to.clone())
+            .collect();
+        assert!(targets.len() > 1, "{targets:?}");
+        // the overall suggestion covers all of them
+        let best = targets
+            .iter()
+            .filter_map(|t| Version::parse(t).ok())
+            .max()
+            .unwrap();
+        assert_eq!(r.fixes["express"], best);
+    }
+
+    #[test]
+    fn only_lists_fixes_newer_than_the_installed_version() {
+        let r = parse(TRANSITIVE_REAL).unwrap();
+        // qs 6.7.0 is installed: Snyk also lists 6.2.4 ... 6.6.1 for older release lines
+        let v = r
+            .vulns
+            .iter()
+            .find(|v| v.id == "SNYK-JS-QS-3153490" && v.direct == "express")
+            .unwrap();
+        assert!(v.fixed_in.len() > 5);
+        let newer = v.newer_fixes();
+        assert_eq!(newer.first(), Some(&"6.7.3"));
+        assert!(
+            !newer.contains(&"6.2.4") && !newer.contains(&"6.6.1"),
+            "{newer:?}"
+        );
+        // and without any fix there is nothing to say
+        let none = r
+            .vulns
+            .iter()
+            .find(|v| v.id == "SNYK-JS-REQUEST-3361831")
+            .unwrap();
+        assert_eq!(none.fix_summary(), "no fix available");
     }
 
     #[test]

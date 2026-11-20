@@ -376,18 +376,7 @@ fn detail_lines(
             if let Some(cve) = v.cve.first() {
                 t.push_str(&format!("  · {cve}"));
             }
-            if v.fixed_in.is_empty() {
-                t.push_str("  · no fix available");
-            } else if v.fixable {
-                t.push_str(&format!("  · fixed in {}", v.fixed_in.join(" / ")));
-            } else {
-                // A fixed release exists, but upgrading this dependency doesn't bring it in.
-                t.push_str(&format!(
-                    "  · fixed in {}, but not reachable by upgrading {}",
-                    v.fixed_in.join(" / "),
-                    v.direct
-                ));
-            }
+            t.push_str(&format!("  · {}", v.fix_summary()));
             (t, String::new(), severity_color(v.severity))
         }
         Child::MoreVulns(n) => (

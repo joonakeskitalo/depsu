@@ -12,7 +12,7 @@ Illustrative output:
 ```
  depsu  pnpm · https://registry.npmjs.org/ · 3 outdated · 12 up to date · snyk: 10 vulnerabilities (5 high+)
 ○ lodash            ✱    dep 4.17.15       → 4.18.1   snyk fix: 4.18.1
-     ├─ ✱ high     SNYK-JS-LODASH-1040724  Code Injection  · lodash@4.17.15  · CVE-2021-23337  · fixed in 4.17.21
+     ├─ ✱ high     SNYK-JS-LODASH-1040724  Code Injection  · lodash@4.17.15  · CVE-2021-23337  · fixed in lodash 4.17.21
      └─ … +7 more vulnerabilities (press o for all)
 ○ react-dom         ⚑    dep ^18.2.0       → ^19.0.0
 · zod                    dep ^3.23.8       ✓ up to date
@@ -172,7 +172,10 @@ Requires the [Snyk CLI](https://docs.snyk.io/snyk-cli) (`npm i -g snyk`) and `sn
 counts against your organisation's test quota**, so it never runs automatically.
 
 - Each vulnerability is shown under the direct dependency that brings it in, with severity, ID,
-  CVE, the vulnerable package and the path to it, and whether upgrading actually fixes it.
+  CVE, the vulnerable package and the path to it, and what to do about it from the direct
+  dependency's point of view: the version of the direct dependency that fixes the finding
+  (`fixed by upgrading express to 4.22.0 (brings qs 6.14.3)`), or, when upgrading it doesn't help,
+  the fixed releases of the nested package that are newer than the installed one.
 - `snyk fix: <version>` on a row is Snyk's suggested version for that dependency. It fixes
   everything fixable and can be lower than the latest release. Press `f` to install it.
 - After an install, the findings of updated packages are dropped and the top bar says the results
