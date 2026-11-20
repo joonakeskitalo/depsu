@@ -92,7 +92,7 @@ impl App {
         let queue = Arc::new(Mutex::new(names));
         let rc = Arc::new(rc);
         let agent = registry::agent();
-        for _ in 0..16.min(total) {
+        for _ in 0..registry::CONCURRENCY.min(total) {
             let (queue, rc, agent, tx) = (queue.clone(), rc.clone(), agent.clone(), tx.clone());
             thread::spawn(move || {
                 while let Some(name) = queue.lock().unwrap().pop_front() {
