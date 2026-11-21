@@ -1,4 +1,5 @@
 mod app;
+mod blocked;
 mod audit;
 mod bunfig;
 mod cache;

@@ -127,6 +127,15 @@ Versions are fetched the way `npm-check-updates` does it: the package document i
 the abbreviated (corgi) `Accept` header and reading stops as soon as `dist-tags` has been seen,
 with a retry for the full document on a 404. Requests run 16 at a time.
 
+**Blocked versions.** Registries with a security policy (JFrog Curation, Nexus Firewall and
+the like) list blocked versions but answer 403 when one is downloaded. Before an install, depsu
+checks that each version it is about to install can be downloaded. If one can't, it looks for the
+newest older release that can (trying up to 15) and offers it in a dialog: `y` installs it
+instead, `n` installs the rest only. If an install still fails with a 403 for a package file,
+also for a nested package, depsu does the same and offers that version, or for a nested package
+an override to it. The version is pinned exactly, because a range would resolve to the blocked
+version again.
+
 ### What counts as outdated
 
 `depsu` compares the lowest version of each dependency's range with the registry's `latest`

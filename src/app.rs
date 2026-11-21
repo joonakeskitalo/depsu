@@ -56,6 +56,13 @@ pub enum Event {
         version: Option<Version>,
         result: Result<registry::Packument, String>,
     },
+    /// Versions the registry refuses to hand out were found.
+    Blocked {
+        plan: Vec<(String, Version)>,
+        ovr: Vec<(Override, String)>,
+        blocked: Vec<crate::blocked::Blocked>,
+        after_failure: bool,
+    },
     /// The ways to fix a package's unmet peers were looked up.
     PeerFixes {
         name: String,
@@ -154,6 +161,28 @@ pub struct RemovedPkg {
 }
 /// Looks a package up in the registry. Replaceable so tests run without the network.
 pub type Fetcher = Arc<dyn Fn(&str) -> Result<registry::Packument, String> + Send + Sync>;
+/// Whether the registry hands out a package file: (package name, file URL).
+pub type Prober = Arc<dyn Fn(&str, &str) -> Result<bool, String> + Send + Sync>;
+
+/// Versions the registry refuses to hand out, waiting for the user to decide.
+pub struct BlockedPrompt {
+    /// The install that was about to run (empty when it already failed).
+    pub plan: Vec<(String, Version)>,
+    ovr: Vec<(Override, String)>,
+    pub blocked: Vec<crate::blocked::Blocked>,
+    /// The install already failed: the blocked version may be a nested package.
+    pub after_failure: bool,
+}
+
+impl BlockedPrompt {
+    pub fn has_alternatives(&self) -> bool {
+        self.blocked.iter().any(|b| b.alternative.is_some())
+    }
+    /// Something in the install isn't blocked.
+    pub fn has_others(&self) -> bool {
+        !self.ovr.is_empty() || self.plan.iter().any(|(n, _)| !self.blocked.iter().any(|b| b.name == *n))
+    }
+}
 
 /// Text the user is typing: a version in the footer (`e`), or a package in the add dialog
 /// (`+`).
@@ -428,6 +457,12 @@ pub struct App {
     pub peer_fix: Option<PeerFix>,
     /// What `d` is about to delete.
     pub delete_prompt: Option<DeletePrompt>,
+    /// Versions the registry refuses, and what can be installed instead.
+    pub blocked_prompt: Option<BlockedPrompt>,
+    /// Packages to install with an exact version the next time they are queued, because a
+    /// range would resolve to a blocked version again.
+    exact_once: HashSet<String>,
+    prober: Prober,
     /// The peer dependencies of an install are being checked.
     peer_checking: bool,
     /// Text the user is typing: a version (`e`) or a package to add (`+`).
@@ -594,6 +629,12 @@ impl App {
             peer_prompt: None,
             peer_fix: None,
             delete_prompt: None,
+            blocked_prompt: None,
+            exact_once: HashSet::new(),
+            prober: {
+                let (rc, agent) = (rc.clone(), agent.clone());
+                Arc::new(move |n: &str, url: &str| registry::downloadable(&rc, &agent, n, url))
+            },
             peer_checking: false,
             input: None,
             adding: HashMap::new(),
@@ -1030,6 +1071,12 @@ impl App {
                     options,
                     notes,
                 } => self.on_peer_fixes(name, unmet, options, notes),
+                Event::Blocked {
+                    plan,
+                    ovr,
+                    blocked,
+                    after_failure,
+                } => self.on_blocked(plan, ovr, blocked, after_failure),
                 Event::VersionChecked {
                     name,
                     version,
@@ -1157,6 +1204,10 @@ impl App {
         result: Result<(), String>,
     ) {
         let ok = result.is_ok();
+        let forbidden = result
+            .as_ref()
+            .err()
+            .and_then(|e| crate::blocked::parse_forbidden(e));
         let added: Vec<(String, Adding)> = names
             .iter()
             .filter_map(|n| Some((n.clone(), self.adding.remove(n)?)))
@@ -1288,6 +1339,9 @@ impl App {
         self.read_installed_versions();
         self.refresh_findings();
         self.rebuild_view();
+        if let Some((name, version)) = forbidden {
+            self.look_for_unblocked(name, version);
+        }
     }
 
     /// Re-reads `package.json` and re-runs the override analysis against the current
@@ -1800,6 +1854,31 @@ impl App {
             self.on_filter_key(key);
             return;
         }
+        if let Some(p) = self.blocked_prompt.take() {
+            match key.code {
+                KeyCode::Char('y') if p.has_alternatives() => self.use_unblocked(p),
+                KeyCode::Char('n') if !p.after_failure && p.has_others() => {
+                    let plan: Vec<(String, Version)> = p
+                        .plan
+                        .into_iter()
+                        .filter(|(n, _)| !p.blocked.iter().any(|b| b.name == *n))
+                        .collect();
+                    for b in &p.blocked {
+                        self.adding.remove(&b.name);
+                    }
+                    self.start_install(plan, p.ovr);
+                }
+                _ => {
+                    for (name, _) in &p.plan {
+                        self.adding.remove(name);
+                    }
+                    if !p.after_failure {
+                        self.push_log("Install cancelled.");
+                    }
+                }
+            }
+            return;
+        }
         if let Some(p) = self.delete_prompt.take() {
             match key.code {
                 KeyCode::Char('y') | KeyCode::Enter => self.confirm_delete(p),
@@ -2274,7 +2353,7 @@ impl App {
         self.input = None;
         let latest = doc.latest.clone().unwrap_or_else(|| version.clone());
         match add_as {
-            AddAs::Override => self.add_override(&name, &version),
+            AddAs::Override => self.add_override(&name, &version, false),
             AddAs::Dependency | AddAs::Dev => {
                 let kind = if add_as == AddAs::Dev { Kind::Dev } else { Kind::Prod };
                 self.adding.insert(
@@ -2291,17 +2370,143 @@ impl App {
     }
 
     /// Adds an override that forces `name` to `version` everywhere in the dependency tree.
-    fn add_override(&mut self, name: &str, version: &Version) {
-        let loc = self.new_override_loc(name);
+    /// Forces `name` to `version` everywhere in the dependency tree with an override, `^version`
+    /// or exactly `version`. An existing override of it is changed instead.
+    fn add_override(&mut self, name: &str, version: &Version, exact: bool) {
+        let new = if exact { version.to_string() } else { format!("^{version}") };
+        let (loc, change) = match self
+            .overrides
+            .iter()
+            .find(|o| o.name == name && o.global() && o.range.is_none())
+        {
+            Some(o) => (
+                o.loc.clone(),
+                Change::Set {
+                    loc: o.loc.clone(),
+                    old: o.value.clone(),
+                    new: new.clone(),
+                },
+            ),
+            None => {
+                let loc = self.new_override_loc(name);
+                (loc.clone(), Change::Add { loc, new: new.clone() })
+            }
+        };
         let key = loc.join("\u{1f}");
-        let new = format!("^{version}");
         self.changed.insert(key.clone());
         self.busy_overrides.insert(key.clone());
         self.push_log(format!("… queued override {name} → {new}"));
         let _ = self.jobs.send(Job {
-            edits: vec![Change::Add { loc, new }],
+            edits: vec![change],
             keys: vec![key],
             ..Default::default()
+        });
+    }
+
+    /// Shows what the registry refuses and what it hands out instead.
+    fn on_blocked(
+        &mut self,
+        plan: Vec<(String, Version)>,
+        ovr: Vec<(Override, String)>,
+        blocked: Vec<crate::blocked::Blocked>,
+        after_failure: bool,
+    ) {
+        if !after_failure {
+            self.peer_checking = false;
+        }
+        for b in &blocked {
+            self.push_log(format!(
+                "✘ {} {} can't be downloaded: the registry refuses it (403).{}",
+                b.name,
+                b.version,
+                match &b.alternative {
+                    Some(a) => format!(" The newest version it hands out is {a}."),
+                    None => " No older version could be downloaded either.".to_string(),
+                }
+            ));
+        }
+        let p = BlockedPrompt {
+            plan,
+            ovr,
+            blocked,
+            after_failure,
+        };
+        // After a failed install there's only something to ask if a version was found.
+        if after_failure && !p.has_alternatives() {
+            return;
+        }
+        // The answer must not land in a text prompt or another question.
+        self.filter_mode = false;
+        self.pin_prompt = false;
+        self.input = None;
+        self.blocked_prompt = Some(p);
+    }
+
+    /// Installs (or, for a nested package, overrides to) the versions the registry hands out,
+    /// pinned exactly: a range would resolve to the blocked version again.
+    fn use_unblocked(&mut self, p: BlockedPrompt) {
+        if p.after_failure {
+            for b in p.blocked {
+                let Some(alt) = b.alternative else {
+                    continue;
+                };
+                let is_row = self
+                    .rows
+                    .iter()
+                    .any(|r| r.name == b.name && r.kind != Kind::Override);
+                if is_row {
+                    self.exact_once.insert(b.name.clone());
+                    self.start_install(vec![(b.name, alt)], Vec::new());
+                } else {
+                    self.add_override(&b.name, &alt, true);
+                }
+            }
+            return;
+        }
+        let mut plan = Vec::new();
+        for (name, version) in p.plan {
+            match p.blocked.iter().find(|b| b.name == name) {
+                None => plan.push((name, version)),
+                Some(b) => match &b.alternative {
+                    Some(alt) => {
+                        self.exact_once.insert(name.clone());
+                        if let Some(a) = self.adding.get_mut(&name) {
+                            a.version = alt.clone();
+                        }
+                        plan.push((name, alt.clone()));
+                    }
+                    None => {
+                        self.adding.remove(&name);
+                    }
+                },
+            }
+        }
+        self.start_install(plan, p.ovr);
+    }
+
+    /// After an install failed because the registry refused a file: looks for the newest
+    /// version of that package it hands out.
+    fn look_for_unblocked(&mut self, name: String, version: Version) {
+        self.push_log(format!(
+            "… the registry refused {name} {version} (403): looking for a version it hands out"
+        ));
+        let direct = self.direct.contains(&name);
+        let (fetcher, prober, tx) = (self.fetcher.clone(), self.prober.clone(), self.events_tx.clone());
+        thread::spawn(move || {
+            let alternative = fetcher(&name)
+                .ok()
+                .and_then(|doc| crate::blocked::latest_available(&doc, &version, &|u| prober(&name, u)));
+            let _ = tx.send(Event::Blocked {
+                plan: Vec::new(),
+                ovr: Vec::new(),
+                blocked: vec![crate::blocked::Blocked {
+                    name,
+                    version,
+                    alternative,
+                    direct,
+                }],
+                after_failure: true,
+            });
         });
     }
 
@@ -2821,16 +3026,38 @@ impl App {
             .filter(|r| r.kind != Kind::Override)
             .map(|r| r.name.clone())
             .collect();
-        let (dir, fetcher, tx) = (
+        let (dir, fetcher, prober, tx) = (
             self.dir.clone(),
             self.fetcher.clone(),
+            self.prober.clone(),
             self.events_tx.clone(),
         );
         thread::spawn(move || {
             let lock = crate::tree::npm_lock_versions(&dir);
             let installed = |n: &str| resolved_version(&dir, lock.as_ref(), n);
             let installed_peers = |n: &str| crate::tree::installed_peers(&dir, n);
-            let fetch = |n: &str| fetcher(n);
+            // Each package document is fetched once for both checks.
+            let memo: std::cell::RefCell<HashMap<String, Result<registry::Packument, String>>> =
+                Default::default();
+            let fetch = |n: &str| {
+                if let Some(r) = memo.borrow().get(n) {
+                    return r.clone();
+                }
+                let r = fetcher(n);
+                memo.borrow_mut().insert(n.to_string(), r.clone());
+                r
+            };
+            // A version the registry refuses would only fail the install.
+            let blocked = crate::blocked::find_blocked(&plan, &fetch, &|n, u| prober(n, u), &direct);
+            if !blocked.is_empty() {
+                let _ = tx.send(Event::Blocked {
+                    plan,
+                    ovr,
+                    blocked,
+                    after_failure: false,
+                });
+                return;
+            }
             let report = peers::check(
                 &plan,
                 &peers::Project {
@@ -2904,13 +3131,14 @@ impl App {
     fn queue_install(&mut self, plan: Vec<(String, Version)>, ovr: Vec<(Override, String)>) {
         let mut items = Vec::new();
         for (name, target) in plan {
+            let exact_now = self.exact_once.remove(&name);
             let Some(r) = self.rows.iter_mut().find(|r| r.name == name) else {
                 if let Some(a) = self.adding.get(&name) {
                     items.push(InstallItem {
                         name: name.clone(),
-                        spec: format!("^{target}"),
+                        spec: if exact_now { target.to_string() } else { format!("^{target}") },
                         kind: a.kind,
-                        exact: false,
+                        exact: exact_now,
                         old: None,
                     });
                 }
@@ -2921,11 +3149,12 @@ impl App {
             }
             r.selected = false;
             r.status = Status::Queued;
+            let exact = exact_now || r.prefix.is_empty();
             items.push(InstallItem {
                 name: r.name.clone(),
-                spec: format!("{}{target}", r.prefix),
+                spec: if exact { target.to_string() } else { format!("{}{target}", r.prefix) },
                 kind: r.kind,
-                exact: r.prefix.is_empty(),
+                exact,
                 old: spec_in_manifest(&self.root_deps, &r.name),
             });
             self.install_targets.insert(r.name.clone(), target);
@@ -4347,23 +4576,32 @@ mod tests {
     /// A fake registry: `a` has 1.0.0, 1.5.0 and 2.0.0; `lodash` has 4.17.20 and 4.17.21.
     fn fake_registry() -> Fetcher {
         use crate::registry::{Packument, VersionInfo};
-        let doc = |latest: &str, versions: &[&str]| Packument {
+        let doc = |name: &str, latest: &str, versions: &[&str]| Packument {
             latest: Some(Version::parse(latest).unwrap()),
             versions: versions
                 .iter()
-                .map(|v| (Version::parse(v).unwrap(), VersionInfo::default()))
+                .map(|v| {
+                    let tarball = Some(format!("https://r/{name}/-/{name}-{v}.tgz"));
+                    (Version::parse(v).unwrap(), VersionInfo { tarball, ..Default::default() })
+                })
                 .collect(),
         };
         let docs = HashMap::from([
-            ("a".to_string(), doc("2.0.0", &["1.0.0", "1.5.0", "2.0.0"])),
-            ("b".to_string(), doc("1.0.0", &["1.0.0"])),
-            ("lodash".to_string(), doc("4.17.21", &["4.17.20", "4.17.21"])),
+            ("a".to_string(), doc("a", "2.0.0", &["1.0.0", "1.5.0", "2.0.0"])),
+            ("b".to_string(), doc("b", "1.0.0", &["1.0.0"])),
+            ("lodash".to_string(), doc("lodash", "4.17.21", &["4.17.20", "4.17.21"])),
+            ("qs".to_string(), doc("qs", "6.0.4", &["6.0.3", "6.0.4"])),
         ]);
         Arc::new(move |n: &str| docs.get(n).cloned().ok_or_else(|| format!("{n} not found")))
+    }
+    /// Every file downloads, except those whose URL contains one of `blocked`.
+    fn blocking(blocked: &'static [&'static str]) -> Prober {
+        Arc::new(move |_, url: &str| Ok(!blocked.iter().any(|b| url.contains(b))))
     }
     fn offline_app() -> (App, Receiver<Job>) {
         let (mut app, rx) = app_capturing_installs();
         app.fetcher = fake_registry();
+        app.prober = blocking(&[]);
         (app, rx)
     }
     fn type_text(app: &mut App, text: &str) {
@@ -4918,6 +5156,7 @@ mod tests {
                         Version::parse(v).unwrap(),
                         VersionInfo {
                             peers: peers.iter().map(|(n, r)| (n.to_string(), r.to_string())).collect(),
+                            tarball: None,
                         },
                     )
                 })
@@ -5098,6 +5337,124 @@ mod tests {
         let p = app.delete_prompt.unwrap();
         assert!(p.packages.is_empty());
         assert_eq!(p.overrides[0].name, "a");
+    }
+
+    fn items(jobs: &[Job]) -> Vec<(String, String, bool)> {
+        jobs.iter()
+            .flat_map(|j| &j.items)
+            .map(|i| (i.name.clone(), i.spec.clone(), i.exact))
+            .collect()
+    }
+
+    #[test]
+    fn a_blocked_version_is_replaced_by_the_newest_one_the_registry_hands_out() {
+        let (mut app, rx) = offline_app();
+        app.prober = blocking(&["lodash-4.17.21.tgz"]);
+        app.on_key(key('+'));
+        type_text(&mut app, "lodash");
+        press(&mut app, KeyCode::Enter);
+        wait_until(&mut app, |a| a.blocked_prompt.is_some());
+        let p = app.blocked_prompt.as_ref().unwrap();
+        assert_eq!(p.blocked[0].name, "lodash");
+        assert_eq!(p.blocked[0].version, Version::new(4, 17, 21));
+        assert_eq!(p.blocked[0].alternative, Some(Version::new(4, 17, 20)));
+        assert!(rx.try_recv().is_err(), "nothing installs before the answer");
+
+        let screen = render(&mut app, 120, 40).join("\n");
+        assert!(screen.contains(" Blocked by the registry "), "{screen}");
+        assert!(screen.contains("lodash 4.17.21 can't be downloaded: the registry refuses it (403 Forbidden)."), "{screen}");
+        assert!(screen.contains("The newest version it hands out is 4.17.20."), "{screen}");
+        assert!(screen.contains("y  install lodash 4.17.20 instead"), "{screen}");
+        assert!(screen.contains("a range like ^4.17.20 would pick 4.17.21 again"), "{screen}");
+
+        app.on_key(key('y'));
+        let jobs = settle(&mut app, &rx, "");
+        assert_eq!(items(&jobs), [("lodash".to_string(), "4.17.20".to_string(), true)], "pinned exactly");
+        app.on_install_finished(vec!["lodash".into()], Vec::new(), Ok(()));
+        assert_eq!(row(&app, "lodash").current, Version::new(4, 17, 20));
+    }
+
+    #[test]
+    fn n_installs_what_is_not_blocked() {
+        let (mut app, rx) = offline_app();
+        app.prober = blocking(&["a-2.0.0.tgz"]);
+        app.start_install(
+            vec![("a".into(), Version::new(2, 0, 0)), ("b".into(), Version::new(1, 0, 0))],
+            Vec::new(),
+        );
+        wait_until(&mut app, |a| a.blocked_prompt.is_some());
+        assert_eq!(app.blocked_prompt.as_ref().unwrap().blocked[0].alternative, Some(Version::new(1, 5, 0)));
+        app.on_key(key('n'));
+        assert_eq!(specs(&settle(&mut app, &rx, "")), ["b@^1.0.0"]);
+    }
+
+    #[test]
+    fn a_version_typed_with_e_that_is_blocked_is_offered_an_alternative() {
+        let (mut app, rx) = offline_app();
+        app.prober = blocking(&["a-2.0.0.tgz"]);
+        app.on_key(key('e'));
+        type_text(&mut app, "2.0.0");
+        press(&mut app, KeyCode::Enter);
+        wait_until(&mut app, |a| a.blocked_prompt.is_some());
+        app.on_key(key('y'));
+        assert_eq!(items(&settle(&mut app, &rx, "")), [("a".to_string(), "1.5.0".to_string(), true)]);
+    }
+
+    #[test]
+    fn a_failed_install_refused_with_403_for_a_nested_package_offers_an_override() {
+        let (mut app, rx) = offline_app();
+        app.prober = blocking(&["qs-6.0.4.tgz"]);
+        let npm = "`npm install a@^2.0.0` exited with exit status: 1\nnpm error code E403\nnpm error 403 403 Forbidden - GET https://r/qs/-/qs-6.0.4.tgz\nnpm error 403 In most cases, you or one of your dependencies are requesting";
+        app.on_install_finished(vec!["a".into()], Vec::new(), Err(npm.into()));
+        wait_until(&mut app, |a| a.blocked_prompt.is_some());
+        let p = app.blocked_prompt.as_ref().unwrap();
+        assert!(p.after_failure && !p.blocked[0].direct);
+        let screen = render(&mut app, 120, 40).join("\n");
+        assert!(screen.contains("qs 6.0.4 can't be downloaded"), "{screen}");
+        assert!(screen.contains("y  override qs to 6.0.3"), "{screen}");
+        assert!(!screen.contains("install the others only"), "{screen}");
+        app.on_key(key('y'));
+        let job = rx.try_recv().expect("override queued");
+        assert_eq!(
+            job.edits,
+            [Change::Add {
+                loc: vec!["overrides".into(), "qs".into()],
+                new: "6.0.3".into()
+            }]
+        );
+    }
+
+    #[test]
+    fn a_failed_install_refused_for_a_dependency_reinstalls_it_at_the_version_found() {
+        let (mut app, rx) = offline_app();
+        app.prober = blocking(&["a-2.0.0.tgz"]);
+        let pnpm = " ERR_PNPM_FETCH_403  GET https://r/a/-/a-2.0.0.tgz: Forbidden - 403";
+        app.on_install_finished(vec!["a".into()], Vec::new(), Err(pnpm.into()));
+        wait_until(&mut app, |a| a.blocked_prompt.is_some());
+        app.on_key(key('y'));
+        assert_eq!(items(&settle(&mut app, &rx, "")), [("a".to_string(), "1.5.0".to_string(), true)]);
+    }
+
+    #[test]
+    fn nothing_is_asked_when_no_version_can_be_downloaded_after_a_failure() {
+        let (mut app, _rx) = offline_app();
+        app.prober = blocking(&["qs-"]);
+        app.on_install_finished(
+            vec!["a".into()],
+            Vec::new(),
+            Err("npm error 403 403 Forbidden - GET https://r/qs/-/qs-6.0.4.tgz".into()),
+        );
+        wait_until(&mut app, |a| a.log.iter().any(|l| l.contains("No older version could be downloaded")));
+        assert!(app.blocked_prompt.is_none());
+    }
+
+    #[test]
+    fn an_unreachable_registry_does_not_stop_the_install() {
+        let (mut app, rx) = offline_app();
+        app.prober = Arc::new(|_, _| Err("connection refused".into()));
+        app.start_install(vec![("a".into(), Version::new(2, 0, 0))], Vec::new());
+        assert_eq!(specs(&settle(&mut app, &rx, "")), ["a@^2.0.0"]);
+        assert!(app.blocked_prompt.is_none());
     }
 
     #[test]

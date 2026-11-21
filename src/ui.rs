@@ -215,11 +215,88 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     if let Some(p) = &app.delete_prompt {
         draw_delete_prompt(f, app, p);
     }
+    if let Some(p) = &app.blocked_prompt {
+        draw_blocked_prompt(f, p);
+    }
     if let Some(input) = &app.input
         && let crate::app::InputPurpose::Add { add_as } = &input.purpose
     {
         draw_add_dialog(f, app, input, *add_as);
     }
+}
+
+/// Versions the registry refuses to hand out, and what it hands out instead.
+fn draw_blocked_prompt(f: &mut Frame, p: &crate::app::BlockedPrompt) {
+    let width = f.area().width.saturating_sub(4).min(84);
+    let inner = (width as usize).saturating_sub(4);
+    let bold = Style::new().add_modifier(Modifier::BOLD);
+    let dim = Style::new().fg(Color::DarkGray);
+    let key = |k: &str| Span::styled(format!("{k:<3}"), Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD));
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    for b in &p.blocked {
+        lines.extend(wrap(
+            Span::styled("✘ ", Style::new().fg(Color::Red).add_modifier(Modifier::BOLD)),
+            Span::raw("   "),
+            vec![
+                Span::styled(format!("{} {}", b.name, b.version), bold),
+                Span::raw(" can't be downloaded: the registry refuses it (403 Forbidden)."),
+            ],
+            inner,
+        ));
+        lines.extend(wrap(
+            Span::raw("   "),
+            Span::raw("   "),
+            match &b.alternative {
+                Some(a) => vec![
+                    Span::raw("The newest version it hands out is "),
+                    Span::styled(a.to_string(), Style::new().fg(Color::Green).add_modifier(Modifier::BOLD)),
+                    Span::raw("."),
+                ],
+                None => vec![Span::styled(
+                    "No older version could be downloaded either.",
+                    Style::new().fg(Color::Yellow),
+                )],
+            },
+            inner,
+        ));
+    }
+    lines.push(Line::default());
+    let found: Vec<&crate::blocked::Blocked> =
+        p.blocked.iter().filter(|b| b.alternative.is_some()).collect();
+    if !found.is_empty() {
+        let what: Vec<String> = found
+            .iter()
+            .map(|b| {
+                let alt = b.alternative.as_ref().unwrap();
+                if p.after_failure && !b.direct {
+                    format!("override {} to {alt}", b.name)
+                } else {
+                    format!("install {} {alt} instead", b.name)
+                }
+            })
+            .collect();
+        lines.extend(wrap(key("y"), Span::raw("   "), vec![Span::raw(what.join(", "))], inner));
+        let b = found[0];
+        lines.extend(wrap(
+            Span::raw("   "),
+            Span::raw("   "),
+            vec![Span::styled(
+                format!(
+                    "Pinned exactly: a range like ^{} would pick {} again.",
+                    b.alternative.as_ref().unwrap(),
+                    b.version
+                ),
+                dim,
+            )],
+            inner,
+        ));
+    }
+    if !p.after_failure && p.has_others() {
+        lines.extend(wrap(key("n"), Span::raw("   "), vec![Span::raw("install the others only")], inner));
+    }
+    lines.push(Line::default());
+    lines.push(Line::from(Span::styled("any other key cancels", dim)));
+    draw_dialog(f, "Blocked by the registry", lines, width);
 }
 
 /// What `d` is about to delete, to confirm.
@@ -669,6 +746,17 @@ fn footer_lines(app: &App, width: u16) -> Vec<Line<'static>> {
             "█".cyan(),
         ];
         return wrap_hints(prefix, hints.iter().map(|h| hint(h)).collect(), "   ", width);
+    }
+    if let Some(p) = &app.blocked_prompt {
+        let mut keys = Vec::new();
+        if p.has_alternatives() {
+            keys.push(hint("y use the version it hands out"));
+        }
+        if !p.after_failure && p.has_others() {
+            keys.push(hint("n install the others only"));
+        }
+        keys.push(hint("any other key cancels"));
+        return wrap_hints(vec!["Answer the dialog above:".cyan().bold()], keys, "   ", width);
     }
     if app.delete_prompt.is_some() {
         return wrap_hints(

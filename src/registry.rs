@@ -105,6 +105,8 @@ fn parse_dist_tags(reader: impl Read) -> Result<HashMap<String, String>, String>
 pub struct VersionInfo {
     /// `peerDependencies`: name → range.
     pub peers: HashMap<String, String>,
+    /// Where the package file is downloaded from (`dist.tarball`).
+    pub tarball: Option<String>,
 }
 
 /// The versions of a package, from its registry document.
@@ -168,6 +170,12 @@ fn parse_packument(reader: impl Read) -> Result<Packument, String> {
     struct Ver {
         #[serde(rename = "peerDependencies", default)]
         peers: HashMap<String, String>,
+        #[serde(default)]
+        dist: Option<Dist>,
+    }
+    #[derive(serde::Deserialize)]
+    struct Dist {
+        tarball: Option<String>,
     }
     let doc: Doc = serde_json::from_reader(BufReader::new(reader))
         .map_err(|e| format!("invalid response: {e}"))?;
@@ -176,9 +184,31 @@ fn parse_packument(reader: impl Read) -> Result<Packument, String> {
         versions: doc
             .versions
             .into_iter()
-            .filter_map(|(v, info)| Some((Version::parse(&v).ok()?, VersionInfo { peers: info.peers })))
+            .filter_map(|(v, info)| {
+                let tarball = info.dist.and_then(|d| d.tarball);
+                Some((Version::parse(&v).ok()?, VersionInfo { peers: info.peers, tarball }))
+            })
             .collect(),
     })
+}
+
+/// Whether the registry hands out the package file at `url`. `false` when it refuses (403, or
+/// 451 for legal reasons) or doesn't have it (404); errors for anything else.
+pub fn downloadable(rc: &Npmrc, agent: &ureq::Agent, name: &str, url: &str) -> Result<bool, String> {
+    let registry = rc.registry_for(name);
+    let mut req = agent
+        .get(url)
+        .set("User-Agent", concat!("depsu/", env!("CARGO_PKG_VERSION")));
+    if let Some(auth) = rc.auth_for(name, &registry) {
+        req = req.set("Authorization", &auth);
+    }
+    // Only the status is needed: the response is dropped without reading the file.
+    match req.call() {
+        Ok(_) => Ok(true),
+        Err(ureq::Error::Status(403 | 404 | 451, _)) => Ok(false),
+        Err(ureq::Error::Status(code, _)) => Err(format!("HTTP {code}")),
+        Err(e) => Err(e.to_string()),
+    }
 }
 
 pub fn agent() -> ureq::Agent {
@@ -203,7 +233,7 @@ mod tests {
     #[test]
     fn reads_versions_and_their_peers() {
         let doc = br#"{"name":"react-dom","dist-tags":{"latest":"19.0.0"},"versions":{
-            "18.2.0":{"version":"18.2.0","peerDependencies":{"react":"^18.2.0"}},
+            "18.2.0":{"version":"18.2.0","peerDependencies":{"react":"^18.2.0"},"dist":{"tarball":"https://r/react-dom/-/react-dom-18.2.0.tgz"}},
             "19.0.0":{"version":"19.0.0","peerDependencies":{"react":"^19.0.0"}},
             "19.1.0-rc.0":{"version":"19.1.0-rc.0"},
             "20.0.0":{"version":"20.0.0"},
@@ -213,6 +243,10 @@ mod tests {
         assert_eq!(p.latest, Some(Version::new(19, 0, 0)));
         assert_eq!(p.versions.len(), 4);
         assert_eq!(p.versions[&Version::new(19, 0, 0)].peers["react"], "^19.0.0");
+        assert_eq!(
+            p.versions[&Version::new(18, 2, 0)].tarball.as_deref(),
+            Some("https://r/react-dom/-/react-dom-18.2.0.tgz")
+        );
         // `best` skips pre-releases and anything above `latest`.
         assert_eq!(p.best(|_, _| true), Some(Version::new(19, 0, 0)));
         assert_eq!(
