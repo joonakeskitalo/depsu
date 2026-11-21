@@ -39,7 +39,7 @@ fn draw_log(f: &mut Frame, app: &mut App) {
         Constraint::Length(1),
         Constraint::Length(2),
         Constraint::Min(3),
-        Constraint::Length(2),
+        Constraint::Length(1),
         Constraint::Length(footer.len() as u16),
     ])
     .areas(f.area());
@@ -66,7 +66,12 @@ fn draw_log(f: &mut Frame, app: &mut App) {
     );
     heading(f, log_rule, title);
     f.render_widget(Paragraph::new(lines), body);
-    heading(f, keys_rule, "keys");
+    f.render_widget(
+        Block::default()
+            .borders(Borders::TOP)
+            .border_style(Style::new().fg(Color::DarkGray)),
+        keys_rule,
+    );
     f.render_widget(Paragraph::new(footer), help);
 }
 /// A two-line section heading: a horizontal rule, and below it the title of what follows.
@@ -109,7 +114,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         Constraint::Length(summary_h),
         Constraint::Length(2),
         Constraint::Length(log_h),
-        Constraint::Length(2),
+        Constraint::Length(1),
         Constraint::Length(footer.len() as u16),
     ])
     .areas(f.area());
@@ -176,7 +181,12 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         .collect();
     heading(f, log_rule, "log");
     f.render_widget(Paragraph::new(lines), log);
-    heading(f, keys_rule, "keys");
+    f.render_widget(
+        Block::default()
+            .borders(Borders::TOP)
+            .border_style(Style::new().fg(Color::DarkGray)),
+        keys_rule,
+    );
 
     f.render_widget(Paragraph::new(footer), help);
 }
