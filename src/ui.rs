@@ -35,13 +35,15 @@ fn draw_log(f: &mut Frame, app: &mut App) {
         "   ",
         f.area().width,
     );
-    let [header, body, help] = Layout::vertical([
+    let [header, log_rule, body, keys_rule, help] = Layout::vertical([
         Constraint::Length(1),
+        Constraint::Length(2),
         Constraint::Min(3),
+        Constraint::Length(2),
         Constraint::Length(footer.len() as u16),
     ])
     .areas(f.area());
-    let h = (body.height as usize).saturating_sub(1).max(1);
+    let h = (body.height as usize).max(1);
     app.log_page = h;
     app.log_scroll = app.log_scroll.min(app.log.len().saturating_sub(h));
     let end = app.log.len() - app.log_scroll;
@@ -62,14 +64,30 @@ fn draw_log(f: &mut Frame, app: &mut App) {
         ]),
         header,
     );
-    f.render_widget(
-        Paragraph::new(lines).block(Block::default().borders(Borders::TOP).title(title)),
-        body,
-    );
+    heading(f, log_rule, title);
+    f.render_widget(Paragraph::new(lines), body);
+    heading(f, keys_rule, "keys");
     f.render_widget(Paragraph::new(footer), help);
 }
+/// A two-line section heading: a horizontal rule, and below it the title of what follows.
+fn heading(f: &mut Frame, area: ratatui::layout::Rect, title: impl Into<String>) {
+    let [line, text] = Layout::vertical([Constraint::Length(1), Constraint::Length(1)]).areas(area);
+    f.render_widget(
+        Block::default()
+            .borders(Borders::TOP)
+            .border_style(Style::new().fg(Color::DarkGray)),
+        line,
+    );
+    f.render_widget(
+        Line::from(Span::styled(
+            format!(" {}", title.into()),
+            Style::new().fg(Color::DarkGray).add_modifier(Modifier::BOLD),
+        )),
+        text,
+    );
+}
 pub fn draw(f: &mut Frame, app: &mut App) {
-    let log_h = 7.min(app.log.len() as u16 + 2).max(3);
+    let log_h = (app.log.len() as u16).clamp(1, 5);
     if app.log_focus {
         return draw_log(f, app);
     }
@@ -81,17 +99,23 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     } else {
         0
     };
-    let [header, body, used_by, summary, log, help] = Layout::vertical([
+    let [header, list_rule, body, info_rule, used_by, summary, log_rule, log, keys_rule, help] =
+        Layout::vertical([
         Constraint::Length(header_lines.len() as u16),
+        Constraint::Length(2),
         Constraint::Min(3),
+        Constraint::Length(2),
         Constraint::Length(1),
         Constraint::Length(summary_h),
+        Constraint::Length(2),
         Constraint::Length(log_h),
+        Constraint::Length(2),
         Constraint::Length(footer.len() as u16),
     ])
     .areas(f.area());
 
     f.render_widget(Paragraph::new(header_lines), header);
+    heading(f, list_rule, "packages");
 
     let grouped = app.group_by != GroupBy::None;
     let indent = if grouped { 2 } else { 0 };
@@ -126,9 +150,14 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         })
         .collect();
     let list = List::new(items)
-        .block(Block::default().borders(Borders::TOP))
         .highlight_style(Style::new().add_modifier(Modifier::REVERSED));
     f.render_stateful_widget(list, body, &mut app.table);
+    let info_title = match app.cursor_item() {
+        Some(Item::Row { idx, .. }) => format!("selected: {}", app.rows[*idx].name),
+        Some(Item::Removed { name }) => format!("selected: {name}"),
+        _ => "selected".to_string(),
+    };
+    heading(f, info_rule, info_title);
     f.render_widget(used_by_line(app, used_by.width as usize), used_by);
     if summary_h > 0 {
         f.render_widget(
@@ -141,14 +170,13 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         .log
         .iter()
         .rev()
-        .take(log_h as usize - 2)
+        .take(log_h as usize)
         .rev()
         .map(|l| log_line(l))
         .collect();
-    f.render_widget(
-        Paragraph::new(lines).block(Block::default().borders(Borders::TOP).title("log")),
-        log,
-    );
+    heading(f, log_rule, "log");
+    f.render_widget(Paragraph::new(lines), log);
+    heading(f, keys_rule, "keys");
 
     f.render_widget(Paragraph::new(footer), help);
 }
