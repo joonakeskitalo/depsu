@@ -25,8 +25,8 @@ Illustrative output:
 - **Uses your package manager.** npm, yarn, pnpm or bun, detected from the project.
 - **Uses your registry.** Reads `.npmrc`, `.yarnrc.yml` for Yarn 2+ and `bunfig.toml` for bun, including private
   registries and auth tokens.
-- **Version range.** Each row says how the version is pinned: `pinned` (exact), `~ patch`, `^ minor` or
-  `>= any`.
+- **Version range.** The range prefix of each version is highlighted: `^` yellow, `~` cyan, `>=` red.
+  A version without a prefix is pinned exactly.
 - **Selection, grouping, filtering.** Group by release type (patch, minor, major), by name
   prefix or by dependency type (dependencies, dev dependencies, optional dependencies, overrides), and
   filter by name.

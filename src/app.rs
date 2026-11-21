@@ -76,16 +76,6 @@ pub enum VersionRange {
     /// Anything newer (>=).
     AtLeast,
 }
-impl VersionRange {
-    pub fn label(self) -> &'static str {
-        match self {
-            VersionRange::Exact => "pinned",
-            VersionRange::Tilde => "~ patch",
-            VersionRange::Caret => "^ minor",
-            VersionRange::AtLeast => ">= any",
-        }
-    }
-}
 pub struct Row {
     pub name: String,
     pub kind: Kind,

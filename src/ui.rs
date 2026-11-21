@@ -258,19 +258,22 @@ fn row_line(r: &AppRow, indent: usize, name_w: usize) -> Line<'static> {
         format!("{:<4}", r.kind.label()),
         Style::new().fg(Color::DarkGray),
     ));
-    let pin = r.range();
+    // The range prefix is highlighted, so it is clear at a glance how the version is pinned.
+    let version = r.current.to_string();
+    let prefix_color = match r.range() {
+        VersionRange::Exact => Color::Reset,
+        VersionRange::Tilde => Color::Cyan,
+        VersionRange::Caret => Color::Yellow,
+        VersionRange::AtLeast => Color::Red,
+    };
     spans.push(Span::styled(
-        format!("{:<8}", pin.label()),
-        Style::new().fg(match pin {
-            VersionRange::Exact => Color::Green,
-            VersionRange::Tilde => Color::Cyan,
-            VersionRange::Caret => Color::Yellow,
-            VersionRange::AtLeast => Color::Red,
-        }),
+        r.prefix,
+        Style::new().fg(prefix_color).add_modifier(Modifier::BOLD),
     ));
     spans.push(Span::raw(format!(
-        "{:<14}",
-        format!("{}{}", r.prefix, r.current)
+        "{:<w$}",
+        version,
+        w = 14usize.saturating_sub(r.prefix.chars().count())
     )));
     if r.outdated {
         spans.push(Span::raw("→ "));
