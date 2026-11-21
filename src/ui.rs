@@ -106,9 +106,13 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     }
     let footer = footer_lines(app, inner_width(f));
     let header_lines = header_lines(app, f.area().width);
-    let used_by_lines = used_by_lines(app, inner_width(f));
+    let used_by_lines = if app.show_info {
+        used_by_lines(app, inner_width(f))
+    } else {
+        Vec::new()
+    };
     // While the nested override lists are hidden, a text summary takes their place.
-    let summary_h = if app.show_overrides == Overrides::Off {
+    let summary_h = if app.show_info && app.show_overrides == Overrides::Off {
         SUMMARY_LINES
     } else {
         0
@@ -118,8 +122,8 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         Constraint::Length(header_lines.len() as u16),
         Constraint::Length(2),
         Constraint::Min(3),
-        Constraint::Length(2),
-        Constraint::Length(used_by_lines.len().max(1) as u16),
+        Constraint::Length(if app.show_info { 2 } else { 0 }),
+        Constraint::Length(if app.show_info { used_by_lines.len().max(1) as u16 } else { 0 }),
         Constraint::Length(summary_h),
         Constraint::Length(2),
         Constraint::Length(log_h),
@@ -172,8 +176,10 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         Some(Item::Removed { name }) => format!("selected: {name}"),
         _ => "selected".to_string(),
     };
-    heading(f, info_rule, info_title);
-    f.render_widget(Paragraph::new(used_by_lines), used_by);
+    if app.show_info {
+        heading(f, info_rule, info_title);
+        f.render_widget(Paragraph::new(used_by_lines), used_by);
+    }
     if summary_h > 0 {
         f.render_widget(
             Paragraph::new(summary_lines(app, summary.width as usize)),

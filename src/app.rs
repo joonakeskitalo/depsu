@@ -219,6 +219,8 @@ pub struct App {
     pub show_overrides: Overrides,
     pub show_uptodate: bool,
     pub show_vulns: bool,
+    /// The panel with details of the item under the cursor.
+    pub show_info: bool,
     pub snyk: Scan,
     pub audit: Scan,
     pub view: Vec<Item>,
@@ -375,6 +377,7 @@ impl App {
             show_overrides: Overrides::Off,
             show_uptodate: true,
             show_vulns: true,
+            show_info: false,
             snyk: Scan::default(),
             audit: Scan::default(),
             view: Vec::new(),
@@ -1169,6 +1172,7 @@ impl App {
             item.push("i install".into());
         }
         global.push("/ filter".into());
+        global.push(format!("? details: {}", if self.show_info { "on" } else { "off" }));
         global.push("g group".into());
         global.push("o overrides".into());
         scan.push("s snyk".into());
@@ -1324,6 +1328,7 @@ impl App {
             KeyCode::Char('n') => self.start_scan(self.audit_source()),
             KeyCode::Char('f') => self.fix_selected(Source::Snyk),
             KeyCode::Char('F') => self.fix_selected(self.audit_source()),
+            KeyCode::Char('?') => self.show_info = !self.show_info,
             KeyCode::Char('r') => self.revert_selected(),
             KeyCode::Char('d') => self.uninstall_selected(),
             KeyCode::Char('y') => {
