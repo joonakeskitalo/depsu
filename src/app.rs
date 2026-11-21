@@ -98,6 +98,9 @@ pub struct Row {
     pub snyk_fix: Option<Version>,
     /// The version `npm audit` / `bun audit` suggests to fix them.
     pub audit_fix: Option<Version>,
+    /// The version this package had when the session started, if an install in this session
+    /// changed it. Kept in memory only, so the change can be reverted.
+    pub changed_from: Option<Version>,
 }
 
 impl Row {
@@ -472,6 +475,7 @@ impl App {
             vulns: Vec::new(),
             snyk_fix: None,
             audit_fix: None,
+            changed_from: None,
         };
         // Packages that are already up to date are listed too, so their overrides are visible.
         let compat = if outdated && kind != Kind::Override {
@@ -533,6 +537,10 @@ impl App {
                         .remove(&r.name)
                         .unwrap_or_else(|| r.latest.clone());
                     r.outdated = r.latest > target && r.latest.pre.is_empty();
+                    if target != r.current {
+                        let from = r.changed_from.take().unwrap_or_else(|| r.current.clone());
+                        r.changed_from = (from != target).then_some(from);
+                    }
                     r.current = target;
                     r.compat = Compat::Ok;
                     r.status = Status::Idle;
@@ -956,6 +964,7 @@ impl App {
             KeyCode::Char('n') => self.start_scan(self.audit_source()),
             KeyCode::Char('f') => self.fix_selected(Source::Snyk),
             KeyCode::Char('F') => self.fix_selected(self.audit_source()),
+            KeyCode::Char('r') => self.revert_selected(),
             KeyCode::Char('y') => {
                 let md = crate::export::markdown(self);
                 match crate::export::copy(&md) {
@@ -1143,6 +1152,64 @@ impl App {
         self.dispatch('i', pkgs, ovr);
     }
 
+    /// Reinstalls the version the checked packages (or the one under the cursor) had when the
+    /// session started. Only packages changed in this session can be reverted.
+    fn revert_selected(&mut self) {
+        let can = |a: &App, i: usize| a.rows[i].changed_from.is_some() && !a.rows[i].busy();
+        let mut idx: Vec<usize> = self
+            .visible_rows()
+            .into_iter()
+            .filter(|&i| self.rows[i].selected && can(self, i))
+            .collect();
+        if idx.is_empty() {
+            match self.cursor_item().cloned() {
+                Some(Item::Row { idx: i, .. }) => idx.push(i),
+                Some(Item::Header { members, .. }) => idx.extend(members),
+                _ => {}
+            }
+            idx.retain(|&i| can(self, i));
+        }
+        if idx.is_empty() {
+            self.push_log("Nothing to revert: put the cursor on a package changed in this session.");
+            return;
+        }
+        let mut items = Vec::new();
+        let mut edits = Vec::new();
+        let mut keys = Vec::new();
+        let mut what = Vec::new();
+        for i in idx {
+            let r = &mut self.rows[i];
+            let Some(from) = r.changed_from.clone() else {
+                continue;
+            };
+            r.selected = false;
+            r.status = Status::Queued;
+            what.push(format!("{}@{from}", r.name));
+            // Install the exact version: a range such as ^1.2.3 would pick the newest match.
+            items.push((r.name.clone(), from.to_string(), r.kind, true));
+            self.install_targets.insert(r.name.clone(), from.clone());
+            // Then restore the original pin type in package.json; the lockfile keeps `from`.
+            if !r.prefix.is_empty() && r.kind != Kind::Override {
+                let field = match r.kind {
+                    Kind::Prod => "dependencies",
+                    Kind::Dev => "devDependencies",
+                    _ => "optionalDependencies",
+                };
+                let loc = vec![field.to_string(), r.name.clone()];
+                keys.push(loc.join("\u{1f}"));
+                edits.push(Change::Set {
+                    loc,
+                    old: from.to_string(),
+                    new: format!("{}{from}", r.prefix),
+                });
+            }
+        }
+        for k in &keys {
+            self.busy_overrides.insert(k.clone());
+        }
+        self.push_log(format!("… queued revert to {}", what.join(", ")));
+        let _ = self.jobs.send(Job { items, edits, keys });
+    }
     /// Installs the version `source` suggests for the checked packages, or for the one under
     /// the cursor (every package of a group when on a group header).
     fn fix_selected(&mut self, source: Source) {

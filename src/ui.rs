@@ -314,6 +314,9 @@ fn footer_lines(app: &App, width: u16) -> Vec<Line<'static>> {
             hints.push("p pin fix as override".to_string());
         }
     }
+    if app.rows.iter().any(|r| r.changed_from.is_some()) {
+        hints.push("r revert".to_string());
+    }
     hints.push("y copy md".to_string());
     hints.push("tab log".to_string());
     hints.push("q quit".to_string());
@@ -406,6 +409,13 @@ fn row_line(r: &AppRow, indent: usize, name_w: usize) -> Line<'static> {
                 Style::new().fg(Color::Magenta),
             ));
         }
+    }
+    if let Some(from) = &r.changed_from {
+        let verb = if *from < r.current { "upgraded" } else { "downgraded" };
+        spans.push(Span::styled(
+            format!("   {verb} from {from} to {} in this session", r.current),
+            Style::new().fg(Color::Cyan),
+        ));
     }
     let line = Line::from(spans);
     if r.busy() || !r.outdated {
