@@ -35,8 +35,9 @@ fn draw_log(f: &mut Frame, app: &mut App) {
         "   ",
         f.area().width,
     );
+    let header_lines = header_lines(app, f.area().width);
     let [header, log_rule, body, keys_rule, help] = Layout::vertical([
-        Constraint::Length(1),
+        Constraint::Length(header_lines.len() as u16),
         Constraint::Length(2),
         Constraint::Min(3),
         Constraint::Length(1),
@@ -54,16 +55,7 @@ fn draw_log(f: &mut Frame, app: &mut App) {
     } else {
         "log".to_string()
     };
-    f.render_widget(
-        Line::from(vec![
-            format!(" depsu {} ", env!("CARGO_PKG_VERSION"))
-                .black()
-                .on_cyan()
-                .bold(),
-            format!(" {} · log", app.project_name()).into(),
-        ]),
-        header,
-    );
+    f.render_widget(Paragraph::new(header_lines), header);
     heading(f, log_rule, title);
     f.render_widget(Paragraph::new(lines), body);
     f.render_widget(
