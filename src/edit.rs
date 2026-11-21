@@ -6,7 +6,8 @@ use serde_json::Value;
 use serde_json::ser::{PrettyFormatter, Serializer};
 use std::path::Path;
 
-/// A change to an override entry in `package.json`.
+/// A change to an entry in `package.json`.
+#[derive(Debug, PartialEq)]
 pub enum Change {
     Set {
         /// Path of keys to the string value, e.g. `["overrides", "foo", "."]`.

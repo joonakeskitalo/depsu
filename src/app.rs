@@ -207,12 +207,23 @@ pub struct Update {
     pub release: Release,
 }
 
+/// A package to install.
+#[derive(Clone, Debug)]
+struct InstallItem {
+    name: String,
+    /// What `package.json` gets, e.g. `^2.0.0`, or `2.0.0` when pinned exactly.
+    spec: String,
+    kind: Kind,
+    exact: bool,
+    /// The spec in `package.json` now, needed to edit it in place.
+    old: Option<String>,
+}
+
 #[derive(Default)]
 struct Job {
     /// Packages to uninstall, before anything else runs.
     uninstall: Vec<String>,
-    /// (name, spec, kind, exact)
-    items: Vec<(String, String, Kind, bool)>,
+    items: Vec<InstallItem>,
     edits: Vec<Change>,
     /// Keys of the overrides being edited.
     keys: Vec<String>,
@@ -1299,7 +1310,13 @@ impl App {
         }
         p.status = Status::Queued;
         let version = p.row.current.to_string();
-        let item = (name.to_string(), version.clone(), p.row.kind, true);
+        let item = InstallItem {
+            name: name.to_string(),
+            spec: version.clone(),
+            kind: p.row.kind,
+            exact: true,
+            old: None,
+        };
         let mut edits = Vec::new();
         let mut keys = Vec::new();
         // Install the exact version, then put the original range back in package.json.
@@ -1960,7 +1977,13 @@ impl App {
             r.status = Status::Queued;
             what.push(format!("{}@{from}", r.name));
             // Install the exact version: a range such as ^1.2.3 would pick the newest match.
-            items.push((r.name.clone(), from.to_string(), r.kind, true));
+            items.push(InstallItem {
+                name: r.name.clone(),
+                spec: from.to_string(),
+                kind: r.kind,
+                exact: true,
+                old: spec_in_manifest(&self.root_deps, &r.name),
+            });
             self.install_targets.insert(r.name.clone(), from.clone());
             // Then restore the original pin type in package.json; the lockfile keeps `from`.
             if !r.prefix.is_empty() && r.kind != Kind::Override {
@@ -2128,12 +2151,13 @@ impl App {
             }
             r.selected = false;
             r.status = Status::Queued;
-            items.push((
-                r.name.clone(),
-                format!("{}{target}", r.prefix),
-                r.kind,
-                r.prefix.is_empty(),
-            ));
+            items.push(InstallItem {
+                name: r.name.clone(),
+                spec: format!("{}{target}", r.prefix),
+                kind: r.kind,
+                exact: r.prefix.is_empty(),
+                old: spec_in_manifest(&self.root_deps, &r.name),
+            });
             self.install_targets.insert(r.name.clone(), target);
         }
         if items.is_empty() && ovr.is_empty() {
@@ -2151,7 +2175,7 @@ impl App {
                 new,
             });
         }
-        let mut what: Vec<String> = items.iter().map(|i| format!("{}@{}", i.0, i.1)).collect();
+        let mut what: Vec<String> = items.iter().map(|i| format!("{}@{}", i.name, i.spec)).collect();
         what.extend(keys.iter().map(|k| override_label(k)));
         self.push_log(format!("… queued {}", what.join(", ")));
         let _ = self.jobs.send(Job {
@@ -2723,7 +2747,7 @@ fn install_worker(dir: PathBuf, pm: Pm, jobs: Receiver<Job>, tx: Sender<Event>) 
         let names: Vec<String> = job
             .items
             .iter()
-            .map(|i| i.0.clone())
+            .map(|i| i.name.clone())
             .chain(job.uninstall.iter().cloned())
             .collect();
         let _ = tx.send(Event::InstallStarted {
@@ -2743,21 +2767,103 @@ fn install_worker(dir: PathBuf, pm: Pm, jobs: Receiver<Job>, tx: Sender<Event>) 
     }
 }
 
+fn spec_in_manifest(root_deps: &[(String, String)], name: &str) -> Option<String> {
+    root_deps
+        .iter()
+        .find(|(n, _)| n == name)
+        .map(|(_, spec)| spec.clone())
+}
+
+/// How the packages of a job are installed.
+#[derive(Debug, PartialEq)]
+enum InstallPlan {
+    /// Package manager commands, run in order (each the arguments after the program).
+    Commands(Vec<Vec<String>>),
+    /// Edit `package.json`, then run one plain install.
+    Manifest(Vec<Change>),
+}
+
+/// One command can only install packages of one kind (`-D`, `-O`) and pin style (`--exact`).
+/// When a job mixes them, separate commands would each be resolved on their own: updating
+/// `react` (a dependency) fails while the old `eslint-plugin-react-hooks` (a dev dependency)
+/// still asks for the old `react`, and the command that would have updated it never runs.
+/// So such a job writes every new spec into `package.json` and installs once, letting the
+/// package manager resolve them together.
+fn install_plan(pm: Pm, items: &[InstallItem]) -> InstallPlan {
+    let mut groups: Vec<((Kind, bool), Vec<String>)> = Vec::new();
+    for it in items {
+        let arg = format!("{}@{}", it.name, it.spec);
+        match groups.iter_mut().find(|(k, _)| *k == (it.kind, it.exact)) {
+            Some((_, v)) => v.push(arg),
+            None => groups.push(((it.kind, it.exact), vec![arg])),
+        }
+    }
+    let editable = items.iter().all(|it| it.old.is_some() && it.kind != Kind::Override);
+    if groups.len() > 1 && editable {
+        return InstallPlan::Manifest(
+            items
+                .iter()
+                .map(|it| Change::Set {
+                    loc: vec![dep_field(it.kind).to_string(), it.name.clone()],
+                    old: it.old.clone().unwrap_or_default(),
+                    new: it.spec.clone(),
+                })
+                .collect(),
+        );
+    }
+    InstallPlan::Commands(
+        groups
+            .into_iter()
+            .map(|((kind, exact), specs)| pm.install_args(&specs, kind, exact))
+            .collect(),
+    )
+}
+
+fn dep_field(kind: Kind) -> &'static str {
+    match kind {
+        Kind::Dev => "devDependencies",
+        Kind::Optional => "optionalDependencies",
+        Kind::Prod | Kind::Override => "dependencies",
+    }
+}
+
+/// Applies `changes` to `package.json` and runs `install`. If the install fails, the file is
+/// put back as it was, so a failed install doesn't leave new versions in it.
+fn install_with_manifest(
+    path: &std::path::Path,
+    changes: &[Change],
+    install: impl FnOnce() -> Result<(), String>,
+) -> Result<(), String> {
+    let original = std::fs::read_to_string(path).map_err(|e| format!("reading package.json: {e}"))?;
+    edit::apply(path, changes).map_err(|e| format!("{e:#}"))?;
+    if let Err(e) = install() {
+        let restored = std::fs::write(path, &original).is_ok();
+        return Err(if restored {
+            format!("{e}\n(package.json was put back as it was)")
+        } else {
+            format!("{e}\n(package.json could not be put back, check it)")
+        });
+    }
+    Ok(())
+}
+
 fn run_job(dir: &std::path::Path, pm: Pm, job: &Job) -> Result<(), String> {
     if !job.uninstall.is_empty() {
         run_pm(dir, pm, &pm.uninstall_args(&job.uninstall))?;
     }
-    // One command per (kind, exact) group.
-    let mut groups: Vec<((Kind, bool), Vec<String>)> = Vec::new();
-    for (name, spec, kind, exact) in &job.items {
-        let arg = format!("{name}@{spec}");
-        match groups.iter_mut().find(|(k, _)| *k == (*kind, *exact)) {
-            Some((_, v)) => v.push(arg),
-            None => groups.push(((*kind, *exact), vec![arg])),
+    if !job.items.is_empty() {
+        match install_plan(pm, &job.items) {
+            InstallPlan::Commands(cmds) => {
+                for args in cmds {
+                    run_pm(dir, pm, &args)?;
+                }
+            }
+            InstallPlan::Manifest(changes) => {
+                install_with_manifest(&dir.join("package.json"), &changes, || {
+                    run_pm(dir, pm, &["install".to_string()])
+                })?;
+            }
         }
-    }
-    for ((kind, exact), specs) in groups {
-        run_pm(dir, pm, &pm.install_args(&specs, kind, exact))?;
     }
 
     if !job.edits.is_empty() {
@@ -3201,7 +3307,7 @@ mod tests {
     fn queued(rx: &Receiver<Job>) -> Vec<String> {
         rx.try_iter()
             .flat_map(|j| j.items)
-            .map(|(n, spec, ..)| format!("{n}@{spec}"))
+            .map(|i| format!("{}@{}", i.name, i.spec))
             .collect()
     }
     fn key(c: char) -> KeyEvent {
@@ -3282,6 +3388,114 @@ mod tests {
         });
         app.on_key(key('y'));
         assert_eq!(queued(&rx), ["a@^2.0.0"], "y installs anyway");
+    }
+
+    fn item(name: &str, spec: &str, kind: Kind, old: Option<&str>) -> InstallItem {
+        InstallItem {
+            name: name.into(),
+            spec: spec.into(),
+            kind,
+            exact: !spec.starts_with(['^', '~', '>']),
+            old: old.map(String::from),
+        }
+    }
+
+    #[test]
+    fn packages_of_one_kind_install_with_one_command() {
+        let plan = install_plan(
+            Pm::Npm,
+            &[
+                item("react", "^19.0.0", Kind::Prod, Some("^18.2.0")),
+                item("react-dom", "^19.0.0", Kind::Prod, Some("^18.2.0")),
+            ],
+        );
+        assert_eq!(
+            plan,
+            InstallPlan::Commands(vec![vec![
+                "install".into(),
+                "react@^19.0.0".into(),
+                "react-dom@^19.0.0".into()
+            ]])
+        );
+    }
+
+    #[test]
+    fn packages_of_different_kinds_are_written_to_package_json_and_installed_once() {
+        let plan = install_plan(
+            Pm::Npm,
+            &[
+                item("react", "^19.0.0", Kind::Prod, Some("^18.2.0")),
+                item("eslint-plugin-react-hooks", "^5.0.0", Kind::Dev, Some("^4.6.0")),
+                item("typescript", "5.6.3", Kind::Dev, Some("5.4.5")),
+            ],
+        );
+        let InstallPlan::Manifest(changes) = plan else {
+            panic!("expected one install from package.json, got {plan:?}");
+        };
+        assert_eq!(
+            changes,
+            [
+                Change::Set {
+                    loc: vec!["dependencies".into(), "react".into()],
+                    old: "^18.2.0".into(),
+                    new: "^19.0.0".into()
+                },
+                Change::Set {
+                    loc: vec!["devDependencies".into(), "eslint-plugin-react-hooks".into()],
+                    old: "^4.6.0".into(),
+                    new: "^5.0.0".into()
+                },
+                Change::Set {
+                    loc: vec!["devDependencies".into(), "typescript".into()],
+                    old: "5.4.5".into(),
+                    new: "5.6.3".into()
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn a_package_missing_from_package_json_falls_back_to_commands() {
+        // E.g. restoring a package that was uninstalled: there's no entry to edit.
+        let plan = install_plan(
+            Pm::Npm,
+            &[
+                item("react", "^19.0.0", Kind::Prod, Some("^18.2.0")),
+                item("lodash", "4.17.21", Kind::Dev, None),
+            ],
+        );
+        let InstallPlan::Commands(cmds) = plan else {
+            panic!("{plan:?}");
+        };
+        assert_eq!(cmds.len(), 2);
+    }
+
+    #[test]
+    fn a_failed_install_puts_package_json_back() {
+        let dir = std::env::temp_dir().join(format!("depsu-manifest-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("package.json");
+        let original = "{\n  \"dependencies\": {\n    \"react\": \"^18.2.0\"\n  }\n}\n";
+        std::fs::write(&path, original).unwrap();
+        let changes = [Change::Set {
+            loc: vec!["dependencies".into(), "react".into()],
+            old: "^18.2.0".into(),
+            new: "^19.0.0".into(),
+        }];
+
+        let seen = std::cell::RefCell::new(String::new());
+        let err = install_with_manifest(&path, &changes, || {
+            *seen.borrow_mut() = std::fs::read_to_string(&path).unwrap();
+            Err("npm error ERESOLVE".into())
+        })
+        .unwrap_err();
+        assert!(seen.borrow().contains("^19.0.0"), "the install sees the new versions");
+        assert!(err.contains("ERESOLVE") && err.contains("put back"), "{err}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+
+        install_with_manifest(&path, &changes, || Ok(())).unwrap();
+        assert!(std::fs::read_to_string(&path).unwrap().contains("\"react\": \"^19.0.0\""));
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     /// The screen as text, one string per row.
