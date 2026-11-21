@@ -1,6 +1,7 @@
 mod app;
 mod audit;
 mod bunfig;
+mod cache;
 mod edit;
 mod export;
 mod npmrc;
@@ -28,6 +29,7 @@ USAGE:
 OPTIONS:
     -C, --dir <PATH>   Project directory (default: current directory)
         --pm <NAME>    Force package manager: npm, yarn, pnpm or bun
+        --cache <FILE> JSON file that remembers latest versions and scans between runs
     -h, --help         Print help
     -V, --version      Print version
 
@@ -35,15 +37,16 @@ KEYS:
     up/down, j/k   move                 home/end  first / last
     space          select (package, group header or override line)
     a              select all / none
-    i, enter       install the selected packages (or the highlighted one)
+    i, enter       install the selected packages (or the highlighted one, or the
+                   fix of the highlighted vulnerability)
     /              filter by name (enter keeps it, esc clears it)
     g              group by: none, release type, name prefix, dependency type
     o              show / hide the override lines under each package
     x              remove the selected / highlighted overrides (press twice to confirm)
     s              scan with Snyk
     n              run npm audit / bun audit (by the project's package manager)
-    f              install the version Snyk suggests
-    F              install the version npm audit / bun audit suggests
+    R              fetch the latest versions again (ignoring the cache)
+    ?              show / hide the details panel
     P              ask how to pin the selected packages (e exact, c ^, t ~, m >=)
     p              override a vulnerable dependency with the fixed version a scan
                    suggests (press twice to confirm)
@@ -53,6 +56,7 @@ KEYS:
 fn main() -> Result<()> {
     let mut dir = PathBuf::from(".");
     let mut forced_pm = None;
+    let mut cache_path: Option<PathBuf> = None;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -70,6 +74,10 @@ fn main() -> Result<()> {
             }
             "-C" | "--dir" => match args.next() {
                 Some(p) => dir = p.into(),
+                None => bail!("{arg} requires a value"),
+            },
+            "--cache" => match args.next() {
+                Some(p) => cache_path = Some(p.into()),
                 None => bail!("{arg} requires a value"),
             },
             "--pm" => {
@@ -101,7 +109,7 @@ fn main() -> Result<()> {
         };
         (rc, warnings)
     };
-    let mut app = app::App::start(dir, pm, manifest.deps, rc, overrides);
+    let mut app = app::App::start(dir, pm, manifest.deps, rc, overrides, cache_path);
     for w in warnings {
         app.push_log(w);
     }

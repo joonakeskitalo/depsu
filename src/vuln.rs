@@ -1,8 +1,9 @@
 //! Types shared by the vulnerability scanners (Snyk, `npm audit`, `bun audit`).
 use semver::Version;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum Severity {
     Low,
     Medium,
@@ -32,7 +33,7 @@ impl Severity {
 }
 
 /// Where a finding comes from.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum Source {
     Snyk,
     NpmAudit,
@@ -53,7 +54,7 @@ impl Source {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Vuln {
     pub source: Source,
     pub id: String,
@@ -64,6 +65,10 @@ pub struct Vuln {
     pub version: String,
     /// The project's direct dependency that brings it in (equal to `package` for direct ones).
     pub direct: String,
+    /// The version of `direct` the scanner looked at, when it says so. Snyk reads it from the
+    /// lockfile, which can differ from `package.json` and from `node_modules`.
+    #[serde(default)]
+    pub direct_version: Option<String>,
     /// Packages below the direct dependency down to the vulnerable one (empty if it is the
     /// direct dependency itself).
     pub path: Vec<String>,
@@ -143,7 +148,7 @@ impl Vuln {
     }
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Report {
     pub vulns: Vec<Vuln>,
     /// The version Snyk suggests for each direct dependency to fix what can be fixed.

@@ -307,6 +307,7 @@ mod tests {
             scan_outdated: false,
             loading: false,
             latest_failed: false,
+            installed: None,
         }
     }
 

@@ -260,6 +260,7 @@ fn assemble(
             package: loc.package.clone(),
             version,
             direct: loc.direct.clone(),
+            direct_version: loc.direct_version.as_ref().map(Version::to_string),
             path: loc.path.clone(),
             fixed_in: Vec::new(),
             upgrade_to,

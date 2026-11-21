@@ -65,7 +65,7 @@ pub fn parse(text: &str) -> Result<Report, String> {
             else {
                 continue;
             };
-            let Some((direct, _)) = split_pkg(first_hop) else {
+            let Some((direct, direct_version)) = split_pkg(first_hop) else {
                 continue;
             };
             let package = v
@@ -113,6 +113,7 @@ pub fn parse(text: &str) -> Result<Report, String> {
                 package: package.to_string(),
                 version: version.to_string(),
                 direct: direct.to_string(),
+                direct_version: (!direct_version.is_empty()).then(|| direct_version.to_string()),
                 path: from[2..]
                     .iter()
                     .map(|s| split_pkg(s).map_or(s.as_str(), |(n, _)| n).to_string())

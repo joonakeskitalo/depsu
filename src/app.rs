@@ -1,6 +1,7 @@
 //! Application state, background workers and key handling.
 
 use crate::audit;
+use crate::cache::{Cache, Findings};
 use crate::edit::{self, Change};
 use crate::npmrc::Npmrc;
 use crate::overrides::{self, Compat, Override, Unneeded};
@@ -119,6 +120,10 @@ pub struct Row {
     pub loading: bool,
     /// Looking up the latest version failed.
     pub latest_failed: bool,
+    /// The resolved version: what the lockfile pins, or else what `node_modules` holds. The
+    /// scanners look at this one, not at the range in `package.json` (`current`). `None` when
+    /// neither says, e.g. a project that was never installed and has no lockfile.
+    pub installed: Option<Version>,
 }
 
 impl Row {
@@ -145,6 +150,11 @@ impl Row {
             ">=" => VersionRange::AtLeast,
             _ => VersionRange::Exact,
         }
+    }
+    /// The version findings are recorded under: the resolved version. Never the version in
+    /// `package.json`, which the scanners don't look at.
+    pub fn scanned_version(&self) -> Option<String> {
+        self.installed.as_ref().map(Version::to_string)
     }
     pub fn busy(&self) -> bool {
         matches!(self.status, Status::Queued | Status::Installing)
@@ -191,7 +201,7 @@ struct Job {
     keys: Vec<String>,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Clone, Copy, PartialEq, Eq, Default, Debug)]
 pub enum ScanStatus {
     #[default]
     NotRun,
@@ -207,8 +217,12 @@ pub enum ScanStatus {
 #[derive(Default)]
 pub struct Scan {
     pub status: ScanStatus,
-    /// An install finished since the last scan: the findings may be out of date.
+    /// Some findings may be out of date: a package is installed at a version this scanner
+    /// hasn't looked at, or the overrides changed what gets installed below the packages.
     pub stale: bool,
+    /// The overrides changed since the last scan, which changes the transitive dependencies
+    /// without changing the version of any of the project's own packages.
+    pub deps_changed: bool,
     report: Option<Report>,
 }
 
@@ -236,6 +250,12 @@ pub struct App {
     pub log_scroll: usize,
     /// Visible log lines while expanded, set by the renderer, used for paging.
     pub log_page: usize,
+    /// Latest versions and findings per package version. Always kept in memory; written to
+    /// `cache_path` when `--cache` was given.
+    cache: Cache,
+    cache_path: Option<PathBuf>,
+    cache_dirty: bool,
+    cache_error_logged: bool,
     pub pending: usize,
     pub total: usize,
     pub registry: String,
@@ -281,7 +301,14 @@ pub struct App {
 }
 
 impl App {
-    pub fn start(dir: PathBuf, pm: Pm, deps: Vec<Dep>, rc: Npmrc, overrides: Vec<Override>) -> App {
+    pub fn start(
+        dir: PathBuf,
+        pm: Pm,
+        deps: Vec<Dep>,
+        rc: Npmrc,
+        overrides: Vec<Override>,
+        cache_path: Option<PathBuf>,
+    ) -> App {
         let (tx, rx) = mpsc::channel();
         let (jobs, job_rx) = mpsc::channel::<Job>();
 
@@ -311,20 +338,8 @@ impl App {
         let total = names.len();
         let registry = rc.registry_for("x");
 
-        let queue = Arc::new(Mutex::new(names));
         let rc = Arc::new(rc);
         let agent = registry::agent();
-        for _ in 0..registry::CONCURRENCY.min(total) {
-            let (queue, rc, agent, tx) = (queue.clone(), rc.clone(), agent.clone(), tx.clone());
-            thread::spawn(move || {
-                while let Some(name) = queue.lock().unwrap().pop_front() {
-                    let result = registry::latest_version(&rc, &agent, &name);
-                    if tx.send(Event::Fetched { name, result }).is_err() {
-                        break;
-                    }
-                }
-            });
-        }
 
         // Dependency tree analysis is only needed when the project defines overrides.
         let tree_tx = {
@@ -389,6 +404,10 @@ impl App {
             log_focus: false,
             log_scroll: 0,
             log_page: 10,
+            cache: Cache::default(),
+            cache_path: None,
+            cache_dirty: false,
+            cache_error_logged: false,
             pending: total,
             total,
             registry,
@@ -422,7 +441,287 @@ impl App {
             jobs,
         };
         app.add_placeholder_rows();
+        if let Some(path) = cache_path {
+            match Cache::load(&path) {
+                Ok(c) => {
+                    app.cache = c;
+                    app.cache_path = Some(path);
+                }
+                // An unreadable cache is left alone rather than overwritten.
+                Err(e) => app.push_log(format!("! cache not used: {e:#}")),
+            }
+        }
+        app.apply_cached_scans();
+        app.begin_fetch(names.into_iter().collect(), true);
         app
+    }
+
+    /// Starts looking up the latest version of `names`. With `use_cache`, versions found in
+    /// the cache file are used without asking the registry.
+    fn begin_fetch(&mut self, names: Vec<String>, use_cache: bool) {
+        self.pending = names.len();
+        self.total = names.len();
+        let mut queue = VecDeque::new();
+        let mut cached = 0;
+        for name in names {
+            let hit = use_cache
+                .then(|| {
+                    self.cache
+                        .latest
+                        .get(&name)
+                        .and_then(|v| Version::parse(v).ok())
+                })
+                .flatten();
+            match hit {
+                Some(v) => {
+                    cached += 1;
+                    let _ = self.events_tx.send(Event::Fetched {
+                        name,
+                        result: Ok(v),
+                    });
+                }
+                None => queue.push_back(name),
+            }
+        }
+        if cached > 0 {
+            self.push_log(format!("… {cached} latest version(s) loaded from the cache, R fetches them again"));
+        }
+        let workers = registry::CONCURRENCY.min(queue.len());
+        let queue = Arc::new(Mutex::new(queue));
+        for _ in 0..workers {
+            let (queue, rc, agent, tx) = (
+                queue.clone(),
+                self.rc.clone(),
+                self.agent.clone(),
+                self.events_tx.clone(),
+            );
+            thread::spawn(move || {
+                while let Some(name) = queue.lock().unwrap().pop_front() {
+                    let result = registry::latest_version(&rc, &agent, &name);
+                    if tx.send(Event::Fetched { name, result }).is_err() {
+                        break;
+                    }
+                }
+            });
+        }
+    }
+
+    /// Looks the latest versions up again, ignoring the cache.
+    fn refetch_latest(&mut self) {
+        if self.loading() {
+            self.push_log("Already checking the latest versions.");
+            return;
+        }
+        let mut names: Vec<String> = self.rows.iter().map(|r| r.name.clone()).collect();
+        for o in &self.overrides {
+            if parse_spec(&o.value).is_some() && !names.contains(&o.name) {
+                names.push(o.name.clone());
+            }
+        }
+        if names.is_empty() {
+            return;
+        }
+        for r in self.rows.iter_mut() {
+            r.loading = true;
+            r.latest_failed = false;
+        }
+        self.push_log(format!("… fetching the latest versions of {} package(s)", names.len()));
+        self.begin_fetch(names, false);
+        self.rebuild_view();
+    }
+
+    // ---- cache -------------------------------------------------------------------------
+
+    fn cache_latest(&mut self, name: &str, latest: &Version) {
+        let v = latest.to_string();
+        if self.cache.latest.get(name) != Some(&v) {
+            self.cache.latest.insert(name.to_string(), v);
+            self.cache_dirty = true;
+        }
+    }
+
+    /// Records what a scan found for each listed package, under the version the scanner
+    /// looked at: the one it names in its findings, or else the resolved version. Packages
+    /// whose version is unknown are not recorded, since a result under a guessed version
+    /// would show up for the wrong version later.
+    fn cache_scan(&mut self, source: Source, report: &Report) {
+        let project = self.project_key();
+        let mut mismatched = Vec::new();
+        for r in self.rows.iter_mut() {
+            let mut by_version: HashMap<Option<String>, Vec<Vuln>> = HashMap::new();
+            for v in report.vulns.iter().filter(|v| v.direct == r.name) {
+                by_version
+                    .entry(v.direct_version.clone())
+                    .or_default()
+                    .push(v.clone());
+            }
+            let resolved = r.installed.as_ref().map(Version::to_string);
+            // A version depsu couldn't determine is learned from the scanner.
+            if resolved.is_none()
+                && let Some(v) = by_version
+                    .keys()
+                    .flatten()
+                    .next()
+                    .and_then(|v| Version::parse(v).ok())
+            {
+                r.installed = Some(v);
+            }
+            let resolved = r.installed.as_ref().map(Version::to_string);
+            for scanned in by_version.keys().flatten() {
+                if resolved.as_ref().is_some_and(|r| r != scanned) {
+                    mismatched.push(format!(
+                        "{}@{scanned} (depsu sees {})",
+                        r.name,
+                        resolved.as_deref().unwrap_or("?")
+                    ));
+                }
+            }
+            // Findings without a version of their own belong to the resolved version.
+            let untagged = by_version.remove(&None).unwrap_or_default();
+            let mut groups: HashMap<String, Vec<Vuln>> = by_version
+                .into_iter()
+                .filter_map(|(k, v)| Some((k?, v)))
+                .collect();
+            if let Some(res) = &resolved {
+                groups.entry(res.clone()).or_default().extend(untagged);
+            }
+            let scans = self.cache.scans_mut(&project);
+            for (version, vulns) in groups {
+                let fix = (resolved.as_ref() == Some(&version) || resolved.is_none())
+                    .then(|| report.fixes.get(&r.name).cloned())
+                    .flatten();
+                scans.set_findings(source.label(), &r.name, &version, Findings { vulns, fix });
+            }
+        }
+        if !mismatched.is_empty() {
+            self.push_log(format!(
+                "⚠ {} scanned other versions than depsu sees: {}. node_modules may be out of date with the lockfile, run an install.",
+                source.label(),
+                mismatched.join(", ")
+            ));
+        }
+        self.cache_dirty = true;
+    }
+
+    /// Reads the resolved version of each listed package: the lockfile's, or else the one in
+    /// `node_modules`.
+    fn read_installed_versions(&mut self) {
+        let lock = crate::tree::npm_lock_versions(&self.dir);
+        for r in self.rows.iter_mut() {
+            r.installed = resolved_version(&self.dir, lock.as_ref(), &r.name);
+        }
+    }
+
+    /// Identifies this project's scan results in the cache: its directory.
+    fn project_key(&self) -> String {
+        self.dir.display().to_string()
+    }
+
+    /// The scanners that have results, from a scan or from the cache.
+    fn scanned_sources(&self) -> Vec<Source> {
+        [(Source::Snyk, &self.snyk), (self.audit_source(), &self.audit)]
+            .into_iter()
+            .filter(|(_, s)| s.report.is_some())
+            .map(|(src, _)| src)
+            .collect()
+    }
+
+    /// Gives every row the findings recorded for the version it is installed at. A row whose
+    /// version a scanner hasn't looked at gets none of that scanner's findings and is marked
+    /// as not scanned, and that scanner's results count as out of date.
+    fn refresh_findings(&mut self) {
+        let sources = self.scanned_sources();
+        let mut missing: HashSet<Source> = HashSet::new();
+        let project = self.project_key();
+        let project_scans = self.cache.scans(&project);
+        for r in self.rows.iter_mut() {
+            r.vulns.clear();
+            r.snyk_fix = None;
+            r.audit_fix = None;
+            r.scan_outdated = false;
+            let version = r.scanned_version();
+            for &source in &sources {
+                let found = version
+                    .as_ref()
+                    .and_then(|ver| project_scans?.findings(source.label(), &r.name, ver));
+                match found {
+                    Some(f) => {
+                        r.vulns.extend(f.vulns.iter().cloned());
+                        if source.is_audit() {
+                            r.audit_fix = f.fix.clone();
+                        } else {
+                            r.snyk_fix = f.fix.clone();
+                        }
+                    }
+                    None => {
+                        r.scan_outdated = true;
+                        missing.insert(source);
+                    }
+                }
+            }
+            r.vulns.sort_by(|a, b| {
+                (std::cmp::Reverse(a.severity), &a.id).cmp(&(std::cmp::Reverse(b.severity), &b.id))
+            });
+        }
+        for source in sources {
+            let scan = self.scan_mut(source);
+            scan.stale = scan.deps_changed || missing.contains(&source);
+        }
+    }
+
+    /// Shows the findings stored in the cache for the versions installed now.
+    fn apply_cached_scans(&mut self) {
+        let mut sources = vec![Source::Snyk];
+        if audit::source_for(self.pm).is_some() {
+            sources.push(self.audit_source());
+        }
+        for source in sources {
+            let project = self.project_key();
+            let project_scans = self.cache.scans(&project);
+            let mut report = Report::default();
+            let mut missing = 0;
+            for r in &self.rows {
+                match r
+                    .scanned_version()
+                    .and_then(|ver| project_scans?.findings(source.label(), &r.name, &ver))
+                {
+                    Some(f) => {
+                        report.vulns.extend(f.vulns.iter().cloned());
+                        if let Some(fix) = &f.fix {
+                            report.fixes.insert(r.name.clone(), fix.clone());
+                        }
+                    }
+                    None => missing += 1,
+                }
+            }
+            if missing == self.rows.len() {
+                continue; // nothing cached for these versions
+            }
+            self.push_log(if missing == 0 {
+                format!("… {} results loaded from the cache", source.label())
+            } else {
+                format!(
+                    "… {} results loaded from the cache; {missing} package(s) haven't been scanned at their installed version, scan again",
+                    source.label()
+                )
+            });
+            self.apply_scan(source, report, true);
+        }
+        self.rebuild_view();
+    }
+
+    fn flush_cache(&mut self) {
+        if !self.cache_dirty {
+            return;
+        }
+        self.cache_dirty = false;
+        if let Some(path) = &self.cache_path
+            && let Err(e) = self.cache.save(path)
+            && !self.cache_error_logged
+        {
+            self.cache_error_logged = true;
+            self.push_log(format!("! could not write the cache: {e:#}"));
+        }
     }
 
     /// Lists every dependency right away, before the registry has answered. The rows are
@@ -451,10 +750,12 @@ impl App {
                 scan_outdated: false,
                 loading: true,
                 latest_failed: false,
+                installed: None,
             })
             .collect();
         rows.sort_by(|a, b| (a.kind.label(), &a.name).cmp(&(b.kind.label(), &b.name)));
         self.rows = rows;
+        self.read_installed_versions();
         self.rebuild_view();
     }
 
@@ -490,7 +791,10 @@ impl App {
                 Event::Fetched { name, result } => {
                     self.pending = self.pending.saturating_sub(1);
                     match result {
-                        Ok(latest) => self.on_fetched(name, latest),
+                        Ok(latest) => {
+                            self.cache_latest(&name, &latest);
+                            self.on_fetched(name, latest);
+                        }
                         Err(e) => {
                             if let Some(r) = self.rows.iter_mut().find(|r| r.name == name) {
                                 r.loading = false;
@@ -523,6 +827,7 @@ impl App {
                 } => self.on_install_finished(names, keys, result),
             }
         }
+        self.flush_cache();
     }
 
     fn own_overrides(&self, name: &str) -> Vec<Override> {
@@ -547,14 +852,16 @@ impl App {
         let Some((kind, prefix, cur)) = self.current.get(&name).cloned() else {
             return;
         };
-        // A row listed at startup is updated in place.
-        if kind != Kind::Override
-            && let Some(i) = self.rows.iter().position(|r| r.name == name)
-        {
+        // A row that is already listed (at startup, or when fetching again) is updated in place.
+        if let Some(i) = self.rows.iter().position(|r| r.name == name) {
             let own = self.own_overrides(&name);
             let (cur, prefix) = (self.rows[i].current.clone(), self.rows[i].prefix);
-            let outdated = latest > cur && latest.pre.is_empty();
-            let compat = if outdated {
+            let outdated = if kind == Kind::Override {
+                own.iter().any(|o| self.update_target(o).is_some())
+            } else {
+                latest > cur && latest.pre.is_empty()
+            };
+            let compat = if outdated && kind != Kind::Override {
                 overrides::check(&own, self.pm, &format!("{prefix}{latest}"), &latest)
             } else {
                 Compat::Ok
@@ -566,7 +873,9 @@ impl App {
             r.overrides = own;
             r.loading = false;
             r.latest_failed = false;
-            self.analyze(&name);
+            if kind != Kind::Override {
+                self.analyze(&name);
+            }
             self.rebuild_view();
             return;
         }
@@ -595,6 +904,7 @@ impl App {
             scan_outdated: false,
             loading: false,
             latest_failed: false,
+            installed: None,
         };
         // Packages that are already up to date are listed too, so their overrides are visible.
         let compat = if outdated && kind != Kind::Override {
@@ -678,11 +988,6 @@ impl App {
                     self.insert_row(row);
                 }
             }
-            if !gone.is_empty() || !restored.is_empty() {
-                for scan in [&mut self.snyk, &mut self.audit] {
-                    scan.stale |= scan.report.is_some();
-                }
-            }
         } else {
             names.retain(|n| !restored.contains(n));
             for p in self.removed.iter_mut().filter(|p| restored.contains(&p.row.name)) {
@@ -694,7 +999,7 @@ impl App {
                 self.push_log(format!("✔ done: {}", what.join(", ")));
                 if removed {
                     for scan in [&mut self.snyk, &mut self.audit] {
-                        scan.stale |= scan.report.is_some();
+                        scan.deps_changed |= scan.report.is_some();
                     }
                     self.push_log(format!(
                         "⚠ Overrides in package.json changed: run Snyk ({}) and {} ({}) again to check for new vulnerabilities.",
@@ -703,7 +1008,6 @@ impl App {
                         scan_key(self.audit_source())
                     ));
                 }
-                let scan_ran = self.snyk.report.is_some() || self.audit.report.is_some();
                 // Updated packages are up to date now; they stay in the list as such.
                 for r in self.rows.iter_mut().filter(|r| names.contains(&r.name)) {
                     // The target is the latest version, or the one Snyk suggested.
@@ -713,22 +1017,12 @@ impl App {
                         .unwrap_or_else(|| r.latest.clone());
                     r.outdated = r.latest > target && r.latest.pre.is_empty();
                     if target != r.current {
-                        r.scan_outdated |= scan_ran;
                         let from = r.changed_from.take().unwrap_or_else(|| r.current.clone());
                         r.changed_from = (from != target).then_some(from);
                     }
                     r.current = target;
                     r.compat = Compat::Ok;
                     r.status = Status::Idle;
-                    // The old findings no longer describe what is installed.
-                    r.vulns.clear();
-                    r.snyk_fix = None;
-                    r.audit_fix = None;
-                }
-                if !names.is_empty() {
-                    for scan in [&mut self.snyk, &mut self.audit] {
-                        scan.stale |= scan.report.is_some();
-                    }
                 }
             }
             Err(e) => {
@@ -754,6 +1048,10 @@ impl App {
         // An install changes `node_modules` and usually `package.json` (also when it failed
         // halfway), so everything derived from them has to be recomputed.
         self.reload_project();
+        // Rows at a new version get the findings recorded for that version, if any.
+        self.read_installed_versions();
+        self.refresh_findings();
+        self.rebuild_view();
     }
 
     /// Re-reads `package.json` and re-runs the override analysis against the current
@@ -867,18 +1165,13 @@ impl App {
         }
     }
     fn insert_row(&mut self, mut row: Row) {
-        for (source, scan) in [
-            (Source::Snyk, &self.snyk),
-            (self.audit_source(), &self.audit),
-        ] {
-            if let Some(rep) = &scan.report {
-                apply_report(source, rep, &mut row);
-            }
-        }
+        let lock = crate::tree::npm_lock_versions(&self.dir);
+        row.installed = resolved_version(&self.dir, lock.as_ref(), &row.name);
         // Keep rows sorted by (kind, name) so late arrivals don't shuffle randomly.
         let key = |r: &Row| (r.kind.label(), r.name.clone());
         let pos = self.rows.partition_point(|r| key(r) < key(&row));
         self.rows.insert(pos, row);
+        self.refresh_findings();
         self.rebuild_view();
     }
 
@@ -1176,6 +1469,7 @@ impl App {
             item.push("i install".into());
         }
         global.push("/ filter".into());
+        global.push("R fetch versions".into());
         global.push(format!("? details: {}", if self.show_info { "on" } else { "off" }));
         global.push("g group".into());
         global.push("o overrides".into());
@@ -1325,6 +1619,7 @@ impl App {
             KeyCode::Char('s') => self.start_scan(Source::Snyk),
             KeyCode::Char('n') => self.start_scan(self.audit_source()),
             KeyCode::Char('?') => self.show_info = !self.show_info,
+            KeyCode::Char('R') => self.refetch_latest(),
             KeyCode::Char('r') => self.revert_selected(),
             KeyCode::Char('d') => self.uninstall_selected(),
             KeyCode::Char('y') => {
@@ -1786,88 +2081,82 @@ impl App {
                 self.scan_mut(source).status = ScanStatus::Failed;
                 self.push_log(format!("✘ {name}: {e}"));
             }
-            Ok(report) => {
-                for w in &report.warnings {
-                    self.push_log(format!("! {name}: {}", w.lines().next().unwrap_or("")));
-                }
-                for r in &mut self.rows {
-                    apply_report(source, &report, r);
-                }
-                let severe = report
-                    .vulns
-                    .iter()
-                    .filter(|v| v.severity >= Severity::High)
-                    .count();
-                let scan = self.scan_mut(source);
-                scan.status = ScanStatus::Done {
-                    total: report.vulns.len(),
-                    severe,
-                };
-                scan.stale = false;
-
-                let shown: HashSet<&str> = self.rows.iter().map(|r| r.name.as_str()).collect();
-                let hidden: HashSet<&str> = report
-                    .vulns
-                    .iter()
-                    .map(|v| v.direct.as_str())
-                    .filter(|d| !shown.contains(d))
-                    .collect();
-                let fixes = self
-                    .rows
-                    .iter()
-                    .filter(|r| r.fix_of(source).is_some())
-                    .count();
-                if report.vulns.is_empty() {
-                    self.push_log(format!("✔ {name}: no known vulnerabilities"));
-                } else {
-                    self.push_log(format!(
-                        "✔ {name}: {} vulnerabilities ({severe} high or critical), fixes suggested for {fixes} package(s). Move onto a finding and press i to install its fix.",
-                        report.vulns.len()
-                    ));
-                }
-                if !hidden.is_empty() {
-                    let mut names: Vec<&str> = hidden.into_iter().collect();
-                    names.sort();
-                    self.push_log(format!(
-                        "! {name}: findings in packages not listed here: {}",
-                        names.join(", ")
-                    ));
-                }
-                self.scan_mut(source).report = Some(report);
-            }
+            Ok(report) => self.apply_scan(source, report, false),
         }
         self.rebuild_view();
     }
+
+    /// Shows the findings of a scan. Scans that just ran are written to the cache; ones read
+    /// from it are not.
+    fn apply_scan(&mut self, source: Source, report: Report, from_cache: bool) {
+        let name = source.label();
+        for w in &report.warnings {
+            self.push_log(format!("! {name}: {}", w.lines().next().unwrap_or("")));
+        }
+        if !from_cache {
+            self.cache_scan(source, &report);
+        }
+        let severe = report
+            .vulns
+            .iter()
+            .filter(|v| v.severity >= Severity::High)
+            .count();
+        let scan = self.scan_mut(source);
+        scan.status = ScanStatus::Done {
+            total: report.vulns.len(),
+            severe,
+        };
+        if !from_cache {
+            scan.deps_changed = false;
+        }
+
+        let shown: HashSet<&str> = self.rows.iter().map(|r| r.name.as_str()).collect();
+        let hidden: HashSet<&str> = report
+            .vulns
+            .iter()
+            .map(|v| v.direct.as_str())
+            .filter(|d| !shown.contains(d))
+            .collect();
+        let fixes = report
+            .fixes
+            .keys()
+            .filter(|n| shown.contains(n.as_str()))
+            .count();
+        if report.vulns.is_empty() {
+            self.push_log(format!("✔ {name}: no known vulnerabilities"));
+        } else {
+            self.push_log(format!(
+                "✔ {name}: {} vulnerabilities ({severe} high or critical), fixes suggested for {fixes} package(s). Move onto a finding and press i to install its fix.",
+                report.vulns.len()
+            ));
+        }
+        if !hidden.is_empty() {
+            let mut names: Vec<&str> = hidden.into_iter().collect();
+            names.sort();
+            self.push_log(format!(
+                "! {name}: findings in packages not listed here: {}",
+                names.join(", ")
+            ));
+        }
+        self.scan_mut(source).report = Some(report);
+        self.refresh_findings();
+    }
+}
+
+/// The version of `name` the scanners see: the one npm's lockfile pins, or else the one in
+/// `node_modules`.
+fn resolved_version(
+    dir: &std::path::Path,
+    lock: Option<&HashMap<String, Version>>,
+    name: &str,
+) -> Option<Version> {
+    lock.and_then(|l| l.get(name).cloned())
+        .or_else(|| crate::tree::installed_version(dir, name))
 }
 
 /// The key that starts a scan with `source`.
 pub fn scan_key(source: Source) -> char {
     if source.is_audit() { 'n' } else { 's' }
-}
-
-/// The key that installs the version `source` suggests.
-/// Copies the findings and the suggested fix for `row` out of `report`, replacing what the
-/// same kind of scanner found before. Findings of the other scanner are kept.
-fn apply_report(source: Source, report: &Report, row: &mut Row) {
-    row.scan_outdated = false;
-    row.vulns
-        .retain(|v| v.source.is_audit() != source.is_audit());
-    row.vulns.extend(
-        report
-            .vulns
-            .iter()
-            .filter(|v| v.direct == row.name)
-            .cloned(),
-    );
-    row.vulns.sort_by(|a, b| {
-        (std::cmp::Reverse(a.severity), &a.id).cmp(&(std::cmp::Reverse(b.severity), &b.id))
-    });
-    let fix = report.fixes.get(&row.name).cloned();
-    if source.is_audit() {
-        row.audit_fix = fix;
-    } else {
-        row.snyk_fix = fix;
-    }
 }
 
 impl App {
@@ -2361,6 +2650,413 @@ fn run_pm(dir: &std::path::Path, pm: Pm, args: &[String]) -> Result<(), String> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cache::Scans;
+    fn vuln(direct: &str, version: &str, id: &str) -> Vuln {
+        Vuln {
+            source: Source::Snyk,
+            id: id.into(),
+            title: "Bad".into(),
+            severity: Severity::High,
+            package: direct.into(),
+            version: version.into(),
+            direct: direct.into(),
+            direct_version: Some(version.into()),
+            path: Vec::new(),
+            fixed_in: vec!["1.0.1".into()],
+            upgrade_to: Some("1.0.1".into()),
+            upgrade_brings: None,
+            upgrade_major: false,
+            range: None,
+            fix_note: None,
+            cve: Vec::new(),
+        }
+    }
+    fn found(direct: &str, version: &str, id: &str) -> Findings {
+        Findings {
+            vulns: vec![vuln(direct, version, id)],
+            fix: Some(Version::new(1, 0, 1)),
+        }
+    }
+
+    /// Starts an app on a project with dependencies `a` and `b`, both installed at 1.0.0,
+    /// with a cache file prepared by `fill`. Every latest version is in the cache, so nothing
+    /// is fetched from the network.
+    fn app_with_cache(latest_a: &str, fill: impl FnOnce(&mut Scans)) -> App {
+        app_with_installed(latest_a, &[("a", "1.0.0"), ("b", "1.0.0")], fill)
+    }
+    /// Writes `node_modules/<name>/package.json` with `version`.
+    fn install(dir: &std::path::Path, name: &str, version: &str) {
+        let d = dir.join("node_modules").join(name);
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(d.join("package.json"), format!(r#"{{"name":"{name}","version":"{version}"}}"#)).unwrap();
+    }
+    /// Like `app_with_cache`, with the given packages installed in `node_modules`.
+    fn app_with_installed(
+        latest_a: &str,
+        installed: &[(&str, &str)],
+        fill: impl FnOnce(&mut Scans),
+    ) -> App {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static N: AtomicUsize = AtomicUsize::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "depsu-app-cache-{}-{}",
+            std::process::id(),
+            N.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        for (name, version) in installed {
+            install(&dir, name, version);
+        }
+        let mut cache = Cache::default();
+        cache.latest.insert("a".into(), latest_a.into());
+        cache.latest.insert("b".into(), "1.0.0".into());
+        fill(cache.scans_mut(&dir.display().to_string()));
+        let path = dir.join("cache.json");
+        cache.save(&path).unwrap();
+        let deps = ["a", "b"]
+            .iter()
+            .map(|n| Dep {
+                name: n.to_string(),
+                spec: "^1.0.0".into(),
+                kind: Kind::Prod,
+            })
+            .collect();
+        let mut app = App::start(
+            dir.clone(),
+            Pm::Npm,
+            deps,
+            Npmrc::load(&dir),
+            Vec::new(),
+            Some(path),
+        );
+        app.drain_events();
+        app
+    }
+    fn row<'a>(app: &'a App, name: &str) -> &'a Row {
+        app.rows.iter().find(|r| r.name == name).unwrap()
+    }
+    /// This project's scan results in the in-memory cache.
+    fn stored(app: &App) -> &Scans {
+        app.cache.scans(&app.project_key()).unwrap()
+    }
+    fn ids(app: &App, name: &str) -> Vec<String> {
+        row(app, name).vulns.iter().map(|v| v.id.clone()).collect()
+    }
+    /// What an install of `name` at `version` does to the row, without running a package
+    /// manager.
+    fn switch_version(app: &mut App, name: &str, version: &str) {
+        install(&app.dir.clone(), name, version);
+        app.read_installed_versions();
+        app.refresh_findings();
+    }
+
+    #[test]
+    fn cached_findings_apply_when_the_scanned_versions_are_installed() {
+        let app = app_with_cache("1.0.0", |c| {
+            c.set_findings("snyk", "a", "1.0.0", found("a", "1.0.0", "A-1"));
+            c.set_findings("snyk", "b", "1.0.0", found("b", "1.0.0", "B-1"));
+        });
+        assert_eq!(ids(&app, "a"), ["A-1"]);
+        assert_eq!(ids(&app, "b"), ["B-1"]);
+        assert!(row(&app, "a").snyk_fix.is_some());
+        assert!(!row(&app, "a").scan_outdated);
+        assert!(!app.snyk.stale);
+        assert_eq!(app.snyk.status, ScanStatus::Done { total: 2, severe: 2 });
+    }
+
+    #[test]
+    fn cached_findings_of_another_version_are_not_shown() {
+        // Only a@0.9.0 was scanned, but a@1.0.0 is installed.
+        let app = app_with_cache("1.0.0", |c| {
+            c.set_findings("snyk", "a", "0.9.0", found("a", "0.9.0", "A-OLD"));
+            c.set_findings("snyk", "b", "1.0.0", found("b", "1.0.0", "B-1"));
+        });
+        let a = row(&app, "a");
+        assert!(a.vulns.is_empty(), "findings of another version must not show");
+        assert!(a.snyk_fix.is_none());
+        assert!(a.scan_outdated);
+        // `b` is at the scanned version, so its findings still apply.
+        assert_eq!(ids(&app, "b"), ["B-1"]);
+        assert!(!row(&app, "b").scan_outdated);
+        assert!(app.snyk.stale, "a package hasn't been scanned at its version");
+    }
+
+    #[test]
+    fn each_version_keeps_its_own_findings_when_switching_back_and_forth() {
+        let mut app = app_with_cache("1.1.0", |c| {
+            c.set_findings("snyk", "a", "1.0.0", found("a", "1.0.0", "A-OLD"));
+            // 1.1.0 was scanned and found clean.
+            c.set_findings("snyk", "a", "1.1.0", Findings::default());
+            c.set_findings("snyk", "b", "1.0.0", Findings::default());
+        });
+        assert_eq!(ids(&app, "a"), ["A-OLD"]);
+
+        switch_version(&mut app, "a", "1.1.0");
+        assert!(row(&app, "a").vulns.is_empty(), "1.1.0 is clean");
+        assert!(row(&app, "a").snyk_fix.is_none());
+        assert!(!row(&app, "a").scan_outdated, "1.1.0 was scanned");
+        assert!(!app.snyk.stale);
+
+        switch_version(&mut app, "a", "1.2.0");
+        assert!(row(&app, "a").vulns.is_empty());
+        assert!(row(&app, "a").scan_outdated, "1.2.0 was never scanned");
+        assert!(app.snyk.stale);
+
+        // Back to the first version: its findings come back.
+        switch_version(&mut app, "a", "1.0.0");
+        assert_eq!(ids(&app, "a"), ["A-OLD"]);
+        assert!(!row(&app, "a").scan_outdated);
+        assert!(!app.snyk.stale);
+    }
+
+    #[test]
+    fn a_scan_is_recorded_for_the_versions_installed_at_the_time() {
+        let mut app = app_with_cache("1.0.0", |_| {});
+        let mut report = Report::default();
+        report.vulns = vec![vuln("a", "1.0.0", "A-1")];
+        app.apply_scan(Source::Snyk, report, false);
+        assert_eq!(ids(&app, "a"), ["A-1"]);
+        // Upgrading `a` hides the finding: the new version hasn't been scanned.
+        switch_version(&mut app, "a", "1.1.0");
+        assert!(row(&app, "a").vulns.is_empty());
+        assert!(row(&app, "a").scan_outdated);
+        // The scan was stored per version, also for the clean package `b`.
+        assert_eq!(stored(&app).findings("snyk", "a", "1.0.0").unwrap().vulns.len(), 1);
+        assert!(stored(&app).findings("snyk", "a", "1.1.0").is_none());
+        assert!(stored(&app).findings("snyk", "b", "1.0.0").unwrap().vulns.is_empty());
+        // ... and it was written to the file.
+        app.flush_cache();
+        let on_disk = Cache::load(app.cache_path.as_ref().unwrap()).unwrap();
+        assert_eq!(on_disk.scans(&app.project_key()).unwrap().findings("snyk", "a", "1.0.0").unwrap().vulns[0].id, "A-1");
+    }
+
+    #[test]
+    fn scanners_are_kept_apart() {
+        let app = app_with_cache("1.0.0", |c| {
+            c.set_findings("snyk", "a", "1.0.0", found("a", "1.0.0", "SNYK-A"));
+            c.set_findings("snyk", "b", "1.0.0", Findings::default());
+            // npm audit looked at another version of `a`.
+            let mut f = found("a", "0.9.0", "NPM-A");
+            f.vulns[0].source = Source::NpmAudit;
+            c.set_findings("npm audit", "a", "0.9.0", f);
+            c.set_findings("npm audit", "b", "1.0.0", Findings::default());
+        });
+        assert_eq!(ids(&app, "a"), ["SNYK-A"]);
+        assert!(row(&app, "a").audit_fix.is_none());
+        assert!(row(&app, "a").scan_outdated, "npm audit hasn't seen a@1.0.0");
+        assert!(!app.snyk.stale);
+        assert!(app.audit.stale);
+    }
+
+    #[test]
+    fn findings_are_keyed_by_the_installed_version_not_the_package_json_one() {
+        // package.json asks for ^1.0.0, but 1.0.5 is what is installed and was scanned.
+        let mut app = app_with_installed("1.0.5", &[("a", "1.0.5")], |c| {
+            c.set_findings("snyk", "a", "1.0.0", found("a", "1.0.0", "A-1.0.0"));
+            c.set_findings("snyk", "a", "1.0.5", found("a", "1.0.5", "A-1.0.5"));
+            c.set_findings("snyk", "b", "1.0.0", Findings::default());
+        });
+        assert_eq!(row(&app, "a").current, Version::new(1, 0, 0));
+        assert_eq!(row(&app, "a").installed, Some(Version::new(1, 0, 5)));
+        assert_eq!(ids(&app, "a"), ["A-1.0.5"]);
+        assert!(!row(&app, "a").scan_outdated);
+        // `b` isn't installed and there's no lockfile: its version is unknown, so no
+        // finding is looked up for it, not even under the package.json version.
+        assert!(row(&app, "b").installed.is_none());
+        assert!(row(&app, "b").vulns.is_empty());
+        assert!(row(&app, "b").scan_outdated);
+
+        // The lockfile moves `a` to 1.0.6 without package.json changing.
+        install(&app.dir.clone(), "a", "1.0.6");
+        app.read_installed_versions();
+        app.refresh_findings();
+        assert!(row(&app, "a").vulns.is_empty(), "1.0.6 was never scanned");
+        assert!(row(&app, "a").scan_outdated);
+
+        // A scan now is recorded under 1.0.6, leaving the other versions' findings alone.
+        let mut report = Report::default();
+        report.vulns = vec![vuln("a", "1.0.6", "A-1.0.6")];
+        app.apply_scan(Source::Snyk, report, false);
+        assert_eq!(ids(&app, "a"), ["A-1.0.6"]);
+        assert_eq!(stored(&app).findings("snyk", "a", "1.0.6").unwrap().vulns[0].id, "A-1.0.6");
+        assert_eq!(stored(&app).findings("snyk", "a", "1.0.0").unwrap().vulns[0].id, "A-1.0.0");
+        assert_eq!(stored(&app).findings("snyk", "a", "1.0.5").unwrap().vulns[0].id, "A-1.0.5");
+    }
+
+    #[test]
+    fn projects_sharing_a_cache_file_keep_their_own_scan_results() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static N: AtomicUsize = AtomicUsize::new(0);
+        let base = std::env::temp_dir().join(format!(
+            "depsu-two-projects-{}-{}",
+            std::process::id(),
+            N.fetch_add(1, Ordering::Relaxed)
+        ));
+        let (dir_a, dir_b) = (base.join("a"), base.join("b"));
+        // The same version of `a` is installed in both projects.
+        for d in [&dir_a, &dir_b] {
+            install(d, "a", "1.0.0");
+            install(d, "b", "1.0.0");
+        }
+        let path = base.join("cache.json");
+        let mut cache = Cache::default();
+        cache.latest.insert("a".into(), "1.0.0".into());
+        cache.latest.insert("b".into(), "1.0.0".into());
+        cache.save(&path).unwrap();
+        let open = |dir: &std::path::Path| {
+            let deps = ["a", "b"]
+                .iter()
+                .map(|n| Dep {
+                    name: n.to_string(),
+                    spec: "^1.0.0".into(),
+                    kind: Kind::Prod,
+                })
+                .collect();
+            let mut app = App::start(
+                dir.to_path_buf(),
+                Pm::Npm,
+                deps,
+                Npmrc::load(dir),
+                Vec::new(),
+                Some(path.clone()),
+            );
+            app.drain_events();
+            app
+        };
+
+        // Project A: Snyk finds nothing.
+        let mut a = open(&dir_a);
+        a.apply_scan(Source::Snyk, Report::default(), false);
+        a.flush_cache();
+        drop(a);
+
+        // Project B: the same a@1.0.0 brings in something vulnerable there.
+        let mut b = open(&dir_b);
+        assert!(row(&b, "a").vulns.is_empty(), "A's results must not show in B");
+        assert_eq!(b.snyk.status, ScanStatus::NotRun, "B has no scan results of its own");
+        let mut report = Report::default();
+        report.vulns = vec![vuln("a", "1.0.0", "ONLY-IN-B")];
+        b.apply_scan(Source::Snyk, report, false);
+        b.flush_cache();
+        drop(b);
+
+        // Back in A: still clean.
+        let a = open(&dir_a);
+        assert!(row(&a, "a").vulns.is_empty(), "B's findings must not show in A");
+        assert!(!row(&a, "a").scan_outdated, "A's own scan still applies");
+        // And B keeps its finding.
+        let b = open(&dir_b);
+        assert_eq!(ids(&b, "a"), ["ONLY-IN-B"]);
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    /// Writes a lockfile v3 pinning each `(name, version)`.
+    fn write_lock(dir: &std::path::Path, pins: &[(&str, &str)]) {
+        let packages: serde_json::Map<String, serde_json::Value> = pins
+            .iter()
+            .map(|(n, v)| (format!("node_modules/{n}"), serde_json::json!({ "version": v })))
+            .collect();
+        let lock = serde_json::json!({ "lockfileVersion": 3, "packages": packages });
+        std::fs::create_dir_all(dir).unwrap();
+        std::fs::write(dir.join("package-lock.json"), lock.to_string()).unwrap();
+    }
+
+    #[test]
+    fn findings_are_filed_under_the_scanned_lockfile_version_not_the_package_json_one() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static N: AtomicUsize = AtomicUsize::new(0);
+        let base = std::env::temp_dir().join(format!(
+            "depsu-lockfile-{}-{}",
+            std::process::id(),
+            N.fetch_add(1, Ordering::Relaxed)
+        ));
+        let (dir_a, dir_b) = (base.join("a"), base.join("b"));
+        // Both package.json files ask for ^1.0.0 (see `open`).
+        // A has 1.0.0 installed. B was never installed; its lockfile pins 0.9.0.
+        install(&dir_a, "a", "1.0.0");
+        install(&dir_a, "b", "1.0.0");
+        write_lock(&dir_b, &[("a", "0.9.0"), ("b", "1.0.0")]);
+        let path = base.join("cache.json");
+        let mut cache = Cache::default();
+        cache.latest.insert("a".into(), "1.0.0".into());
+        cache.latest.insert("b".into(), "1.0.0".into());
+        cache.save(&path).unwrap();
+        let open = |dir: &std::path::Path| {
+            let deps = ["a", "b"]
+                .iter()
+                .map(|n| Dep {
+                    name: n.to_string(),
+                    spec: "^1.0.0".into(),
+                    kind: Kind::Prod,
+                })
+                .collect();
+            let mut app = App::start(
+                dir.to_path_buf(),
+                Pm::Npm,
+                deps,
+                Npmrc::load(dir),
+                Vec::new(),
+                Some(path.clone()),
+            );
+            app.drain_events();
+            app
+        };
+
+        let mut b = open(&dir_b);
+        assert_eq!(row(&b, "a").current, Version::new(1, 0, 0), "package.json");
+        assert_eq!(row(&b, "a").installed, Some(Version::new(0, 9, 0)), "lockfile");
+        // Snyk scans the lockfile and reports the direct dependency as a@0.9.0.
+        let mut report = Report::default();
+        report.vulns = vec![vuln("a", "0.9.0", "IN-0.9.0")];
+        b.apply_scan(Source::Snyk, report, false);
+        assert_eq!(ids(&b, "a"), ["IN-0.9.0"]);
+        assert!(stored(&b).findings("snyk", "a", "0.9.0").is_some());
+        assert!(
+            stored(&b).findings("snyk", "a", "1.0.0").is_none(),
+            "nothing may be filed under the package.json version"
+        );
+        b.flush_cache();
+        drop(b);
+
+        // Even if A used B's results (as before results were kept per project), a@1.0.0
+        // has none: B never scanned 1.0.0.
+        let mut shared = Cache::load(&path).unwrap();
+        let b_scans = shared.projects.remove(&dir_b.display().to_string()).unwrap();
+        shared.projects.insert(dir_a.display().to_string(), b_scans);
+        shared.save(&path).unwrap();
+        let a = open(&dir_a);
+        assert!(row(&a, "a").vulns.is_empty(), "0.9.0's findings must not show for 1.0.0");
+        assert!(row(&a, "a").scan_outdated, "1.0.0 hasn't been scanned");
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn a_snyk_version_that_differs_from_node_modules_is_reported() {
+        let mut app = app_with_cache("1.0.0", |_| {});
+        let mut report = Report::default();
+        // Snyk read 0.9.0 from the lockfile, but node_modules holds 1.0.0.
+        report.vulns = vec![vuln("a", "0.9.0", "OLD")];
+        app.apply_scan(Source::Snyk, report, false);
+        assert!(row(&app, "a").vulns.is_empty(), "not shown for the installed 1.0.0");
+        assert!(stored(&app).findings("snyk", "a", "0.9.0").is_some());
+        assert!(
+            app.log.iter().any(|l| l.contains("a@0.9.0 (depsu sees 1.0.0)")),
+            "{:?}",
+            app.log
+        );
+    }
+
+    #[test]
+    fn cached_latest_versions_are_compared_with_the_installed_version() {
+        let app = app_with_cache("2.0.0", |_| {});
+        assert!(!app.loading(), "no network lookups were needed");
+        let a = row(&app, "a");
+        assert_eq!(a.latest, Version::parse("2.0.0").unwrap());
+        assert!(a.outdated);
+        assert!(!row(&app, "b").outdated);
+        assert_eq!(app.snyk.status, ScanStatus::NotRun, "nothing cached, nothing shown");
+    }
+
     fn ovr(name: &str, value: &str, key: &str) -> Override {
         Override {
             name: name.into(),

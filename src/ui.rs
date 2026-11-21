@@ -481,6 +481,13 @@ fn row_line(app: &App, r: &AppRow, indent: usize, name_w: usize, width: usize) -
             ));
         }
     }
+    // The installed version differs from the one the last scan looked at.
+    if r.scan_outdated {
+        spans.push(Span::styled(
+            "   ↻ not scanned at this version",
+            Style::new().fg(Color::Yellow),
+        ));
+    }
     if let Some(from) = &r.changed_from {
         let verb = if *from < r.current { "upgraded" } else { "downgraded" };
         spans.push(Span::styled(
@@ -571,11 +578,6 @@ fn override_marker(r: &AppRow) -> (Vec<Span<'static>>, usize) {
                 .fg(severity_color(sev))
                 .add_modifier(Modifier::BOLD),
         ));
-        width += 1;
-    }
-    // ↻: the version changed since the last scan, so a rescan is due.
-    if r.scan_outdated {
-        spans.push(Span::styled("↻", Style::new().fg(Color::Yellow)));
         width += 1;
     }
     (spans, width)

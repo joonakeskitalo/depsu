@@ -54,12 +54,14 @@ Run it in a project directory:
 depsu
 depsu --dir ../other-project
 depsu --pm pnpm       # skip detection
+depsu --cache .depsu-cache.json   # remember versions and scans between runs
 ```
 
 | Option | |
 |---|---|
 | `-C`, `--dir <PATH>` | Project directory (default: current directory) |
 | `--pm <NAME>` | Force the package manager: `npm`, `yarn`, `pnpm` or `bun` |
+| `--cache <FILE>` | JSON file that stores the latest versions, and the Snyk / audit findings per project and package version. One file can be shared by several projects: latest versions are shared, scan results are kept apart per project directory. Read at start, updated as results arrive. A file that can't be parsed is left untouched and not used |
 | `-h`, `--help` / `-V`, `--version` | |
 
 ### Keys
@@ -79,6 +81,7 @@ depsu --pm pnpm       # skip detection
 | `s` | Scan with Snyk |
 | `n` | Run `npm audit` / `bun audit` (whichever the project uses) |
 | `v` | Show / hide vulnerability findings |
+| `R` | Fetch the latest versions again, ignoring the cache |
 | `?` | Show / hide the details panel for the highlighted package: installed packages that use it and its override summary |
 | `q` / `Esc` | Quit (press twice while an install is running) |
 
@@ -142,7 +145,6 @@ them under each package.
 | `?` | The override can't be interpreted (URL, alias, odd range) |
 | `↳` | An override applies somewhere in the package's installed dependency tree (yellow if it forces a version outside what the parent declares) |
 | `✱` | A scan found vulnerabilities (coloured by worst severity) |
-| `↻` | The version changed since the last scan, so its findings are out of date: scan again |
 
 **Compatibility.** npm requires an override on a direct dependency to have the exact same spec as
 the dependency (or be `$name`), otherwise it fails with `EOVERRIDE`. yarn, pnpm and bun let the
@@ -201,6 +203,17 @@ counts against your organisation's test quota**, so it never runs automatically.
   dependency's point of view: the version of the direct dependency that fixes the finding
   (`fixed by upgrading express to 4.22.0 (brings qs 6.14.3)`), or, when upgrading it doesn't help,
   the fixed releases of the nested package that are newer than the installed one.
+- Findings are kept per project and per resolved package version, in memory and in the
+  `--cache` file. The resolved version is the one `package-lock.json` pins, or else the one in
+  `node_modules`, since that is what Snyk and `npm audit` look at; the range in `package.json`
+  is never used. A Snyk finding is filed under the version Snyk names in it, and depsu warns
+  when that differs from `node_modules`. A package whose version can't be determined (not
+  installed, no npm lockfile) is not recorded. After an install
+  or revert, a package shows the findings recorded for its new version if that version was
+  scanned before. `↻ not scanned at this version` means no scanner has looked at the installed
+  version yet. Press `s` or `n` to scan it. Findings are matched by the version of your direct
+  dependency, so a change deeper in the tree (for example from editing overrides) still needs a
+  new scan.
 - `snyk fix: <version>` on a row is Snyk's suggested version for that dependency. It fixes
   everything fixable and can be lower than the latest release. Move onto a finding and press `i` to
   install the version that fixes it.

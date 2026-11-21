@@ -336,6 +336,8 @@ pub struct Located {
     pub path: Vec<String>,
     pub package: String,
     pub version: Version,
+    /// The installed version of `direct`.
+    pub direct_version: Option<Version>,
     /// Index of the advisory, as given to `find_vulnerable`.
     pub advisory: usize,
 }
@@ -363,6 +365,7 @@ impl Analyzer {
             installed_any = true;
             let mut st = AuditWalk {
                 direct: dep.clone(),
+                direct_version: self.pkg(&root).version.clone(),
                 visited: HashSet::from([root.clone()]),
                 found: HashSet::new(),
                 out: Vec::new(),
@@ -405,6 +408,7 @@ impl Analyzer {
                         path: path.clone(),
                         package: name.to_string(),
                         version: version.clone(),
+                        direct_version: st.direct_version.clone(),
                         advisory: *adv,
                     });
                 }
@@ -431,6 +435,7 @@ impl Analyzer {
 
 struct AuditWalk {
     direct: String,
+    direct_version: Option<Version>,
     visited: HashSet<PathBuf>,
     /// (advisory, package, version) already reported for this direct dependency.
     found: HashSet<(usize, String, Version)>,
@@ -475,6 +480,46 @@ struct Walk {
 }
 
 /// Does the override force a version the parent didn't ask for?
+/// The versions npm's lockfile (`package-lock.json` in `dir`) pins the project's direct
+/// dependencies to, by name. Reads lockfile v2/v3 (`packages`) and v1 (`dependencies`).
+pub fn npm_lock_versions(dir: &Path) -> Option<HashMap<String, Version>> {
+    let text = std::fs::read_to_string(dir.join("package-lock.json")).ok()?;
+    let json: serde_json::Value = serde_json::from_str(&text).ok()?;
+    let mut out = HashMap::new();
+    let version = |v: &serde_json::Value| Version::parse(v.get("version")?.as_str()?).ok();
+    if let Some(pkgs) = json.get("packages").and_then(|p| p.as_object()) {
+        for (key, entry) in pkgs {
+            // Only top-level installs: `node_modules/x`, not `node_modules/y/node_modules/x`.
+            let Some(name) = key.strip_prefix("node_modules/") else {
+                continue;
+            };
+            if name.contains("/node_modules/") {
+                continue;
+            }
+            if let Some(v) = version(entry) {
+                out.insert(name.to_string(), v);
+            }
+        }
+    } else if let Some(deps) = json.get("dependencies").and_then(|d| d.as_object()) {
+        for (name, entry) in deps {
+            if let Some(v) = version(entry) {
+                out.insert(name.clone(), v);
+            }
+        }
+    }
+    Some(out)
+}
+
+/// The version of `name` installed for the project in `dir`, found the way Node resolves it
+/// (the nearest `node_modules` upwards, so hoisted workspace installs count).
+pub fn installed_version(dir: &Path, name: &str) -> Option<Version> {
+    dir.ancestors()
+        .map(|a| a.join("node_modules").join(name).join("package.json"))
+        .find(|p| p.is_file())
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
+        .and_then(|j| Version::parse(j.get("version")?.as_str()?).ok())
+}
 pub fn risk(o: &Override, requested: &str) -> Compat {
     if o.value.starts_with('$') || o.value == requested {
         return Compat::Ok;
