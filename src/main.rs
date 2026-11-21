@@ -51,7 +51,7 @@ KEYS:
                    overrides, or the package / override under the cursor (asks first)
     s              scan with Snyk
     n              run npm audit / bun audit (by the project's package manager)
-    e              install a version you type for the highlighted package
+    e              edit the version of the highlighted package (and its pin type)
     f              fix the unmet peers of the highlighted package
     c              commit package.json and the lockfile, titled as a conventional
                    commit of the changes (e.g. 'chore: upgrade eslint 8.57.0 to 9.0.0')

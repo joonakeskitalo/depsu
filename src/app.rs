@@ -43,10 +43,9 @@ pub enum Event {
     InstallStarted {
         names: Vec<String>,
     },
-    /// The registry answered whether the version typed for a package exists.
-    VersionChecked {
+    /// The registry sent the published versions of the package being edited.
+    VersionDoc {
         name: String,
-        version: Version,
         result: Result<registry::Packument, String>,
     },
     /// The registry answered about a package to add.
@@ -211,10 +210,50 @@ impl Input {
 }
 
 pub enum InputPurpose {
-    /// A version to install for an existing package (`e`).
-    Version { name: String },
     /// A package to add to the project (`+`).
     Add { add_as: AddAs },
+}
+
+/// The version of a package being edited (`e`): what goes into `package.json`, with its pin
+/// type, e.g. `^18.3.1`.
+pub struct VersionEdit {
+    pub name: String,
+    pub field: crate::textfield::TextField,
+    /// The package's published versions, once the registry answered.
+    pub doc: Option<Result<registry::Packument, String>>,
+    /// Why the last Enter didn't install.
+    pub error: Option<String>,
+}
+
+/// What the version typed in the `e` dialog is.
+#[derive(Clone, Debug, PartialEq)]
+pub enum VersionCheck {
+    NotAVersion,
+    LookingUp,
+    LookupFailed(String),
+    Published { prefix: &'static str, version: Version },
+    /// Not published: the message names the nearest published versions.
+    NotPublished(String),
+}
+
+impl VersionEdit {
+    pub fn check(&self) -> VersionCheck {
+        let Some((prefix, version)) = parse_pinned(self.field.text()) else {
+            return VersionCheck::NotAVersion;
+        };
+        match &self.doc {
+            None => VersionCheck::LookingUp,
+            Some(Err(e)) => VersionCheck::LookupFailed(e.clone()),
+            Some(Ok(doc)) if doc.versions.contains_key(&version) => {
+                VersionCheck::Published { prefix, version }
+            }
+            Some(Ok(doc)) => VersionCheck::NotPublished(
+                no_such_version(&self.name, &version, doc)
+                    .trim_start_matches("✘ ")
+                    .to_string(),
+            ),
+        }
+    }
 }
 
 /// What a package is added as.
@@ -494,6 +533,11 @@ pub struct App {
     /// Packages to install with an exact version the next time they are queued, because a
     /// range would resolve to a blocked version again.
     exact_once: HashSet<String>,
+    /// Packages to install with this pin type the next time they are queued, because the
+    /// user typed it in the `e` dialog.
+    prefix_once: HashMap<String, &'static str>,
+    /// The version of a package being edited (`e`).
+    pub version_edit: Option<VersionEdit>,
     prober: Prober,
     /// The peer dependencies of an install are being checked.
     peer_checking: bool,
@@ -667,6 +711,8 @@ impl App {
             queued_fixes: Vec::new(),
             session_fixes: Vec::new(),
             exact_once: HashSet::new(),
+            prefix_once: HashMap::new(),
+            version_edit: None,
             prober: {
                 let (rc, agent) = (rc.clone(), agent.clone());
                 Arc::new(move |n: &str, url: &str| registry::downloadable(&rc, &agent, n, url))
@@ -1115,11 +1161,11 @@ impl App {
                 } => self.on_blocked(plan, ovr, blocked, after_failure),
                 Event::CommitPrepared(result) => self.on_commit_prepared(result),
                 Event::Committed(result) => self.on_committed(result),
-                Event::VersionChecked {
-                    name,
-                    version,
-                    result,
-                } => self.on_version_checked(name, version, result),
+                Event::VersionDoc { name, result } => {
+                    if let Some(e) = self.version_edit.as_mut().filter(|e| e.name == name) {
+                        e.doc = Some(result);
+                    }
+                }
                 Event::AddChecked {
                     name,
                     add_as,
@@ -1899,6 +1945,10 @@ impl App {
             self.on_commit_key(key);
             return;
         }
+        if self.version_edit.is_some() {
+            self.on_version_key(key);
+            return;
+        }
         if let Some(p) = self.blocked_prompt.take() {
             match key.code {
                 KeyCode::Char('y') if p.has_alternatives() => self.use_unblocked(p),
@@ -1916,6 +1966,7 @@ impl App {
                 _ => {
                     for (name, _) in &p.plan {
                         self.adding.remove(name);
+                        self.prefix_once.remove(name);
                     }
                     if !p.after_failure {
                         self.push_log("Install cancelled.");
@@ -1967,6 +2018,7 @@ impl App {
                 _ => {
                     for (name, _) in &p.plan {
                         self.adding.remove(name);
+                        self.prefix_once.remove(name);
                     }
                     self.push_log("Install cancelled.");
                 }
@@ -2119,11 +2171,6 @@ impl App {
         match key.code {
             KeyCode::Esc => self.input = None,
             KeyCode::Enter => match &input.purpose {
-                InputPurpose::Version { name } => {
-                    let (name, text) = (name.clone(), input.text.clone());
-                    self.input = None;
-                    self.submit_version(name, &text);
-                }
                 InputPurpose::Add { add_as } => {
                     let (add_as, text) = (*add_as, input.text.clone());
                     self.submit_add(add_as, &text);
@@ -2134,11 +2181,10 @@ impl App {
                 input.error = None;
             }
             KeyCode::Tab | KeyCode::Down | KeyCode::BackTab | KeyCode::Up => {
-                if let InputPurpose::Add { add_as } = &mut input.purpose {
-                    let by = if matches!(key.code, KeyCode::BackTab | KeyCode::Up) { -1 } else { 1 };
-                    *add_as = add_as.step(by);
-                    input.error = None;
-                }
+                let InputPurpose::Add { add_as } = &mut input.purpose;
+                let by = if matches!(key.code, KeyCode::BackTab | KeyCode::Up) { -1 } else { 1 };
+                *add_as = add_as.step(by);
+                input.error = None;
             }
             KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
                 input.text.push(c);
@@ -2399,10 +2445,11 @@ impl App {
         }
     }
 
-    /// Asks which version to install for the package under the cursor.
+    /// Opens the version of the package under the cursor for editing, pre-filled with what it
+    /// has now, and looks up which versions are published.
     fn ask_version(&mut self) {
         let Some(Item::Row { idx, .. }) = self.cursor_item() else {
-            self.push_log("Put the cursor on a package to choose its version.");
+            self.push_log("Put the cursor on a package to edit its version.");
             return;
         };
         let r = &self.rows[*idx];
@@ -2416,49 +2463,102 @@ impl App {
         if r.busy() {
             return;
         }
-        self.input = Some(Input::new(InputPurpose::Version {
-            name: r.name.clone(),
-        }));
-    }
-
-    fn submit_version(&mut self, name: String, text: &str) {
-        let Some(version) = parse_version(text) else {
-            self.push_log(format!(
-                "✘ {:?} isn't a version like 1.2.3. To change how it is pinned (^, ~), use P.",
-                text.trim()
-            ));
-            return;
-        };
-        self.push_log(format!("… looking up {name}@{version}"));
+        let now = r.installed.clone().unwrap_or_else(|| r.current.clone());
+        let name = r.name.clone();
+        self.version_edit = Some(VersionEdit {
+            name: name.clone(),
+            field: crate::textfield::TextField::new(format!("{}{now}", r.prefix)),
+            doc: None,
+            error: None,
+        });
         let (fetch, tx) = (self.fetcher.clone(), self.events_tx.clone());
         thread::spawn(move || {
             let result = fetch(&name);
-            let _ = tx.send(Event::VersionChecked {
-                name,
-                version,
-                result,
-            });
+            let _ = tx.send(Event::VersionDoc { name, result });
         });
     }
 
-    fn on_version_checked(
-        &mut self,
-        name: String,
-        version: Version,
-        result: Result<registry::Packument, String>,
-    ) {
-        let doc = match result {
-            Ok(d) => d,
-            Err(e) => return self.push_log(format!("✘ could not look up {name}: {e}")),
+    fn on_version_key(&mut self, key: KeyEvent) {
+        let Some(e) = &mut self.version_edit else {
+            return;
         };
-        if !doc.versions.contains_key(&version) {
-            return self.push_log(no_such_version(&name, &version, &doc));
+        let f = &mut e.field;
+        let changed = match key.code {
+            KeyCode::Esc => {
+                self.version_edit = None;
+                return;
+            }
+            KeyCode::Enter => return self.submit_version(),
+            KeyCode::Backspace => f.backspace(),
+            KeyCode::Delete => f.delete(),
+            KeyCode::Left => {
+                f.left();
+                false
+            }
+            KeyCode::Right => {
+                f.right();
+                false
+            }
+            KeyCode::Home => {
+                f.home();
+                false
+            }
+            KeyCode::End => {
+                f.end();
+                false
+            }
+            KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                f.insert(c);
+                true
+            }
+            _ => false,
+        };
+        if changed {
+            e.error = None;
         }
+    }
+
+    /// Installs the version in the `e` dialog, with the pin type written in front of it.
+    fn submit_version(&mut self) {
+        let Some(e) = &mut self.version_edit else {
+            return;
+        };
+        let (prefix, version) = match e.check() {
+            VersionCheck::Published { prefix, version } => (prefix, version),
+            VersionCheck::NotAVersion => {
+                e.error = Some(
+                    "Type a version like 1.2.3, with ^, ~ or >= in front for a range.".into(),
+                );
+                return;
+            }
+            VersionCheck::LookingUp => {
+                e.error = Some("Still looking up the published versions…".into());
+                return;
+            }
+            VersionCheck::LookupFailed(err) => {
+                e.error = Some(format!("Could not look up {}: {err}", e.name));
+                return;
+            }
+            VersionCheck::NotPublished(msg) => {
+                e.error = Some(msg);
+                return;
+            }
+        };
+        let name = e.name.clone();
+        self.version_edit = None;
         let Some(i) = self.rows.iter().position(|r| r.name == name) else {
             return;
         };
-        if self.rows[i].busy() {
+        let r = &self.rows[i];
+        if r.busy() {
             return;
+        }
+        let installed = r.installed.as_ref().unwrap_or(&r.current);
+        if r.prefix == prefix && r.current == version && *installed == version {
+            return self.push_log(format!("{name} is already at {prefix}{version}."));
+        }
+        if prefix != r.prefix {
+            self.prefix_once.insert(name, prefix);
         }
         // The version was typed, so a clash with an override is reported but doesn't stop it.
         self.dispatch(None, vec![(i, version)], Vec::new());
@@ -3236,6 +3336,7 @@ impl App {
         if self.peer_checking {
             for (name, _) in &plan {
                 self.adding.remove(name);
+                self.prefix_once.remove(name);
             }
             self.push_log("Still checking the peer dependencies of the previous install.");
             return;
@@ -3364,6 +3465,7 @@ impl App {
         let mut items = Vec::new();
         for (name, target) in plan {
             let exact_now = self.exact_once.remove(&name);
+            let prefix_now = self.prefix_once.remove(&name);
             let Some(r) = self.rows.iter_mut().find(|r| r.name == name) else {
                 if let Some(a) = self.adding.get(&name) {
                     items.push(InstallItem {
@@ -3381,10 +3483,11 @@ impl App {
             }
             r.selected = false;
             r.status = Status::Queued;
-            let exact = exact_now || r.prefix.is_empty();
+            let prefix = prefix_now.unwrap_or(r.prefix);
+            let exact = exact_now || prefix.is_empty();
             items.push(InstallItem {
                 name: r.name.clone(),
-                spec: if exact { target.to_string() } else { format!("{}{target}", r.prefix) },
+                spec: if exact { target.to_string() } else { format!("{prefix}{target}") },
                 kind: r.kind,
                 exact,
                 old: spec_in_manifest(&self.root_deps, &r.name),
@@ -3954,6 +4057,18 @@ fn install_worker(dir: PathBuf, pm: Pm, jobs: Receiver<Job>, tx: Sender<Event>) 
 /// `1.2.3`, also written `v1.2.3` or `=1.2.3`.
 fn parse_version(text: &str) -> Option<Version> {
     Version::parse(text.trim().trim_start_matches(['v', '='])).ok()
+}
+
+/// `^1.2.3`, `~1.2.3`, `>=1.2.3` or `1.2.3` (also `v1.2.3`, `=1.2.3`): the pin type and the
+/// version.
+pub fn parse_pinned(text: &str) -> Option<(&'static str, Version)> {
+    let t = text.trim();
+    for prefix in [">=", "^", "~"] {
+        if let Some(rest) = t.strip_prefix(prefix) {
+            return Some((prefix, parse_version(rest)?));
+        }
+    }
+    Some(("", parse_version(t)?))
 }
 
 /// npm package names: `name` or `@scope/name`, of URL-safe characters.
@@ -4795,52 +4910,152 @@ mod tests {
             .collect()
     }
 
+    /// Opens the `e` dialog on `a` and waits for the published versions.
+    fn edit_version(app: &mut App) {
+        app.on_key(key('e'));
+        wait_until(app, |a| a.version_edit.as_ref().is_some_and(|e| e.doc.is_some()));
+    }
+    fn version_field(app: &App) -> &str {
+        app.version_edit.as_ref().unwrap().field.text()
+    }
+    /// Replaces the text in the `e` dialog.
+    fn retype(app: &mut App, text: &str) {
+        while !version_field(app).is_empty() {
+            press(app, KeyCode::Backspace);
+        }
+        type_text(app, text);
+    }
+
     #[test]
-    fn e_installs_the_version_the_user_types() {
-        let (mut app, rx) = offline_app();
+    fn e_opens_the_current_version_for_editing() {
+        let (mut app, _rx) = offline_app();
         assert!(matches!(app.cursor_item(), Some(Item::Row { name, .. }) if name == "a"));
-        app.on_key(key('e'));
-        assert!(matches!(&app.input, Some(Input { purpose: InputPurpose::Version { name }, .. }) if name == "a"));
-        type_text(&mut app, "1.5.0");
-        press(&mut app, KeyCode::Enter);
-        assert!(app.input.is_none());
-        let jobs = settle(&mut app, &rx, "");
-        assert_eq!(specs(&jobs), ["a@^1.5.0"], "keeps the ^ pin type");
+        edit_version(&mut app);
+        assert_eq!(version_field(&app), "^1.0.0", "pre-filled with what it has now");
+        assert_eq!(crate::ui::focus(&app), crate::ui::Focus::Dialog);
+        let screen = render(&mut app, 120, 40).join("\n");
+        assert!(screen.contains(" Version of a "), "{screen}");
+        assert!(screen.contains("package.json  ^1.0.0"), "{screen}");
+        assert!(screen.contains("installed     1.0.0"), "{screen}");
+        assert!(screen.contains("Version       ^1.0.0█"), "{screen}");
+        assert!(screen.contains("✔ 1.0.0 is published, and is what a has now"), "{screen}");
+        // The pin-type legend wraps inside the box instead of running past it.
+        for w in [120u16, 70, 50] {
+            let rows = dialog_rows(&render(&mut app, w, 40), " Version of a ");
+            let body = rows.join("\n");
+            assert!(body.contains("exact"), "{w}: {body}");
+            let top: Vec<char> = rows[0].chars().collect();
+            let left = top.iter().position(|&c| c == '╭').unwrap();
+            let right = top.iter().position(|&c| c == '╮').unwrap();
+            for r in &rows[1..rows.len() - 1] {
+                let c: Vec<char> = r.chars().collect();
+                assert!(c[left] == '│' && c[right] == '│', "{w}: {r:?}");
+            }
+        }
     }
 
     #[test]
-    fn e_rejects_a_version_that_was_never_published() {
+    fn e_installs_the_edited_version_with_its_pin_type() {
         let (mut app, rx) = offline_app();
-        app.on_key(key('e'));
-        type_text(&mut app, "1.4.0");
+        edit_version(&mut app);
+        // Edit just the version digits: 1.0.0 → 1.5.0.
+        press(&mut app, KeyCode::Home);
+        for _ in 0.."^1.".len() {
+            press(&mut app, KeyCode::Right);
+        }
+        press(&mut app, KeyCode::Delete);
+        type_text(&mut app, "5");
+        assert_eq!(version_field(&app), "^1.5.0");
         press(&mut app, KeyCode::Enter);
-        let jobs = settle(&mut app, &rx, "no published version");
-        assert!(jobs.is_empty());
-        let msg = app.log.iter().find(|l| l.contains("no published version")).unwrap();
-        assert!(msg.contains("a has no published version 1.4.0 (nearest: 1.0.0, 1.5.0), latest is 2.0.0"), "{msg}");
+        assert!(app.version_edit.is_none());
+        assert_eq!(specs(&settle(&mut app, &rx, "")), ["a@^1.5.0"]);
     }
 
     #[test]
-    fn e_rejects_text_that_is_not_a_version() {
+    fn the_pin_type_can_be_changed_with_the_version() {
         let (mut app, rx) = offline_app();
-        app.on_key(key('e'));
-        type_text(&mut app, "^1.5");
+        edit_version(&mut app);
+        retype(&mut app, "~1.5.0");
         press(&mut app, KeyCode::Enter);
-        assert!(app.log.last().unwrap().contains("isn't a version like 1.2.3"));
+        assert_eq!(items(&settle(&mut app, &rx, "")), [("a".to_string(), "~1.5.0".to_string(), false)]);
+
+        let (mut app, rx) = offline_app();
+        edit_version(&mut app);
+        retype(&mut app, "2.0.0");
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(items(&settle(&mut app, &rx, "")), [("a".to_string(), "2.0.0".to_string(), true)], "exact");
+    }
+
+    #[test]
+    fn e_says_as_you_type_whether_the_version_is_published() {
+        let (mut app, rx) = offline_app();
+        edit_version(&mut app);
+        retype(&mut app, "^1.4.0");
+        assert_eq!(
+            app.version_edit.as_ref().unwrap().check(),
+            VersionCheck::NotPublished("a has no published version 1.4.0 (nearest: 1.0.0, 1.5.0), latest is 2.0.0".into())
+        );
+        let screen = render(&mut app, 120, 40).join("\n");
+        assert!(screen.contains("✘ a has no published version 1.4.0 (nearest: 1.0.0, 1.5.0)"), "{screen}");
+        // Enter doesn't install it: the dialog stays, saying why.
+        press(&mut app, KeyCode::Enter);
+        assert!(app.version_edit.as_ref().unwrap().error.is_some());
+        retype(&mut app, "^1.5");
+        assert_eq!(app.version_edit.as_ref().unwrap().check(), VersionCheck::NotAVersion);
+        assert!(render(&mut app, 120, 40).join("\n").contains("✘ not a version like 1.2.3"));
+        retype(&mut app, "^1.5.0");
+        assert!(render(&mut app, 120, 40).join("\n").contains("✔ 1.5.0 is published"));
+        assert!(settle(&mut app, &rx, "never").is_empty(), "nothing installed while typing");
+    }
+
+    #[test]
+    fn enter_on_the_unchanged_version_does_nothing() {
+        let (mut app, rx) = offline_app();
+        edit_version(&mut app);
+        press(&mut app, KeyCode::Enter);
+        assert!(app.version_edit.is_none());
+        assert_eq!(app.log.last().unwrap(), "a is already at ^1.0.0.");
         assert!(settle(&mut app, &rx, "never").is_empty());
     }
 
     #[test]
-    fn esc_cancels_typing() {
+    fn esc_cancels_editing_the_version() {
         let (mut app, rx) = offline_app();
-        app.on_key(key('e'));
-        type_text(&mut app, "1.5.0");
+        edit_version(&mut app);
+        retype(&mut app, "^1.5.0");
         press(&mut app, KeyCode::Esc);
-        assert!(app.input.is_none());
+        assert!(app.version_edit.is_none());
         assert!(settle(&mut app, &rx, "never").is_empty());
         // Keys work as usual again.
         app.on_key(key('?'));
         assert!(app.show_info);
+    }
+
+    #[test]
+    fn a_cancelled_install_leaves_no_pin_type_behind() {
+        let (mut app, rx) = offline_app();
+        app.prober = blocking(&["a-2.0.0.tgz"]);
+        edit_version(&mut app);
+        retype(&mut app, "~2.0.0");
+        press(&mut app, KeyCode::Enter);
+        wait_until(&mut app, |a| a.blocked_prompt.is_some());
+        app.on_key(key('x')); // cancel
+        app.prober = blocking(&[]);
+        app.start_install(vec![("a".into(), Version::new(1, 5, 0))], Vec::new());
+        assert_eq!(specs(&settle(&mut app, &rx, "")), ["a@^1.5.0"], "the row's own ^");
+    }
+
+    #[test]
+    fn pinned_versions_are_read_with_their_prefix() {
+        let v = |s: &str| Version::parse(s).unwrap();
+        assert_eq!(parse_pinned("^1.2.3"), Some(("^", v("1.2.3"))));
+        assert_eq!(parse_pinned(" ~1.2.3 "), Some(("~", v("1.2.3"))));
+        assert_eq!(parse_pinned(">=1.2.3"), Some((">=", v("1.2.3"))));
+        assert_eq!(parse_pinned("1.2.3"), Some(("", v("1.2.3"))));
+        assert_eq!(parse_pinned("v1.2.3"), Some(("", v("1.2.3"))));
+        assert_eq!(parse_pinned("=1.2.3"), Some(("", v("1.2.3"))));
+        assert_eq!(parse_pinned("^1.2"), None);
+        assert_eq!(parse_pinned("latest"), None);
     }
 
     #[test]
@@ -6086,8 +6301,8 @@ mod tests {
     fn a_version_typed_with_e_that_is_blocked_is_offered_an_alternative() {
         let (mut app, rx) = offline_app();
         app.prober = blocking(&["a-2.0.0.tgz"]);
-        app.on_key(key('e'));
-        type_text(&mut app, "2.0.0");
+        edit_version(&mut app);
+        retype(&mut app, "2.0.0");
         press(&mut app, KeyCode::Enter);
         wait_until(&mut app, |a| a.blocked_prompt.is_some());
         app.on_key(key('y'));

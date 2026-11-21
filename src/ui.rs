@@ -117,6 +117,7 @@ pub fn focus(app: &App) -> Focus {
         Some(i) if matches!(i.purpose, crate::app::InputPurpose::Add { .. })
     );
     if app.peer_prompt.is_some()
+        || app.version_edit.is_some()
         || app.peer_fix.is_some()
         || app.delete_prompt.is_some()
         || app.blocked_prompt.is_some()
@@ -308,6 +309,9 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     if let Some(p) = &app.commit_prompt {
         draw_commit_dialog(f, p);
     }
+    if let Some(e) = &app.version_edit {
+        draw_version_edit(f, app, e);
+    }
     if let Some(input) = &app.input
         && let crate::app::InputPurpose::Add { add_as } = &input.purpose
     {
@@ -346,6 +350,91 @@ fn field_lines(field: &crate::textfield::TextField, active: bool, style: Style) 
         start = end + 1;
     }
     out
+}
+
+/// The version of a package being edited (`e`): what it has now, the version as typed, and
+/// whether that version is published.
+fn draw_version_edit(f: &mut Frame, app: &App, e: &crate::app::VersionEdit) {
+    use crate::app::VersionCheck;
+    let width = f.area().width.saturating_sub(4).min(80);
+    let inner = (width as usize).saturating_sub(4);
+    let bold = Style::new().add_modifier(Modifier::BOLD);
+    let dim = Style::new().fg(Color::DarkGray);
+    let label = |t: &str| Span::styled(format!("{t:<14}"), bold);
+    let indent = || Span::raw(" ".repeat(14));
+    let row = app.rows.iter().find(|r| r.name == e.name);
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    if let Some(r) = row {
+        lines.push(Line::from(vec![label("package.json"), Span::raw(format!("{}{}", r.prefix, r.current))]));
+        lines.push(Line::from(vec![
+            label("installed"),
+            match &r.installed {
+                Some(v) => Span::raw(v.to_string()),
+                None => Span::styled("not installed", dim),
+            },
+        ]));
+        lines.push(Line::from(vec![
+            label("latest"),
+            if r.loading {
+                Span::styled("checking…", dim)
+            } else {
+                Span::raw(r.latest.to_string())
+            },
+        ]));
+        lines.push(Line::default());
+    }
+    let typed = field_lines(&e.field, true, bold).into_iter().next().unwrap_or_default();
+    lines.extend(wrap(
+        Span::styled(format!("{:<14}", "Version"), Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+        indent(),
+        typed,
+        inner,
+    ));
+    lines.extend(wrap(
+        indent(),
+        indent(),
+        vec![Span::styled("^ minor and patch · ~ patch only · >= anything newer · none: exact", dim)],
+        inner,
+    ));
+    let (text, style) = match e.check() {
+        VersionCheck::NotAVersion => ("✘ not a version like 1.2.3".to_string(), Style::new().fg(Color::Red)),
+        VersionCheck::LookingUp => ("looking up the published versions…".to_string(), dim),
+        VersionCheck::LookupFailed(err) => (format!("✘ could not look up {}: {err}", e.name), Style::new().fg(Color::Red)),
+        VersionCheck::NotPublished(msg) => (format!("✘ {msg}"), Style::new().fg(Color::Red)),
+        VersionCheck::Published { prefix, version } => {
+            let now = row.is_some_and(|r| {
+                r.installed.as_ref().unwrap_or(&r.current) == &version && r.current == version
+            });
+            let same_pin = row.is_some_and(|r| r.prefix == prefix);
+            let note = match (now, same_pin) {
+                (true, true) => format!(", and is what {} has now", e.name),
+                (true, false) => ", only the pin type changes".to_string(),
+                _ => String::new(),
+            };
+            (format!("✔ {version} is published{note}"), Style::new().fg(Color::Green))
+        }
+    };
+    lines.extend(wrap(indent(), indent(), vec![Span::styled(text, style)], inner));
+    lines.push(Line::default());
+    if let Some(err) = &e.error {
+        lines.extend(wrap(
+            Span::raw(""),
+            Span::raw("  "),
+            vec![Span::styled(err.clone(), Style::new().fg(Color::Red))],
+            inner,
+        ));
+        lines.push(Line::default());
+    }
+    let key = |k: &str, t: &str| {
+        vec![
+            Span::styled(k.to_string(), Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+            Span::raw(format!(" {t}   ")),
+        ]
+    };
+    let mut keys = key("enter", "install");
+    keys.extend(key("esc", "cancel"));
+    lines.push(Line::from(keys));
+    draw_dialog(f, &format!("Version of {}", e.name), lines, width);
 }
 
 /// The commit `c` proposes: its title and body to edit, and which files.
@@ -1048,27 +1137,21 @@ fn wrap_hints(
 
 fn footer_lines(app: &App, width: u16) -> Vec<Line<'static>> {
     let hint = |t: &str| vec![t.to_string().dark_gray()];
-    if let Some(input) = &app.input {
-        let crate::app::InputPurpose::Version { name } = &input.purpose else {
-            return wrap_hints(
-                vec!["Add a package:".cyan().bold()],
-                vec![hint("see the dialog above"), hint("enter add"), hint("esc cancel")],
-                "   ",
-                width,
-            );
-        };
-        let mut hints = Vec::new();
-        if let Some(r) = app.rows.iter().find(|r| r.name == *name) {
-            hints.push(format!("now {}{}, latest {}", r.prefix, r.current, r.latest));
-        }
-        hints.push("enter install".to_string());
-        hints.push("esc cancel".to_string());
-        let prefix = vec![
-            format!("Version of {name}: ").cyan().bold(),
-            input.text.clone().into(),
-            "█".cyan(),
-        ];
-        return wrap_hints(prefix, hints.iter().map(|h| hint(h)).collect(), "   ", width);
+    if app.input.is_some() {
+        return wrap_hints(
+            vec!["Add a package:".cyan().bold()],
+            vec![hint("see the dialog above"), hint("enter add"), hint("esc cancel")],
+            "   ",
+            width,
+        );
+    }
+    if app.version_edit.is_some() {
+        return wrap_hints(
+            vec!["Edit the version:".cyan().bold()],
+            vec![hint("← → home end move"), hint("enter install"), hint("esc cancel")],
+            "   ",
+            width,
+        );
     }
     if let Some(p) = &app.commit_prompt {
         let keys = match p.field {
