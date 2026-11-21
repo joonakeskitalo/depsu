@@ -264,7 +264,7 @@ fn footer_lines(app: &App, width: u16) -> Vec<Line<'static>> {
             width,
         );
     }
-    let (item, mut global) = app.hints();
+    let (item, scan, mut global) = app.hints();
     let mut prefix = vec!["all:".cyan().bold()];
     if !app.filter.is_empty() {
         prefix.push(format!(" filter: {}", app.filter).cyan());
@@ -278,6 +278,13 @@ fn footer_lines(app: &App, width: u16) -> Vec<Line<'static>> {
         lines.extend(wrap_hints(
             vec!["item:".cyan().bold()],
             item.iter().map(|h| hint(h)).collect(),
+            width,
+        ));
+    }
+    if !scan.is_empty() {
+        lines.extend(wrap_hints(
+            vec!["scan:".cyan().bold()],
+            scan.iter().map(|h| hint(h)).collect(),
             width,
         ));
     }

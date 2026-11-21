@@ -1030,9 +1030,10 @@ impl App {
 
     /// Hotkey hints for the actions that can be performed on the current selection or cursor
     /// item right now.
-    pub fn hints(&self) -> (Vec<String>, Vec<String>) {
+    pub fn hints(&self) -> (Vec<String>, Vec<String>, Vec<String>) {
         let mut item: Vec<String> = Vec::new();
         let mut global: Vec<String> = Vec::new();
+        let mut scan: Vec<String> = Vec::new();
         if !self.view.is_empty() {
             global.push("↑/↓ move".into());
         }
@@ -1065,10 +1066,12 @@ impl App {
         global.push("/ filter".into());
         global.push("g group".into());
         global.push("o overrides".into());
-        global.push(format!("v vulns: {}", self.vuln_view.label()));
-        global.push("s snyk".into());
+        scan.push("s snyk".into());
         if let Some(src) = audit::source_for(self.pm) {
-            global.push(format!("n {}", src.label()));
+            scan.push(format!("n {}", src.label()));
+        }
+        if self.snyk.report.is_some() || self.audit.report.is_some() {
+            scan.push(format!("v show: {}", self.vuln_view.label()));
         }
         let remove = self
             .visible_overrides()
@@ -1109,7 +1112,7 @@ impl App {
         global.push("y copy md".into());
         global.push("tab log".into());
         global.push("q quit".into());
-        (item, global)
+        (item, scan, global)
     }
 
     // ---- keys ------------------------------------------------------------------------
