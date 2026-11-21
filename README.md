@@ -13,7 +13,7 @@ Illustrative output:
  depsu  pnpm · https://registry.npmjs.org/ · 3 outdated · 12 up to date · snyk: 10 vulnerabilities (5 high+)
 ○ lodash            ✱    dep 4.17.15       → 4.18.1   snyk fix: 4.18.1
      ├─ ✱ high     SNYK-JS-LODASH-1040724  Code Injection  · lodash@4.17.15  · CVE-2021-23337  · fixed in lodash 4.17.21
-     └─ … +7 more vulnerabilities (press o for all)
+     └─ ✱ medium   SNYK-JS-LODASH-1018905  ReDoS  · lodash@4.17.15  · CVE-2020-28500  · fixed in lodash 4.17.21
 ○ react-dom         ⚑    dep ^18.2.0       → ^19.0.0
 · zod                    dep ^3.23.8       ✓ up to date
 ```
@@ -72,7 +72,7 @@ depsu --pm pnpm       # skip detection
 | `i` / `Enter` | Install the selected packages, or the highlighted one. On a vulnerability finding, install the version that fixes it |
 | `/` | Filter by name. `Enter` keeps the filter, `Esc` clears it |
 | `g` | Group by: none → release type → name prefix → dependency type |
-| `o` | Overrides: hidden → compact → full |
+| `o` | Show / hide the override lines under each package |
 | `x` | Remove the selected or highlighted overrides, or the overrides of the highlighted package, flagged `✂` or not. Warns when installed packages use the overridden package (press twice to confirm) |
 | `P` | Choose how the selected or highlighted packages are pinned: exact (`e`), caret `^` (`c`), tilde `~` (`t`) or at least `>=` (`m`). Letters are used because `^` and `~` are dead keys on Nordic keyboards. The version stays, `package.json` is edited and the install runs |
 | `p` | Pin a vulnerable transitive dependency to the fixed version a scan suggests, as an override (press twice to confirm) |

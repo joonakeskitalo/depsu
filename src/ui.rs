@@ -596,7 +596,7 @@ fn detail_lines(
     let o = match child {
         Child::Own(i) => r.overrides.get(i),
         Child::Tree(i) => r.tree_hits.get(i).map(|h| &h.over),
-        Child::More(_) | Child::Vuln(_) | Child::MoreVulns(_) => None,
+        Child::Vuln(_) => None,
     };
     let update = o.and_then(|o| app.update_target(o));
     // Selection mark, only on override lines that can be updated.
@@ -672,16 +672,6 @@ fn detail_lines(
             t.push_str(&format!("  · {}", v.fix_summary()));
             (t, String::new(), severity_color(v.severity))
         }
-        Child::MoreVulns(n) => (
-            format!("… +{n} more vulnerabilities (press o for all)"),
-            String::new(),
-            Color::DarkGray,
-        ),
-        Child::More(n) => (
-            format!("… +{n} more (press o for all)"),
-            String::new(),
-            Color::DarkGray,
-        ),
     };
 
     // The new value goes right after the override itself, before via/notes.

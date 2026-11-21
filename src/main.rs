@@ -38,8 +38,7 @@ KEYS:
     i, enter       install the selected packages (or the highlighted one)
     /              filter by name (enter keeps it, esc clears it)
     g              group by: none, release type, name prefix, dependency type
-    u              show / hide up-to-date packages
-    o              overrides: hidden, compact, full
+    o              show / hide the override lines under each package
     x              remove the selected / highlighted overrides (press twice to confirm)
     s              scan with Snyk
     n              run npm audit / bun audit (by the project's package manager)

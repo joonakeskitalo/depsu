@@ -610,7 +610,7 @@ impl App {
     }
 
     fn on_tree(&mut self, name: String, mut hits: Vec<Hit>) {
-        // Risky hits first, so they survive the compact view's cut-off.
+        // Risky hits first, so they come first in the list.
         hits.sort_by_key(|h| std::cmp::Reverse(h.risk));
         if let Some(r) = self.rows.iter_mut().find(|r| r.name == name) {
             r.tree_hits = hits;
@@ -1047,7 +1047,7 @@ impl App {
         match child {
             Child::Own(i) => r.overrides.get(*i),
             Child::Tree(i) => r.tree_hits.get(*i).map(|h| &h.over),
-            Child::More(_) | Child::Vuln(_) | Child::MoreVulns(_) => None,
+            Child::Vuln(_) => None,
         }
     }
 
@@ -2278,7 +2278,6 @@ fn anchor_of(item: &Item) -> (u8, String) {
         } => (
             2,
             match child {
-                Child::More(_) | Child::MoreVulns(_) => format!("{row}\u{0}more"),
                 _ => format!("{row}\u{0}{key}"),
             },
         ),

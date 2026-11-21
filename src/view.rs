@@ -38,31 +38,26 @@ impl GroupBy {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Overrides {
     Off,
-    /// Own overrides plus the first few overrides found in the dependency tree.
-    Compact,
+    /// Own overrides plus every override found in the dependency tree.
     Full,
 }
 
 impl Overrides {
     pub fn next(self) -> Self {
         match self {
-            Overrides::Compact => Overrides::Full,
             Overrides::Full => Overrides::Off,
-            Overrides::Off => Overrides::Compact,
+            Overrides::Off => Overrides::Full,
         }
     }
 
     pub fn label(self) -> &'static str {
         match self {
             Overrides::Off => "hidden",
-            Overrides::Compact => "compact",
-            Overrides::Full => "full",
+            Overrides::Full => "shown",
         }
     }
 }
 
-/// Tree hits listed per package in compact mode.
-const COMPACT_TREE_HITS: usize = 5;
 
 /// A nested entry under a package.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -71,12 +66,8 @@ pub enum Child {
     Own(usize),
     /// `Row::tree_hits[i]`: an override somewhere in its dependency tree.
     Tree(usize),
-    /// Number of tree hits not listed.
-    More(usize),
     /// `Row::vulns[i]`: a Snyk finding.
     Vuln(usize),
-    /// Number of Snyk findings not listed.
-    MoreVulns(usize),
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -138,27 +129,16 @@ pub enum Item {
 }
 
 fn children(r: &Row, idx: usize, mode: Overrides, vulns: bool) -> Vec<Item> {
-    let cap = if mode == Overrides::Full {
-        usize::MAX
-    } else {
-        COMPACT_TREE_HITS
-    };
     let mut kids: Vec<Child> = Vec::new();
     // Security findings first: they matter more than where overrides apply.
     if vulns {
-        kids.extend((0..r.vulns.len().min(cap)).map(Child::Vuln));
-        if r.vulns.len() > cap {
-            kids.push(Child::MoreVulns(r.vulns.len() - cap));
-        }
+        kids.extend((0..r.vulns.len()).map(Child::Vuln));
     }
     if mode != Overrides::Off {
         if r.lists_own_overrides() {
             kids.extend((0..r.overrides.len()).map(Child::Own));
         }
-        kids.extend((0..r.tree_hits.len().min(cap)).map(Child::Tree));
-        if r.tree_hits.len() > cap {
-            kids.push(Child::More(r.tree_hits.len() - cap));
-        }
+        kids.extend((0..r.tree_hits.len()).map(Child::Tree));
     }
     let n = kids.len();
     kids.into_iter()
@@ -172,7 +152,6 @@ fn children(r: &Row, idx: usize, mode: Overrides, vulns: bool) -> Vec<Item> {
                 Child::Own(i) => r.overrides[i].key(),
                 Child::Tree(i) => r.tree_hits[i].over.key(),
                 Child::Vuln(i) => format!("vuln:{}", r.vulns[i].id),
-                Child::More(_) | Child::MoreVulns(_) => String::new(),
             },
         })
         .collect()
@@ -407,7 +386,7 @@ mod tests {
             &sample(),
             GroupBy::Release,
             "",
-            Overrides::Compact,
+            Overrides::Full,
             true,
             true,
         );
@@ -432,7 +411,7 @@ mod tests {
             &sample(),
             GroupBy::Prefix,
             "",
-            Overrides::Compact,
+            Overrides::Full,
             true,
             true,
         );
@@ -457,7 +436,7 @@ mod tests {
             &sample(),
             GroupBy::Prefix,
             "ESLINT",
-            Overrides::Compact,
+            Overrides::Full,
             true,
             true,
         );
@@ -467,7 +446,7 @@ mod tests {
                 &sample(),
                 GroupBy::None,
                 "zzz",
-                Overrides::Compact,
+                Overrides::Full,
                 true,
                 true
             )
@@ -512,15 +491,12 @@ mod tests {
                 .collect()
         };
         assert_eq!(kinds(Overrides::Off), ["a", "b"]);
-        let compact = kinds(Overrides::Compact);
-        // own override + 5 tree hits + "+2 more", all nested under `a`, none under `b`
-        assert_eq!(compact.len(), 1 + 1 + 5 + 1 + 1);
-        assert_eq!(compact[1], "Own(0)");
-        assert_eq!(compact[7], "More(2)$");
-        assert_eq!(compact[8], "b");
         let full = kinds(Overrides::Full);
+        // own override + all 7 tree hits, nested under `a`, none under `b`
         assert_eq!(full.len(), 1 + 1 + 7 + 1);
+        assert_eq!(full[1], "Own(0)");
         assert_eq!(full[8], "Tree(6)$");
+        assert_eq!(full[9], "b");
     }
 
     #[test]
