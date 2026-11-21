@@ -7,6 +7,7 @@ mod export;
 mod npmrc;
 mod overrides;
 mod package;
+mod peers;
 mod pm;
 mod registry;
 mod snyk;

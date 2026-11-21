@@ -510,6 +510,35 @@ pub fn npm_lock_versions(dir: &Path) -> Option<HashMap<String, Version>> {
     Some(out)
 }
 
+/// The `peerDependencies` the installed copy of `name` declares: from `node_modules`, or else
+/// from npm's lockfile entry for it.
+pub fn installed_peers(dir: &Path, name: &str) -> Option<HashMap<String, String>> {
+    let read = |v: &serde_json::Value| -> HashMap<String, String> {
+        v.get("peerDependencies")
+            .and_then(|p| p.as_object())
+            .map(|m| {
+                m.iter()
+                    .filter_map(|(k, r)| Some((k.clone(), r.as_str()?.to_string())))
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    let installed = dir
+        .ancestors()
+        .map(|a| a.join("node_modules").join(name).join("package.json"))
+        .find(|p| p.is_file())
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok());
+    if let Some(json) = installed {
+        return Some(read(&json));
+    }
+    let lock: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(dir.join("package-lock.json")).ok()?).ok()?;
+    lock.get("packages")?
+        .get(format!("node_modules/{name}"))
+        .map(read)
+}
+
 /// The version of `name` installed for the project in `dir`, found the way Node resolves it
 /// (the nearest `node_modules` upwards, so hoisted workspace installs count).
 pub fn installed_version(dir: &Path, name: &str) -> Option<Version> {

@@ -306,6 +306,34 @@ fn wrap_hints(
 
 fn footer_lines(app: &App, width: u16) -> Vec<Line<'static>> {
     let hint = |t: &str| vec![t.to_string().dark_gray()];
+    if let Some(p) = &app.peer_prompt {
+        let opt = |k: &str, d: String| vec![k.to_string().bold(), d.into()];
+        let list = |v: &[(String, semver::Version)]| {
+            v.iter()
+                .map(|(n, ver)| format!("{n} → {ver}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        let mut atoms = Vec::new();
+        if p.extra.is_empty() {
+            atoms.push(opt("y", " install anyway".to_string()));
+        } else {
+            atoms.push(opt("y", format!(" also update {}", list(&p.extra))));
+            atoms.push(opt("n", format!(" install only {}", list(&p.plan))));
+        }
+        if !p.unresolved.is_empty() {
+            atoms.push(vec![
+                format!("can't fix: {} (see log)", p.unresolved.join(", ")).yellow(),
+            ]);
+        }
+        atoms.push(hint("any other key cancels"));
+        return wrap_hints(
+            vec!["Other packages must change:".cyan().bold()],
+            atoms,
+            "   ",
+            width,
+        );
+    }
     if app.pin_prompt {
         let opt = |k: &str, d: &str| vec![k.to_string().bold(), d.to_string().into()];
         return wrap_hints(

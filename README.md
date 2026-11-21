@@ -71,7 +71,7 @@ depsu --cache .depsu-cache.json   # remember versions and scans between runs
 | `↑` `↓` / `j` `k`, `Home` `End` | Move |
 | `space` | Select a package, a whole group (on its header) or an override line |
 | `a` | Select all / none of the shown packages |
-| `i` / `Enter` | Install the selected packages, or the highlighted one. On a vulnerability finding, install the version that fixes it |
+| `i` / `Enter` | Install the selected packages, or the highlighted one. On a vulnerability finding, install the version that fixes it. If the update needs other installed packages to change (peer dependencies), depsu lists them and asks: `y` update them too, `n` install only what you picked, any other key cancels |
 | `/` | Filter by name. `Enter` keeps the filter, `Esc` clears it |
 | `g` | Group by: none → release type → name prefix → dependency type |
 | `o` | Show / hide the override lines under each package |

@@ -6,6 +6,7 @@ use crate::edit::{self, Change};
 use crate::npmrc::Npmrc;
 use crate::overrides::{self, Compat, Override, Unneeded};
 use crate::package::{self, Dep, Kind, parse_spec};
+use crate::peers;
 use crate::pm::Pm;
 use crate::registry;
 use crate::snyk;
@@ -42,6 +43,12 @@ pub enum Event {
     InstallStarted {
         names: Vec<String>,
     },
+    /// The peer dependency check of an install is done.
+    PeerCheck {
+        plan: Vec<(String, Version)>,
+        ovr: Vec<(Override, String)>,
+        report: peers::Report,
+    },
     InstallFinished {
         names: Vec<String>,
         keys: Vec<String>,
@@ -61,7 +68,7 @@ enum TreeMsg {
     Reset,
 }
 
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, PartialEq, Debug)]
 pub enum Status {
     Idle,
     Queued,
@@ -87,6 +94,16 @@ pub struct RemovedPkg {
     /// The range it had in `package.json`.
     pub spec: String,
     pub status: Status,
+}
+/// An install waiting for the user to decide about the other packages it needs changed.
+pub struct PeerPrompt {
+    /// What the user asked to install: (name, version).
+    pub plan: Vec<(String, Version)>,
+    ovr: Vec<(Override, String)>,
+    /// The other packages that can be updated so that everything fits.
+    pub extra: Vec<(String, Version)>,
+    /// Packages that have to change but depsu can't update.
+    pub unresolved: Vec<String>,
 }
 pub struct Row {
     pub name: String,
@@ -243,6 +260,10 @@ pub struct App {
     pub filter_mode: bool,
     /// Waiting for the user to choose the pin type for the packages `P` was pressed on.
     pub pin_prompt: bool,
+    /// An install is waiting for the answer to a question about its peer dependencies.
+    pub peer_prompt: Option<PeerPrompt>,
+    /// The peer dependencies of an install are being checked.
+    peer_checking: bool,
     pub log: Vec<String>,
     /// The log is expanded to fill the screen and takes the keys (toggled with Tab).
     pub log_focus: bool,
@@ -400,6 +421,8 @@ impl App {
             filter: String::new(),
             filter_mode: false,
             pin_prompt: false,
+            peer_prompt: None,
+            peer_checking: false,
             log: Vec::new(),
             log_focus: false,
             log_scroll: 0,
@@ -820,6 +843,7 @@ impl App {
                         p.status = Status::Installing;
                     }
                 }
+                Event::PeerCheck { plan, ovr, report } => self.on_peer_check(plan, ovr, report),
                 Event::InstallFinished {
                     names,
                     keys,
@@ -1530,6 +1554,18 @@ impl App {
             self.on_filter_key(key);
             return;
         }
+        if let Some(p) = self.peer_prompt.take() {
+            match key.code {
+                KeyCode::Char('y') => {
+                    let mut plan = p.plan;
+                    plan.extend(p.extra);
+                    self.queue_install(plan, p.ovr);
+                }
+                KeyCode::Char('n') if !p.extra.is_empty() => self.queue_install(p.plan, p.ovr),
+                _ => self.push_log("Install cancelled."),
+            }
+            return;
+        }
         if self.pin_prompt {
             self.pin_prompt = false;
             let prefix = match key.code {
@@ -1980,10 +2016,116 @@ impl App {
             return;
         }
         self.confirm_conflicts = None;
+        let plan: Vec<(String, Version)> = pkgs
+            .into_iter()
+            .map(|(i, v)| (self.rows[i].name.clone(), v))
+            .collect();
+        if plan.is_empty() {
+            self.queue_install(plan, ovr);
+            return;
+        }
+        if self.peer_checking {
+            self.push_log("Still checking the peer dependencies of the previous install.");
+            return;
+        }
+        self.peer_checking = true;
+        let names: Vec<String> = plan.iter().map(|(n, v)| format!("{n}@{v}")).collect();
+        self.push_log(format!("… checking peer dependencies of {}", names.join(", ")));
+        let direct: Vec<String> = self
+            .rows
+            .iter()
+            .filter(|r| r.kind != Kind::Override)
+            .map(|r| r.name.clone())
+            .collect();
+        let (dir, rc, agent, tx) = (
+            self.dir.clone(),
+            self.rc.clone(),
+            self.agent.clone(),
+            self.events_tx.clone(),
+        );
+        thread::spawn(move || {
+            let lock = crate::tree::npm_lock_versions(&dir);
+            let installed = |n: &str| resolved_version(&dir, lock.as_ref(), n);
+            let installed_peers = |n: &str| crate::tree::installed_peers(&dir, n);
+            let fetch = |n: &str| registry::packument(&rc, &agent, n);
+            let report = peers::check(
+                &plan,
+                &peers::Project {
+                    direct: &direct,
+                    installed: &installed,
+                    installed_peers: &installed_peers,
+                    fetch: &fetch,
+                },
+            );
+            let _ = tx.send(Event::PeerCheck { plan, ovr, report });
+        });
+    }
 
+    /// Installs right away if nothing else has to change, otherwise asks.
+    fn on_peer_check(
+        &mut self,
+        plan: Vec<(String, Version)>,
+        ovr: Vec<(Override, String)>,
+        report: peers::Report,
+    ) {
+        self.peer_checking = false;
+        for w in &report.warnings {
+            self.push_log(format!("! {w}"));
+        }
+        if report.needs.is_empty() {
+            self.queue_install(plan, ovr);
+            return;
+        }
+        let mut extra = Vec::new();
+        let mut unresolved = Vec::new();
+        let what: Vec<String> = plan.iter().map(|(n, v)| format!("{n}@{v}")).collect();
+        let mut lines = vec![format!(
+            "⚠ Installing {} needs other packages to change:",
+            what.join(", ")
+        )];
+        for n in &report.needs {
+            let updatable = self
+                .rows
+                .iter()
+                .any(|r| r.name == n.name && r.kind != Kind::Override && !r.busy());
+            match &n.to {
+                Some(to) if updatable => {
+                    lines.push(format!("  {} {} → {to}: {}", n.name, n.from, n.why));
+                    extra.push((n.name.clone(), to.clone()));
+                }
+                _ => {
+                    lines.push(format!(
+                        "  ! {} {}: no version depsu can install fits: {}",
+                        n.name, n.from, n.why
+                    ));
+                    unresolved.push(n.name.clone());
+                }
+            }
+        }
+        for l in lines {
+            self.push_log(l);
+        }
+        // The answer must not land in the filter or the pin type prompt.
+        self.filter_mode = false;
+        self.pin_prompt = false;
+        self.peer_prompt = Some(PeerPrompt {
+            plan,
+            ovr,
+            extra,
+            unresolved,
+        });
+    }
+
+    /// Queues the installs of `plan` (name, version) and the override updates.
+    fn queue_install(&mut self, plan: Vec<(String, Version)>, ovr: Vec<(Override, String)>) {
         let mut items = Vec::new();
-        for (i, target) in pkgs {
-            let r = &mut self.rows[i];
+        for (name, target) in plan {
+            let Some(r) = self.rows.iter_mut().find(|r| r.name == name) else {
+                continue;
+            };
+            if r.busy() {
+                continue;
+            }
             r.selected = false;
             r.status = Status::Queued;
             items.push((
@@ -1993,6 +2135,9 @@ impl App {
                 r.prefix.is_empty(),
             ));
             self.install_targets.insert(r.name.clone(), target);
+        }
+        if items.is_empty() && ovr.is_empty() {
+            return;
         }
         let mut edits = Vec::new();
         let mut keys = Vec::new();
@@ -3044,6 +3189,98 @@ mod tests {
             "{:?}",
             app.log
         );
+    }
+
+    /// An app whose installs are captured instead of run.
+    fn app_capturing_installs() -> (App, Receiver<Job>) {
+        let mut app = app_with_cache("2.0.0", |_| {});
+        let (tx, rx) = mpsc::channel();
+        app.jobs = tx;
+        (app, rx)
+    }
+    fn queued(rx: &Receiver<Job>) -> Vec<String> {
+        rx.try_iter()
+            .flat_map(|j| j.items)
+            .map(|(n, spec, ..)| format!("{n}@{spec}"))
+            .collect()
+    }
+    fn key(c: char) -> KeyEvent {
+        KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE)
+    }
+    fn needs_b() -> peers::Report {
+        peers::Report {
+            needs: vec![peers::Need {
+                name: "b".into(),
+                from: Version::new(1, 0, 0),
+                to: Some(Version::new(2, 0, 0)),
+                why: "a@2.0.0 needs b ^2.0.0".into(),
+            }],
+            warnings: Vec::new(),
+        }
+    }
+    fn plan_a() -> Vec<(String, Version)> {
+        vec![("a".to_string(), Version::new(2, 0, 0))]
+    }
+
+    #[test]
+    fn an_install_with_nothing_else_to_change_goes_ahead() {
+        let (mut app, rx) = app_capturing_installs();
+        app.on_peer_check(plan_a(), Vec::new(), peers::Report::default());
+        assert!(app.peer_prompt.is_none());
+        assert_eq!(queued(&rx), ["a@^2.0.0"]);
+    }
+
+    #[test]
+    fn the_user_is_asked_and_can_update_the_other_package_too() {
+        let (mut app, rx) = app_capturing_installs();
+        app.on_peer_check(plan_a(), Vec::new(), needs_b());
+        let p = app.peer_prompt.as_ref().expect("asks before installing");
+        assert_eq!(p.extra, [("b".to_string(), Version::new(2, 0, 0))]);
+        assert!(queued(&rx).is_empty(), "nothing is installed before the answer");
+        assert!(app.log.iter().any(|l| l.contains("b 1.0.0 → 2.0.0: a@2.0.0 needs b ^2.0.0")));
+        app.on_key(key('y'));
+        assert!(app.peer_prompt.is_none());
+        assert_eq!(queued(&rx), ["a@^2.0.0", "b@^2.0.0"]);
+    }
+
+    #[test]
+    fn the_user_can_install_only_what_they_picked() {
+        let (mut app, rx) = app_capturing_installs();
+        app.on_peer_check(plan_a(), Vec::new(), needs_b());
+        app.on_key(key('n'));
+        assert_eq!(queued(&rx), ["a@^2.0.0"]);
+    }
+
+    #[test]
+    fn any_other_key_cancels_the_install() {
+        let (mut app, rx) = app_capturing_installs();
+        app.on_peer_check(plan_a(), Vec::new(), needs_b());
+        app.on_key(key('x'));
+        assert!(queued(&rx).is_empty());
+        assert!(app.peer_prompt.is_none());
+        assert_eq!(row(&app, "a").status, Status::Idle);
+        assert!(app.log.last().unwrap().contains("cancelled"));
+    }
+
+    #[test]
+    fn a_change_depsu_cannot_make_is_reported_and_needs_confirming() {
+        let (mut app, rx) = app_capturing_installs();
+        let mut report = needs_b();
+        report.needs[0].to = None;
+        app.on_peer_check(plan_a(), Vec::new(), report);
+        let p = app.peer_prompt.as_ref().unwrap();
+        assert!(p.extra.is_empty());
+        assert_eq!(p.unresolved, ["b"]);
+        // `n` means nothing here: there's nothing to leave out.
+        app.on_key(key('n'));
+        assert!(queued(&rx).is_empty());
+        app.on_peer_check(plan_a(), Vec::new(), {
+            let mut r = needs_b();
+            r.needs[0].to = None;
+            r
+        });
+        app.on_key(key('y'));
+        assert_eq!(queued(&rx), ["a@^2.0.0"], "y installs anyway");
     }
 
     #[test]

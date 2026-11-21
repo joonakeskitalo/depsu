@@ -9,7 +9,7 @@ use crate::npmrc::Npmrc;
 use semver::Version;
 use serde::Deserializer as _;
 use serde::de::{self, IgnoredAny, MapAccess, Visitor};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::io::{BufReader, Read};
 use std::time::Duration;
 
@@ -100,6 +100,87 @@ fn parse_dist_tags(reader: impl Read) -> Result<HashMap<String, String>, String>
     }
 }
 
+/// What depsu needs to know about one published version.
+#[derive(Clone, Debug, Default)]
+pub struct VersionInfo {
+    /// `peerDependencies`: name → range.
+    pub peers: HashMap<String, String>,
+}
+
+/// The versions of a package, from its registry document.
+#[derive(Clone, Debug, Default)]
+pub struct Packument {
+    /// The `latest` dist-tag.
+    pub latest: Option<Version>,
+    pub versions: BTreeMap<Version, VersionInfo>,
+}
+
+impl Packument {
+    /// The highest release (no pre-releases, nothing above `latest`) that `ok` accepts.
+    pub fn best(&self, ok: impl Fn(&Version, &VersionInfo) -> bool) -> Option<Version> {
+        self.versions
+            .iter()
+            .rev()
+            .filter(|(v, _)| v.pre.is_empty())
+            .filter(|(v, _)| self.latest.as_ref().is_none_or(|l| *v <= l))
+            .find(|(v, info)| ok(v, info))
+            .map(|(v, _)| v.clone())
+    }
+}
+
+/// Fetches the whole (abbreviated) registry document of `name`.
+pub fn packument(rc: &Npmrc, agent: &ureq::Agent, name: &str) -> Result<Packument, String> {
+    let registry = rc.registry_for(name);
+    let url = format!("{registry}{}", name.replacen('/', "%2f", 1));
+    let auth = rc.auth_for(name, &registry);
+    let get = |accept: &str| {
+        let mut req = agent
+            .get(&url)
+            .set("Accept", accept)
+            .set("User-Agent", concat!("depsu/", env!("CARGO_PKG_VERSION")));
+        if let Some(auth) = &auth {
+            req = req.set("Authorization", auth);
+        }
+        req.call()
+    };
+    let resp = match get(CORGI) {
+        Err(ureq::Error::Status(404, _)) => get(FULL),
+        other => other,
+    };
+    match resp {
+        Ok(r) => parse_packument(r.into_reader()),
+        Err(ureq::Error::Status(404, _)) => Err(format!("{name} not found in {registry}")),
+        Err(ureq::Error::Status(401 | 403, _)) => Err(format!("{name}: unauthorized")),
+        Err(ureq::Error::Status(code, _)) => Err(format!("{name}: HTTP {code}")),
+        Err(e) => Err(format!("{name}: {e}")),
+    }
+}
+
+fn parse_packument(reader: impl Read) -> Result<Packument, String> {
+    #[derive(serde::Deserialize)]
+    struct Doc {
+        #[serde(rename = "dist-tags", default)]
+        tags: HashMap<String, String>,
+        #[serde(default)]
+        versions: HashMap<String, Ver>,
+    }
+    #[derive(serde::Deserialize)]
+    struct Ver {
+        #[serde(rename = "peerDependencies", default)]
+        peers: HashMap<String, String>,
+    }
+    let doc: Doc = serde_json::from_reader(BufReader::new(reader))
+        .map_err(|e| format!("invalid response: {e}"))?;
+    Ok(Packument {
+        latest: doc.tags.get("latest").and_then(|v| Version::parse(v).ok()),
+        versions: doc
+            .versions
+            .into_iter()
+            .filter_map(|(v, info)| Some((Version::parse(&v).ok()?, VersionInfo { peers: info.peers })))
+            .collect(),
+    })
+}
+
 pub fn agent() -> ureq::Agent {
     ureq::AgentBuilder::new()
         .timeout(Duration::from_secs(30))
@@ -119,6 +200,26 @@ mod tests {
         assert_eq!(tags["latest"], "1.2.3");
     }
 
+    #[test]
+    fn reads_versions_and_their_peers() {
+        let doc = br#"{"name":"react-dom","dist-tags":{"latest":"19.0.0"},"versions":{
+            "18.2.0":{"version":"18.2.0","peerDependencies":{"react":"^18.2.0"}},
+            "19.0.0":{"version":"19.0.0","peerDependencies":{"react":"^19.0.0"}},
+            "19.1.0-rc.0":{"version":"19.1.0-rc.0"},
+            "20.0.0":{"version":"20.0.0"},
+            "garbage":{}
+        }}"#;
+        let p = parse_packument(&doc[..]).unwrap();
+        assert_eq!(p.latest, Some(Version::new(19, 0, 0)));
+        assert_eq!(p.versions.len(), 4);
+        assert_eq!(p.versions[&Version::new(19, 0, 0)].peers["react"], "^19.0.0");
+        // `best` skips pre-releases and anything above `latest`.
+        assert_eq!(p.best(|_, _| true), Some(Version::new(19, 0, 0)));
+        assert_eq!(
+            p.best(|_, i| i.peers.get("react").is_some_and(|r| r.starts_with("^18"))),
+            Some(Version::new(18, 2, 0))
+        );
+    }
     #[test]
     fn missing_dist_tags_is_an_error() {
         assert!(parse_dist_tags(&br#"{"name":"x"}"#[..]).is_err());
