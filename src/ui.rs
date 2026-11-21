@@ -209,11 +209,81 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     if let Some(p) = &app.peer_prompt {
         draw_peer_prompt(f, p);
     }
+    if let Some(p) = &app.peer_fix {
+        draw_peer_fix(f, p);
+    }
     if let Some(input) = &app.input
         && let crate::app::InputPurpose::Add { add_as } = &input.purpose
     {
         draw_add_dialog(f, app, input, *add_as);
     }
+}
+
+/// The ways to fix a package's unmet peers (`f`), to pick from.
+fn draw_peer_fix(f: &mut Frame, p: &crate::app::PeerFix) {
+    let width = f.area().width.saturating_sub(4).min(80);
+    let inner = (width as usize).saturating_sub(4);
+    let dim = Style::new().fg(Color::DarkGray);
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    for u in &p.unmet {
+        lines.extend(wrap(
+            Span::raw(""),
+            Span::raw("  "),
+            vec![
+                Span::raw(format!("{} needs ", p.name)),
+                Span::styled(format!("{} {}", u.name, u.range), Style::new().add_modifier(Modifier::BOLD)),
+                Span::raw(", but "),
+                Span::styled(u.installed.to_string(), Style::new().fg(Color::Yellow)),
+                Span::raw(" is installed."),
+            ],
+            inner,
+        ));
+    }
+    lines.push(Line::default());
+    for (i, o) in p.options.iter().enumerate() {
+        let chosen = i == p.choice;
+        let style = if chosen {
+            Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD | Modifier::REVERSED)
+        } else {
+            Style::new()
+        };
+        lines.extend(wrap(
+            Span::styled(if chosen { "› " } else { "  " }, Style::new().fg(Color::Cyan)),
+            Span::raw("     "),
+            vec![Span::styled(format!("{} {}", i + 1, o.label), style)],
+            inner,
+        ));
+    }
+    for n in &p.notes {
+        lines.extend(wrap(
+            Span::raw("  "),
+            Span::raw("  "),
+            vec![Span::styled(format!("({n})"), dim)],
+            inner,
+        ));
+    }
+    lines.push(Line::default());
+    lines.extend(wrap(
+        Span::raw(""),
+        Span::raw(""),
+        vec![Span::styled(
+            "The install checks peer dependencies again and asks if more has to change.",
+            dim,
+        )],
+        inner,
+    ));
+    lines.push(Line::default());
+    let key = |k: &str, t: &str| {
+        vec![
+            Span::styled(k.to_string(), Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+            Span::raw(format!(" {t}   ")),
+        ]
+    };
+    let mut keys = key("enter", "fix");
+    keys.extend(key("↑↓", "choose"));
+    keys.extend(key("esc", "cancel"));
+    lines.push(Line::from(keys));
+    draw_dialog(f, &format!("Fix the peers of {}", p.name), lines, width);
 }
 
 /// A box in the middle of the screen with `lines` and `title`, at most `max_width` wide.
@@ -523,6 +593,14 @@ fn footer_lines(app: &App, width: u16) -> Vec<Line<'static>> {
             "█".cyan(),
         ];
         return wrap_hints(prefix, hints.iter().map(|h| hint(h)).collect(), "   ", width);
+    }
+    if app.peer_fix.is_some() {
+        return wrap_hints(
+            vec!["Answer the dialog above:".cyan().bold()],
+            vec![hint("↑↓ choose"), hint("enter or 1-9 fix"), hint("any other key cancels")],
+            "   ",
+            width,
+        );
     }
     if app.peer_prompt.is_some() {
         return wrap_hints(

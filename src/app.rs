@@ -56,6 +56,13 @@ pub enum Event {
         version: Option<Version>,
         result: Result<registry::Packument, String>,
     },
+    /// The ways to fix a package's unmet peers were looked up.
+    PeerFixes {
+        name: String,
+        unmet: Vec<peers::Unmet>,
+        options: Vec<peers::FixOption>,
+        notes: Vec<String>,
+    },
     /// The peer dependency check of an install is done.
     PeerCheck {
         plan: Vec<(String, Version)>,
@@ -209,6 +216,17 @@ struct Adding {
     kind: Kind,
     version: Version,
     latest: Version,
+}
+
+/// The ways to fix a package's unmet peers, waiting for the user to pick one.
+pub struct PeerFix {
+    pub name: String,
+    pub unmet: Vec<peers::Unmet>,
+    pub options: Vec<peers::FixOption>,
+    /// Why some fix isn't offered.
+    pub notes: Vec<String>,
+    /// The highlighted option.
+    pub choice: usize,
 }
 
 /// An install waiting for the user to decide about the other packages it needs changed.
@@ -396,6 +414,8 @@ pub struct App {
     pub pin_prompt: bool,
     /// An install is waiting for the answer to a question about its peer dependencies.
     pub peer_prompt: Option<PeerPrompt>,
+    /// The fixes for a package's unmet peers (`f`), waiting for a choice.
+    pub peer_fix: Option<PeerFix>,
     /// The peer dependencies of an install are being checked.
     peer_checking: bool,
     /// Text the user is typing: a version (`e`) or a package to add (`+`).
@@ -561,6 +581,7 @@ impl App {
             filter_mode: false,
             pin_prompt: false,
             peer_prompt: None,
+            peer_fix: None,
             peer_checking: false,
             input: None,
             adding: HashMap::new(),
@@ -992,6 +1013,12 @@ impl App {
                     }
                 }
                 Event::PeerCheck { plan, ovr, report } => self.on_peer_check(plan, ovr, report),
+                Event::PeerFixes {
+                    name,
+                    unmet,
+                    options,
+                    notes,
+                } => self.on_peer_fixes(name, unmet, options, notes),
                 Event::VersionChecked {
                     name,
                     version,
@@ -1717,6 +1744,9 @@ impl App {
             && !self.rows[*idx].busy()
         {
             item.push("e set version".into());
+            if self.rows[*idx].peers.iter().any(|p| p.met() == Some(false)) {
+                item.push("f fix unmet peers".into());
+            }
         }
         if !self.acting_rows(|r| !r.busy() && r.kind != Kind::Override).is_empty() {
             item.push("d uninstall".into());
@@ -1751,6 +1781,31 @@ impl App {
         }
         if self.filter_mode {
             self.on_filter_key(key);
+            return;
+        }
+        if let Some(mut p) = self.peer_fix.take() {
+            let pick = match key.code {
+                KeyCode::Up | KeyCode::Char('k') => {
+                    p.choice = p.choice.checked_sub(1).unwrap_or(p.options.len().saturating_sub(1));
+                    self.peer_fix = Some(p);
+                    return;
+                }
+                KeyCode::Down | KeyCode::Char('j') | KeyCode::Tab => {
+                    p.choice = (p.choice + 1) % p.options.len().max(1);
+                    self.peer_fix = Some(p);
+                    return;
+                }
+                KeyCode::Enter => Some(p.choice),
+                KeyCode::Char(c @ '1'..='9') => Some(c as usize - '1' as usize),
+                _ => None,
+            };
+            match pick.and_then(|i| p.options.get(i)) {
+                Some(o) => {
+                    self.push_log(format!("… fixing the peers of {}: {}", p.name, o.label));
+                    self.start_install(o.plan.clone(), Vec::new());
+                }
+                None => self.push_log("Peers unchanged."),
+            }
             return;
         }
         if let Some(p) = self.peer_prompt.take() {
@@ -1862,6 +1917,7 @@ impl App {
             KeyCode::Char('R') => self.refetch_latest(),
             KeyCode::Char('r') => self.revert_selected(),
             KeyCode::Char('e') => self.ask_version(),
+            KeyCode::Char('f') => self.fix_unmet_peers(),
             KeyCode::Char('+') => {
                 self.input = Some(Input::new(InputPurpose::Add {
                     add_as: AddAs::Dependency,
@@ -1944,6 +2000,90 @@ impl App {
     }
 
     // ---- choosing a version, adding a package -------------------------------------------
+
+    /// Looks up the ways to fix the unmet peers of the package under the cursor, then asks.
+    fn fix_unmet_peers(&mut self) {
+        let Some(Item::Row { idx, .. }) = self.cursor_item() else {
+            self.push_log("Put the cursor on a package marked ⚠ unmet peer.");
+            return;
+        };
+        let r = &self.rows[*idx];
+        let unmet: Vec<peers::Unmet> = r
+            .peers
+            .iter()
+            .filter(|p| p.met() == Some(false))
+            .filter_map(|p| {
+                Some(peers::Unmet {
+                    name: p.name.clone(),
+                    range: p.range.clone(),
+                    installed: p.installed.clone()?,
+                })
+            })
+            .collect();
+        if unmet.is_empty() {
+            self.push_log(format!("{} has no unmet peers.", r.name));
+            return;
+        }
+        if r.busy() {
+            return;
+        }
+        let name = r.name.clone();
+        let have = r.installed.clone().unwrap_or_else(|| r.current.clone());
+        self.push_log(format!("… looking up fixes for the peers of {name}"));
+        let direct: Vec<String> = self
+            .rows
+            .iter()
+            .filter(|r| r.kind != Kind::Override)
+            .map(|r| r.name.clone())
+            .collect();
+        let (dir, fetcher, tx) = (self.dir.clone(), self.fetcher.clone(), self.events_tx.clone());
+        thread::spawn(move || {
+            let lock = crate::tree::npm_lock_versions(&dir);
+            let installed = |n: &str| resolved_version(&dir, lock.as_ref(), n);
+            let fetch = |n: &str| fetcher(n);
+            let (options, notes) = peers::fix_options(
+                &name,
+                &have,
+                &unmet,
+                &peers::Project {
+                    direct: &direct,
+                    installed: &installed,
+                    installed_peers: &|_| None,
+                    fetch: &fetch,
+                },
+            );
+            let _ = tx.send(Event::PeerFixes {
+                name,
+                unmet,
+                options,
+                notes,
+            });
+        });
+    }
+
+    fn on_peer_fixes(
+        &mut self,
+        name: String,
+        unmet: Vec<peers::Unmet>,
+        options: Vec<peers::FixOption>,
+        notes: Vec<String>,
+    ) {
+        if options.is_empty() {
+            self.push_log(format!("✘ Can't fix the peers of {name}: {}.", notes.join("; ")));
+            return;
+        }
+        // The answer must not land in a text prompt or another question.
+        self.filter_mode = false;
+        self.pin_prompt = false;
+        self.input = None;
+        self.peer_fix = Some(PeerFix {
+            name,
+            unmet,
+            options,
+            notes,
+            choice: 0,
+        });
+    }
 
     /// Asks which version to install for the package under the cursor.
     fn ask_version(&mut self) {
@@ -4621,7 +4761,7 @@ mod tests {
         // The peer that isn't installed, and peers that fit, stay out of the list.
         let screen = render(&mut app, 200, 30).join("\n");
         assert!(!screen.contains("react ^18"), "{screen}");
-        assert_eq!(screen.matches("unmet").count(), 1, "only a has an unmet peer");
+        assert_eq!(screen.matches("⚠ unmet peer").count(), 1, "only a has an unmet peer");
 
         // Too narrow for the details: just the count.
         let screen = render(&mut app, 80, 20).join("\n");
@@ -4643,6 +4783,98 @@ mod tests {
             screen.contains("2 peer dependencies: b ^2.0.0, but 1.0.0 is installed, react ^18.0.0 (not installed)"),
             "{screen}"
         );
+    }
+
+    /// A registry where `a` 0.9.0 accepts `b ^1`, and `b` has 2.0.0 and 2.1.0.
+    fn peer_fix_registry() -> Fetcher {
+        use crate::registry::{Packument, VersionInfo};
+        let doc = |latest: &str, versions: &[(&str, &[(&str, &str)])]| Packument {
+            latest: Some(Version::parse(latest).unwrap()),
+            versions: versions
+                .iter()
+                .map(|(v, peers)| {
+                    (
+                        Version::parse(v).unwrap(),
+                        VersionInfo {
+                            peers: peers.iter().map(|(n, r)| (n.to_string(), r.to_string())).collect(),
+                        },
+                    )
+                })
+                .collect(),
+        };
+        let docs = HashMap::from([
+            (
+                "a".to_string(),
+                doc("1.0.0", &[("0.9.0", &[("b", "^1.0.0")]), ("1.0.0", &[("b", "^2.0.0")])]),
+            ),
+            ("b".to_string(), doc("2.1.0", &[("1.0.0", &[]), ("2.0.0", &[]), ("2.1.0", &[])])),
+        ]);
+        Arc::new(move |n: &str| docs.get(n).cloned().ok_or_else(|| format!("{n} not found")))
+    }
+    /// Handles background events until `done` holds.
+    fn wait_until(app: &mut App, done: impl Fn(&App) -> bool) {
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !done(app) && std::time::Instant::now() < until {
+            app.drain_events();
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(done(app), "timed out; log: {:?}", app.log);
+    }
+
+    #[test]
+    fn f_offers_to_update_the_peer_or_change_the_package() {
+        let mut app = app_with_peers();
+        app.fetcher = peer_fix_registry();
+        let (tx, rx) = mpsc::channel();
+        app.jobs = tx;
+        assert!(app.hints().0.contains(&"f fix unmet peers".to_string()));
+        app.on_key(key('f'));
+        wait_until(&mut app, |a| a.peer_fix.is_some());
+        let p = app.peer_fix.as_ref().unwrap();
+        let labels: Vec<&str> = p.options.iter().map(|o| o.label.as_str()).collect();
+        assert_eq!(labels, ["update b to 2.1.0", "downgrade a to 0.9.0"]);
+
+        let screen = render(&mut app, 120, 40).join("\n");
+        assert!(screen.contains(" Fix the peers of a "), "{screen}");
+        assert!(screen.contains("a needs b ^2.0.0, but 1.0.0 is installed."), "{screen}");
+        assert!(screen.contains("› 1 update b to 2.1.0"), "{screen}");
+        assert!(screen.contains("  2 downgrade a to 0.9.0"), "{screen}");
+
+        // Down, then enter: the second option goes through the peer check, then installs.
+        press(&mut app, KeyCode::Down);
+        assert_eq!(app.peer_fix.as_ref().unwrap().choice, 1);
+        press(&mut app, KeyCode::Enter);
+        assert!(app.peer_fix.is_none());
+        let jobs = settle(&mut app, &rx, "");
+        assert_eq!(specs(&jobs), ["a@^0.9.0"]);
+    }
+
+    #[test]
+    fn a_number_picks_an_option_and_other_keys_cancel() {
+        let mut app = app_with_peers();
+        app.fetcher = peer_fix_registry();
+        let (tx, rx) = mpsc::channel();
+        app.jobs = tx;
+        app.on_key(key('f'));
+        wait_until(&mut app, |a| a.peer_fix.is_some());
+        app.on_key(key('x'));
+        assert!(app.peer_fix.is_none());
+        assert!(settle(&mut app, &rx, "never").is_empty());
+
+        app.on_key(key('f'));
+        wait_until(&mut app, |a| a.peer_fix.is_some());
+        app.on_key(key('1'));
+        assert_eq!(specs(&settle(&mut app, &rx, "")), ["b@^2.1.0"]);
+    }
+
+    #[test]
+    fn f_on_a_package_without_unmet_peers_says_so() {
+        let mut app = app_with_peers();
+        let b = app.view.iter().position(|it| matches!(it, Item::Row { name, .. } if name == "b")).unwrap();
+        app.table.select(Some(b));
+        app.on_key(key('f'));
+        assert_eq!(app.log.last().unwrap(), "b has no unmet peers.");
+        assert!(!app.hints().0.iter().any(|h| h.contains("unmet")));
     }
 
     #[test]

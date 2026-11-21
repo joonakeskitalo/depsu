@@ -161,6 +161,110 @@ pub fn check(plan: &[(String, Version)], p: &Project) -> Report {
     report
 }
 
+/// One way to fix a package's unmet peers: the packages to install.
+#[derive(Clone, Debug, PartialEq)]
+pub struct FixOption {
+    pub plan: Vec<(String, Version)>,
+    /// E.g. `update b to 2.1.0` or `downgrade a to 0.9.0`.
+    pub label: String,
+}
+
+/// A peer `package` declares that the installed version doesn't fit.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Unmet {
+    pub name: String,
+    pub range: String,
+    pub installed: Version,
+}
+
+/// The ways to fix the unmet peers of `package` (installed at `have`), best first:
+///
+/// 1. update the peers to versions in the ranges `package` asks for, when they are the
+///    project's own dependencies;
+/// 2. change `package` to a version whose peer ranges accept what is installed.
+///
+/// `notes` explains why an option is missing.
+pub fn fix_options(
+    package: &str,
+    have: &Version,
+    unmet: &[Unmet],
+    p: &Project,
+) -> (Vec<FixOption>, Vec<String>) {
+    let mut options = Vec::new();
+    let mut notes = Vec::new();
+    let verb = |from: Option<&Version>, to: &Version| match from {
+        Some(f) if to < f => "downgrade",
+        _ => "update",
+    };
+
+    // 1. The peers.
+    let mut plan = Vec::new();
+    for u in unmet {
+        if !p.direct.contains(&u.name) {
+            notes.push(format!(
+                "{} is installed by another package, so depsu can't update it",
+                u.name
+            ));
+            plan.clear();
+            break;
+        }
+        let Ok(doc) = (p.fetch)(&u.name) else {
+            notes.push(format!("could not look up {}", u.name));
+            plan.clear();
+            break;
+        };
+        match doc.best(|v, _| satisfies(&u.range, v) == Some(true)) {
+            Some(v) => plan.push((u.name.clone(), v)),
+            None => {
+                notes.push(format!("{} has no release in {}", u.name, u.range));
+                plan.clear();
+                break;
+            }
+        }
+    }
+    if !plan.is_empty() {
+        let label = plan
+            .iter()
+            .map(|(n, v)| {
+                let from = unmet.iter().find(|u| u.name == *n).map(|u| &u.installed);
+                format!("{} {n} to {v}", verb(from, v))
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        options.push(FixOption { plan, label });
+    }
+
+    // 2. The package itself.
+    if p.direct.iter().any(|d| d == package) {
+        match (p.fetch)(package) {
+            Ok(doc) => {
+                let fits = |info: &crate::registry::VersionInfo| {
+                    info.peers.iter().all(|(peer, range)| match (p.installed)(peer) {
+                        Some(v) => satisfies(range, &v) != Some(false),
+                        None => true,
+                    })
+                };
+                match doc.best(|v, info| v != have && fits(info)) {
+                    Some(v) => options.push(FixOption {
+                        label: format!("{} {package} to {v}", verb(Some(have), &v)),
+                        plan: vec![(package.to_string(), v)],
+                    }),
+                    None => notes.push(format!(
+                        "no release of {package} accepts the installed {}",
+                        unmet
+                            .iter()
+                            .map(|u| format!("{} {}", u.name, u.installed))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    )),
+                }
+            }
+            Err(_) => notes.push(format!("could not look up {package}")),
+        }
+    }
+    (options, notes)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -299,6 +403,65 @@ mod tests {
     fn a_peer_that_is_not_installed_is_left_to_the_package_manager() {
         let r = run(&[("react-dom", "19.0.0")], &["react-dom"], &[("react-dom", "18.2.0")]);
         assert!(r.needs.is_empty());
+    }
+
+    /// `plugin@1.0.0` needs `react ^19`, but react 18.2.0 is installed.
+    fn fix_case(direct: &[&str]) -> (Vec<FixOption>, Vec<String>) {
+        let reg = HashMap::from([
+            (
+                "plugin",
+                doc(
+                    "2.0.0",
+                    &[
+                        ("0.9.0", &[("react", "^18.0.0")]),
+                        ("1.0.0", &[("react", "^19.0.0")]),
+                        ("2.0.0", &[("react", "^19.0.0")]),
+                    ],
+                ),
+            ),
+            ("react", doc("19.0.0", &[("18.2.0", &[]), ("19.0.0", &[]), ("19.1.0-rc.1", &[])])),
+        ]);
+        let installed = HashMap::from([("react".to_string(), v("18.2.0")), ("plugin".to_string(), v("1.0.0"))]);
+        let direct: Vec<String> = direct.iter().map(|s| s.to_string()).collect();
+        let project = Project {
+            direct: &direct,
+            installed: &|n| installed.get(n).cloned(),
+            installed_peers: &|_| None,
+            fetch: &|n| reg.get(n).cloned().ok_or_else(|| format!("{n} not found")),
+        };
+        let unmet = [Unmet {
+            name: "react".into(),
+            range: "^19.0.0".into(),
+            installed: v("18.2.0"),
+        }];
+        fix_options("plugin", &v("1.0.0"), &unmet, &project)
+    }
+
+    #[test]
+    fn an_unmet_peer_can_be_fixed_by_updating_it_or_by_changing_the_package() {
+        let (options, notes) = fix_case(&["plugin", "react"]);
+        assert_eq!(
+            options,
+            [
+                FixOption {
+                    plan: vec![("react".into(), v("19.0.0"))],
+                    label: "update react to 19.0.0".into()
+                },
+                FixOption {
+                    plan: vec![("plugin".into(), v("0.9.0"))],
+                    label: "downgrade plugin to 0.9.0".into()
+                },
+            ]
+        );
+        assert!(notes.is_empty(), "{notes:?}");
+    }
+
+    #[test]
+    fn a_peer_that_is_not_a_project_dependency_can_only_be_fixed_through_the_package() {
+        let (options, notes) = fix_case(&["plugin"]);
+        assert_eq!(options.len(), 1);
+        assert_eq!(options[0].label, "downgrade plugin to 0.9.0");
+        assert!(notes[0].contains("react is installed by another package"), "{notes:?}");
     }
 
     #[test]
