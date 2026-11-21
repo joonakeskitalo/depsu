@@ -111,8 +111,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     } else {
         Vec::new()
     };
-    // While the nested override lists are hidden, a text summary takes their place.
-    let summary_h = if app.show_info && app.show_overrides == Overrides::Off {
+    let summary_h = if app.show_info {
         SUMMARY_LINES
     } else {
         0
