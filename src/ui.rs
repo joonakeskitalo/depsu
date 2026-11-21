@@ -249,19 +249,17 @@ fn draw_commit_dialog(f: &mut Frame, p: &crate::app::CommitPrompt) {
         ),
     ]));
     lines.push(Line::default());
-    let body_kept = crate::commit::body_for(&p.plan, &p.title).is_some();
-    lines.push(Line::from(vec![
-        Span::styled("Changes", bold),
-        Span::styled(
-            if body_kept || p.plan.body.is_empty() {
-                ""
-            } else {
-                "   (the title says it all, so the commit gets no body)"
-            },
-            dim,
-        ),
-    ]));
-    // The body, cut so the dialog fits the screen.
+    // What the body holds, given the title as it is now.
+    let in_title = crate::commit::title_has_changes(&p.plan, &p.title);
+    let fixes = crate::commit::fixes_for(&p.plan, &p.title);
+    let note = match (in_title, fixes.is_empty() && !p.plan.fixes.is_empty(), p.plan.fixes.is_empty()) {
+        (true, _, true) | (true, true, _) => "   (the title says it all, so the commit gets no body)",
+        (true, false, false) => "   (in the title, so the body lists only the fixes)",
+        (false, true, false) => "   (the title names the fixes, so the body lists only the changes)",
+        _ => "",
+    };
+    lines.push(Line::from(vec![Span::styled("Changes", bold), Span::styled(note, dim)]));
+    // The changes and fixes, cut so the dialog fits the screen.
     let room = (f.area().height as usize).saturating_sub(22).max(3);
     let body: Vec<&str> = p.plan.body.lines().collect();
     for l in body.iter().take(room) {

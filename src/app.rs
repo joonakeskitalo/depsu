@@ -475,6 +475,11 @@ pub struct App {
     pub blocked_prompt: Option<BlockedPrompt>,
     /// The commit `c` proposes.
     pub commit_prompt: Option<CommitPrompt>,
+    /// Vulnerabilities queued installs and overrides will fix, with the row name or override
+    /// key of the job that fixes them.
+    queued_fixes: Vec<(String, crate::commit::Fixed)>,
+    /// Vulnerabilities fixed in this session and not committed yet.
+    pub session_fixes: Vec<crate::commit::Fixed>,
     /// Packages to install with an exact version the next time they are queued, because a
     /// range would resolve to a blocked version again.
     exact_once: HashSet<String>,
@@ -646,6 +651,8 @@ impl App {
             delete_prompt: None,
             blocked_prompt: None,
             commit_prompt: None,
+            queued_fixes: Vec::new(),
+            session_fixes: Vec::new(),
             exact_once: HashSet::new(),
             prober: {
                 let (rc, agent) = (rc.clone(), agent.clone());
@@ -1221,6 +1228,17 @@ impl App {
         result: Result<(), String>,
     ) {
         let ok = result.is_ok();
+        let (done, pending): (Vec<_>, Vec<_>) = std::mem::take(&mut self.queued_fixes)
+            .into_iter()
+            .partition(|(by, _)| names.contains(by) || keys.contains(by));
+        self.queued_fixes = pending;
+        if ok {
+            for (_, f) in done {
+                if !self.session_fixes.contains(&f) {
+                    self.session_fixes.push(f);
+                }
+            }
+        }
         let forbidden = result
             .as_ref()
             .err()
@@ -2209,7 +2227,7 @@ impl App {
 
     fn on_commit_prepared(&mut self, result: Result<crate::commit::Plan, String>) {
         let plan = match result {
-            Ok(p) => p,
+            Ok(p) => p.with_fixes(&self.session_fixes),
             Err(e) => return self.push_log(format!("✘ Can't commit: {e}")),
         };
         if plan.files.is_empty() {
@@ -2265,6 +2283,8 @@ impl App {
             Ok(hash) => {
                 if let Some(p) = self.commit_prompt.take() {
                     self.push_log(format!("✔ committed {hash}: {}", p.title.trim()));
+                    // Committed fixes aren't listed again in the next commit.
+                    self.session_fixes.retain(|f| !p.plan.fixes.contains(f));
                 }
             }
             Err(e) => {
@@ -3235,6 +3255,15 @@ impl App {
 
     /// Queues the installs of `plan` (name, version) and the override updates.
     fn queue_install(&mut self, plan: Vec<(String, Version)>, ovr: Vec<(Override, String)>) {
+        for (name, target) in &plan {
+            if let Some(r) = self.rows.iter().find(|r| r.name == *name && !r.busy()) {
+                for v in &r.vulns {
+                    if self.vuln_install_fix(r, v).is_some_and(|fix| *target >= fix) {
+                        self.queued_fixes.push((name.clone(), fixed(&r.name, v)));
+                    }
+                }
+            }
+        }
         let mut items = Vec::new();
         for (name, target) in plan {
             let exact_now = self.exact_once.remove(&name);
@@ -3712,6 +3741,14 @@ impl App {
                 }
             };
             let key = loc.join("\u{1f}");
+            let fixes: Vec<crate::commit::Fixed> = self
+                .rows
+                .iter()
+                .flat_map(|r| &r.vulns)
+                .filter(|v| v.package == p.name && pin_target(v).is_some_and(|t| t <= p.version))
+                .map(|v| fixed(&p.name, v))
+                .collect();
+            self.queued_fixes.extend(fixes.into_iter().map(|f| (key.clone(), f)));
             self.changed.insert(key.clone());
             self.busy_overrides.insert(key.clone());
             keys.push(key);
@@ -3727,6 +3764,17 @@ impl App {
         });
     }
 }
+/// `v`, fixed by changing `package`, as the commit lists it.
+fn fixed(package: &str, v: &Vuln) -> crate::commit::Fixed {
+    crate::commit::Fixed {
+        package: package.to_string(),
+        id: v.id.clone(),
+        title: v.title.clone(),
+        source: v.source.label().to_string(),
+        severity: v.severity.label().to_string(),
+    }
+}
+
 /// The version of a vulnerable transitive package to pin it to: the lowest fix in its
 /// installed major release, or else the lowest newer fix.
 fn pin_target(v: &Vuln) -> Option<Version> {
@@ -5476,6 +5524,80 @@ mod tests {
         app.on_key(key('c'));
         wait_until(&mut app, |a| a.log.last().is_some_and(|l| l.starts_with("Nothing to commit")));
         assert!(app.commit_prompt.is_none());
+    }
+
+    #[test]
+    fn applied_fixes_are_listed_in_the_commit_body() {
+        let mut app = app_with_three_findings();
+        let (tx, rx) = mpsc::channel();
+        app.jobs = tx;
+        let dir = app.dir.clone();
+        std::fs::write(dir.join("package.json"), r#"{"dependencies":{"a":"^1.0.0","b":"^1.0.0"}}"#).unwrap();
+        std::fs::write(dir.join(".gitignore"), "node_modules\ncache.json*\n").unwrap();
+        git(&dir, &["init", "-q", "-b", "main"]);
+        for (k, v) in [("user.name", "t"), ("user.email", "t@example.com"), ("commit.gpgsign", "false")] {
+            git(&dir, &["config", k, v]);
+        }
+        git(&dir, &["add", "-A"]);
+        git(&dir, &["commit", "-q", "-m", "init"]);
+
+        // Upgrading a to its fix version fixes UPGRADE (and nothing else).
+        app.queue_install(vec![("a".into(), Version::new(1, 0, 1))], Vec::new());
+        rx.try_recv().expect("install queued");
+        app.on_install_finished(vec!["a".into()], Vec::new(), Ok(()));
+        let ids: Vec<&str> = app.session_fixes.iter().map(|f| f.id.as_str()).collect();
+        assert_eq!(ids, ["UPGRADE"]);
+
+        // Overriding qs with p fixes NESTED.
+        cursor_on_finding(&mut app, "NESTED");
+        app.on_key(key('p'));
+        app.on_key(key('p'));
+        let job = rx.try_recv().expect("override queued");
+        app.on_install_finished(Vec::new(), job.keys, Ok(()));
+        let ids: Vec<&str> = app.session_fixes.iter().map(|f| f.id.as_str()).collect();
+        assert_eq!(ids, ["UPGRADE", "NESTED"]);
+        assert_eq!(app.session_fixes[1].package, "qs");
+
+        // What those installs left in package.json.
+        std::fs::write(
+            dir.join("package.json"),
+            r#"{"dependencies":{"a":"^1.0.1","b":"^1.0.0"},"overrides":{"qs":"^6.0.4"}}"#,
+        )
+        .unwrap();
+        app.on_key(key('c'));
+        wait_until(&mut app, |a| a.commit_prompt.is_some());
+        let p = app.commit_prompt.as_ref().unwrap();
+        assert_eq!(p.title, "chore: upgrade a 1.0.0 to 1.0.1, override qs to ^6.0.4");
+        assert_eq!(
+            p.plan.body,
+            "- upgrade a 1.0.0 to 1.0.1\n- override qs to ^6.0.4\n\nFixes:\n- UPGRADE: Bad (high)\n- NESTED: Bad (high)"
+        );
+        let screen = render(&mut app, 120, 40).join("\n");
+        assert!(screen.contains("Fixes:") && screen.contains("- NESTED: Bad (high)"), "{screen}");
+        assert!(screen.contains("in the title, so the body lists only the fixes"), "{screen}");
+
+        press(&mut app, KeyCode::Enter);
+        wait_until(&mut app, |a| a.commit_prompt.is_none());
+        // The title names both changes: the body doesn't repeat them, only the fixes.
+        assert_eq!(
+            git(&dir, &["log", "-1", "--format=%b"]),
+            "Fixes:\n- UPGRADE: Bad (high)\n- NESTED: Bad (high)"
+        );
+        assert!(app.session_fixes.is_empty(), "committed fixes aren't listed again");
+    }
+
+    #[test]
+    fn a_failed_install_fixes_nothing() {
+        let mut app = app_with_three_findings();
+        let (tx, _rx) = mpsc::channel();
+        app.jobs = tx;
+        app.queue_install(vec![("a".into(), Version::new(1, 0, 1))], Vec::new());
+        app.on_install_finished(vec!["a".into()], Vec::new(), Err("npm error".into()));
+        assert!(app.session_fixes.is_empty());
+        // A version below the fix fixes nothing either.
+        app.queue_install(vec![("a".into(), Version::new(1, 0, 0))], Vec::new());
+        app.on_install_finished(vec!["a".into()], Vec::new(), Ok(()));
+        assert!(app.session_fixes.is_empty());
     }
 
     #[test]

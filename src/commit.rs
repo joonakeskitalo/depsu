@@ -242,11 +242,37 @@ pub fn changes(
 
 // ---- git -------------------------------------------------------------------------------
 
+/// A vulnerability an install or override in this session fixed.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Fixed {
+    /// The package whose change fixed it: the dependency that was upgraded, or the package
+    /// that was overridden.
+    pub package: String,
+    pub id: String,
+    pub title: String,
+    /// `snyk`, `npm audit` or `bun audit`.
+    pub source: String,
+    pub severity: String,
+}
+
+impl Fixed {
+    fn line(&self) -> String {
+        format!("- {}: {} ({})", self.id, self.title, self.severity)
+    }
+}
+
 /// What would be committed.
 #[derive(Clone, Debug)]
 pub struct Plan {
     pub title: String,
+    /// The body: the changes, then the vulnerabilities they fix.
     pub body: String,
+    /// The list of changes alone.
+    pub changes_body: String,
+    /// The names of the changed packages and overrides.
+    pub names: Vec<String>,
+    /// Vulnerabilities fixed by the changes in this commit.
+    pub fixes: Vec<Fixed>,
     /// Each change as the title words it with versions (`eslint 8.57.0 to 9.0.0`), to tell
     /// whether a title already says everything the body does.
     pub items: Vec<String>,
@@ -371,6 +397,9 @@ pub fn prepare(dir: &Path, pm: Pm) -> Result<Plan, String> {
     Ok(Plan {
         title: title(&changes),
         body: body(&changes),
+        changes_body: body(&changes),
+        names: changes.iter().map(|c| c.parts().2).collect(),
+        fixes: Vec::new(),
         items: changes.iter().map(|c| c.parts().1).collect(),
         files: changed,
         branch,
@@ -388,11 +417,54 @@ fn mentions(title: &str, item: &str) -> bool {
     })
 }
 
-/// The body to commit with `title`: none when the title already names every change with its
-/// versions, since the body would only repeat it.
-pub fn body_for<'a>(plan: &'a Plan, title: &str) -> Option<&'a str> {
-    let repeats = !plan.items.is_empty() && plan.items.iter().all(|i| mentions(title, i));
-    (!plan.body.is_empty() && !repeats).then_some(plan.body.as_str())
+impl Plan {
+    /// Adds the vulnerabilities fixed by the changes in this commit to the body: those of the
+    /// changed packages, once each.
+    pub fn with_fixes(mut self, fixed: &[Fixed]) -> Plan {
+        self.fixes = Vec::new();
+        for f in fixed {
+            if self.names.contains(&f.package)
+                && !self.fixes.iter().any(|x| x.id == f.id && x.package == f.package)
+            {
+                self.fixes.push(f.clone());
+            }
+        }
+        self.body = self.changes_body.clone();
+        if !self.fixes.is_empty() {
+            let lines: Vec<String> = self.fixes.iter().map(Fixed::line).collect();
+            if !self.body.is_empty() {
+                self.body.push_str("\n\n");
+            }
+            self.body.push_str(&format!("Fixes:\n{}", lines.join("\n")));
+        }
+        self
+    }
+}
+
+/// The body to commit with `title`, without what the title already says: the list of changes
+/// goes when the title names every change with its versions, and a fixed vulnerability goes
+/// when the title mentions its ID. `None` when nothing is left.
+pub fn body_for(plan: &Plan, title: &str) -> Option<String> {
+    let mut parts = Vec::new();
+    if !plan.changes_body.is_empty() && !title_has_changes(plan, title) {
+        parts.push(plan.changes_body.clone());
+    }
+    let fixes = fixes_for(plan, title);
+    if !fixes.is_empty() {
+        let lines: Vec<String> = fixes.iter().map(|f| f.line()).collect();
+        parts.push(format!("Fixes:\n{}", lines.join("\n")));
+    }
+    (!parts.is_empty()).then(|| parts.join("\n\n"))
+}
+
+/// The title names every change with its versions.
+pub fn title_has_changes(plan: &Plan, title: &str) -> bool {
+    !plan.items.is_empty() && plan.items.iter().all(|i| mentions(title, i))
+}
+
+/// The fixed vulnerabilities the body lists: those the title doesn't mention.
+pub fn fixes_for<'a>(plan: &'a Plan, title: &str) -> Vec<&'a Fixed> {
+    plan.fixes.iter().filter(|f| !title.contains(&f.id)).collect()
 }
 
 /// Commits the plan's files with `title`, and the plan's body unless the title already says
@@ -401,9 +473,10 @@ pub fn run(dir: &Path, plan: &Plan, title: &str) -> Result<String, String> {
     let mut add = vec!["add", "-A", "--"];
     add.extend(plan.files.iter().map(String::as_str));
     git(dir, &add)?;
+    let body = body_for(plan, title);
     let mut commit = vec!["commit", "-m", title];
-    if let Some(body) = body_for(plan, title) {
-        commit.extend(["-m", body]);
+    if let Some(body) = &body {
+        commit.extend(["-m", body.as_str()]);
     }
     // With paths, git commits only those files, whatever else is staged.
     commit.push("--");
@@ -551,6 +624,9 @@ mod tests {
         Plan {
             title: title(changes),
             body: body(changes),
+            changes_body: body(changes),
+            names: changes.iter().map(|c| c.parts().2).collect(),
+            fixes: Vec::new(),
             items: changes.iter().map(|c| c.parts().1).collect(),
             files: vec!["package.json".into()],
             branch: "main".into(),
@@ -571,6 +647,50 @@ mod tests {
         assert_eq!(body_for(&p, "fix(deps): upgrade eslint 8.57.0 to 9.0.0 and prettier 3.2.0 to 3.3.3"), None);
     }
 
+    fn fixed(package: &str, id: &str) -> Fixed {
+        Fixed {
+            package: package.into(),
+            id: id.into(),
+            title: "Prototype Pollution".into(),
+            source: "snyk".into(),
+            severity: "high".into(),
+        }
+    }
+
+    #[test]
+    fn fixed_vulnerabilities_are_listed_in_the_body() {
+        let p = plan_for(&[up("lodash", "4.17.15", "4.17.21")]).with_fixes(&[
+            fixed("lodash", "SNYK-JS-LODASH-1040724"),
+            fixed("lodash", "SNYK-JS-LODASH-1040724"),
+            // Another package's fix isn't part of this commit.
+            fixed("express", "SNYK-JS-QS-3153490"),
+        ]);
+        assert_eq!(
+            p.body,
+            "- upgrade lodash 4.17.15 to 4.17.21\n\nFixes:\n- SNYK-JS-LODASH-1040724: Prototype Pollution (high)"
+        );
+        // The title names the change, so the body has only what the title can't say.
+        assert_eq!(p.title, "chore: upgrade lodash 4.17.15 to 4.17.21");
+        assert_eq!(
+            body_for(&p, &p.title).as_deref(),
+            Some("Fixes:\n- SNYK-JS-LODASH-1040724: Prototype Pollution (high)")
+        );
+        // A title without the versions gets both.
+        assert_eq!(body_for(&p, "fix: upgrade lodash").as_deref(), Some(p.body.as_str()));
+        // A title naming the vulnerability doesn't get it repeated either.
+        assert_eq!(
+            body_for(&p, "fix: upgrade lodash 4.17.15 to 4.17.21 (SNYK-JS-LODASH-1040724)"),
+            None
+        );
+        assert_eq!(
+            body_for(&p, "fix: SNYK-JS-LODASH-1040724").as_deref(),
+            Some("- upgrade lodash 4.17.15 to 4.17.21")
+        );
+        // Without fixes it's left out again.
+        let p = p.with_fixes(&[]);
+        assert_eq!(body_for(&p, &p.title), None);
+    }
+
     #[test]
     fn the_body_stays_when_it_says_more_than_the_title() {
         // A title with names only.
@@ -580,10 +700,13 @@ mod tests {
             .collect();
         let p = plan_for(&many);
         assert_eq!(p.title, "chore: upgrade eslint, prettier, typescript and vite");
-        assert_eq!(body_for(&p, &p.title), Some(p.body.as_str()));
+        assert_eq!(body_for(&p, &p.title), Some(p.body.clone()));
         // A title the user edited the versions out of.
         let p = plan_for(&[up("eslint", "8.57.0", "9.0.0")]);
-        assert_eq!(body_for(&p, "chore: upgrade eslint to v9"), Some("- upgrade eslint 8.57.0 to 9.0.0"));
+        assert_eq!(
+            body_for(&p, "chore: upgrade eslint to v9").as_deref(),
+            Some("- upgrade eslint 8.57.0 to 9.0.0")
+        );
         // A longer package name containing the change's text doesn't count.
         let p = plan_for(&[up("lint", "1.0.0", "2.0.0")]);
         assert!(body_for(&p, "chore: upgrade eslint 1.0.0 to 2.0.0").is_some());
