@@ -1030,11 +1030,11 @@ impl App {
 
     /// Hotkey hints for the actions that can be performed on the current selection or cursor
     /// item right now.
-    pub fn hints(&self) -> Vec<String> {
-        let mut h: Vec<String> = Vec::new();
-        let mut add = |s: String| h.push(s);
+    pub fn hints(&self) -> (Vec<String>, Vec<String>) {
+        let mut item: Vec<String> = Vec::new();
+        let mut global: Vec<String> = Vec::new();
         if !self.view.is_empty() {
-            add("↑/↓ move".into());
+            global.push("↑/↓ move".into());
         }
         let cursor_selectable = match self.cursor_item() {
             Some(Item::Row { idx, .. }) => self.rows[*idx].can_select(),
@@ -1045,10 +1045,10 @@ impl App {
             None => false,
         };
         if cursor_selectable {
-            add("space select".into());
+            item.push("space select".into());
         }
         if self.visible_rows().iter().any(|&i| self.rows[i].can_select()) {
-            add("a all".into());
+            global.push("a all".into());
         }
         let ovr_updatable = |o: &Override| !self.override_busy(o) && self.update_target(o).is_some();
         let install = self
@@ -1060,15 +1060,15 @@ impl App {
                 .cursor_override()
                 .is_some_and(|o| ovr_updatable(o));
         if install {
-            add("i install".into());
+            item.push("i install".into());
         }
-        add("/ filter".into());
-        add("g group".into());
-        add("o overrides".into());
-        add("u up-to-date".into());
-        add("s snyk".into());
+        global.push("/ filter".into());
+        global.push("g group".into());
+        global.push("o overrides".into());
+        global.push("u up-to-date".into());
+        global.push("s snyk".into());
         if let Some(src) = audit::source_for(self.pm) {
-            add(format!("n {}", src.label()));
+            global.push(format!("n {}", src.label()));
         }
         let remove = self
             .visible_overrides()
@@ -1076,11 +1076,11 @@ impl App {
             .any(|o| self.selected_overrides.contains(&o.key()) && !self.override_busy(o))
             || self.cursor_override().is_some_and(|o| !self.override_busy(o));
         if remove {
-            add("x remove override".into());
+            item.push("x remove override".into());
         }
         for source in [Source::Snyk, self.audit_source()] {
             if !self.acting_rows(|r| !r.busy() && r.fix_of(source).is_some()).is_empty() {
-                add(format!(
+                item.push(format!(
                     "{} {} fix",
                     fix_key(source),
                     if source.is_audit() { "audit" } else { "snyk" }
@@ -1088,28 +1088,28 @@ impl App {
             }
         }
         if !self.acting_rows(|r| !r.busy()).is_empty() {
-            add("P pin type".into());
+            item.push("P pin type".into());
         }
         if !self.acting_rows(|r| !r.busy() && !r.vulns.is_empty()).is_empty() {
-            add("p pin fix as override".into());
+            item.push("p pin fix as override".into());
         }
         if !self.acting_rows(|r| !r.busy() && r.kind != Kind::Override).is_empty() {
-            add("d uninstall".into());
+            item.push("d uninstall".into());
         }
         if !self.acting_rows(|r| !r.busy() && r.changed_from.is_some()).is_empty() {
-            add("r revert".into());
+            item.push("r revert".into());
         }
         if let Some(Item::Removed { name }) = self.cursor_item()
             && self
                 .removed_pkg(name)
                 .is_some_and(|p| !matches!(p.status, Status::Queued | Status::Installing))
         {
-            add("r restore".into());
+            item.push("r restore".into());
         }
-        add("y copy md".into());
-        add("tab log".into());
-        add("q quit".into());
-        h
+        global.push("y copy md".into());
+        global.push("tab log".into());
+        global.push("q quit".into());
+        (item, global)
     }
 
     // ---- keys ------------------------------------------------------------------------

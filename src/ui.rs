@@ -261,16 +261,29 @@ fn footer_lines(app: &App, width: u16) -> Vec<Line<'static>> {
             width,
         );
     }
-    let mut hints = app.hints();
-    let mut prefix = Vec::new();
+    let (item, mut global) = app.hints();
+    let mut prefix = vec!["all:".cyan().bold()];
     if !app.filter.is_empty() {
-        prefix = vec![format!("filter: {}", app.filter).cyan()];
-        if let Some(pos) = hints.iter().position(|h| h == "/ filter") {
-            hints[pos] = "/ edit".to_string();
-            hints.insert(pos + 1, "esc clear".to_string());
+        prefix.push(format!(" filter: {}", app.filter).cyan());
+        if let Some(pos) = global.iter().position(|h| h == "/ filter") {
+            global[pos] = "/ edit".to_string();
+            global.insert(pos + 1, "esc clear".to_string());
         }
     }
-    wrap_hints(prefix, hints.iter().map(|h| hint(h)).collect(), width)
+    let mut lines = Vec::new();
+    if !item.is_empty() {
+        lines.extend(wrap_hints(
+            vec!["item:".cyan().bold()],
+            item.iter().map(|h| hint(h)).collect(),
+            width,
+        ));
+    }
+    lines.extend(wrap_hints(
+        prefix,
+        global.iter().map(|h| hint(h)).collect(),
+        width,
+    ));
+    lines
 }
 
 fn removed_line(app: &App, name: &str) -> Line<'static> {
