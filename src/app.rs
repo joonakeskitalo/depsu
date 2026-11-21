@@ -191,8 +191,9 @@ pub struct App {
     unneeded: HashMap<String, Unneeded>,
     root_deps: Vec<(String, String)>,
     confirm_remove: bool,
-    /// Override keys with a removal in flight.
-    removing: HashSet<String>,
+    confirm_pin: bool,
+    /// Override keys being added or removed, which call for a rescan.
+    changed: HashSet<String>,
     /// False until the first key press: the cursor then stays at the top of the package list.
     cursor_moved: bool,
     tree_tx: Option<Sender<TreeMsg>>,
@@ -311,7 +312,8 @@ impl App {
             unneeded: HashMap::new(),
             root_deps,
             confirm_remove: false,
-            removing: HashSet::new(),
+            confirm_pin: false,
+            changed: HashSet::new(),
             cursor_moved: false,
             tree_tx,
             events_tx,
@@ -438,7 +440,7 @@ impl App {
         let mut removed = false;
         for k in &keys {
             self.busy_overrides.remove(k);
-            removed |= self.removing.remove(k);
+            removed |= self.changed.remove(k);
         }
         let what: Vec<String> = names
             .iter()
@@ -453,7 +455,7 @@ impl App {
                         scan.stale |= scan.report.is_some();
                     }
                     self.push_log(format!(
-                        "⚠ Overrides were removed: run Snyk ({}) and {} ({}) again to check for new vulnerabilities.",
+                        "⚠ Overrides in package.json changed: run Snyk ({}) and {} ({}) again to check for new vulnerabilities.",
                         scan_key(Source::Snyk),
                         self.audit_source().label(),
                         scan_key(self.audit_source())
@@ -751,6 +753,9 @@ impl App {
         if key.code != KeyCode::Char('x') {
             self.confirm_remove = false;
         }
+        if key.code != KeyCode::Char('p') {
+            self.confirm_pin = false;
+        }
         match key.code {
             KeyCode::Esc if !self.filter.is_empty() => {
                 self.filter.clear();
@@ -798,6 +803,7 @@ impl App {
             }
             KeyCode::Char('i') | KeyCode::Enter => self.install_selected(),
             KeyCode::Char('x') => self.remove_selected(),
+            KeyCode::Char('p') => self.pin_selected(),
             KeyCode::Char('s') => self.start_scan(Source::Snyk),
             KeyCode::Char('n') => self.start_scan(self.audit_source()),
             KeyCode::Char('f') => self.fix_selected(Source::Snyk),
@@ -1027,7 +1033,6 @@ impl App {
         let mut keys = Vec::new();
         for (o, new) in ovr {
             keys.push(o.key());
-            self.removing.insert(o.key());
             self.selected_overrides.remove(&o.key());
             self.busy_overrides.insert(o.key());
             edits.push(Change::Set {
@@ -1226,7 +1231,7 @@ impl App {
             ));
             if targets.iter().any(|o| self.unneeded(o).is_none()) {
                 self.push_log(
-                    "⚠ Not flagged as unneeded: removing it can change which versions get installed and reintroduce vulnerabilities.",
+                    "⚠ Not flagged as unneeded: changed it can change which versions get installed and reintroduce vulnerabilities.",
                 );
             }
             return;
@@ -1237,7 +1242,7 @@ impl App {
         let mut keys = Vec::new();
         for o in &targets {
             keys.push(o.key());
-            self.removing.insert(o.key());
+            self.changed.insert(o.key());
             self.selected_overrides.remove(&o.key());
             self.busy_overrides.insert(o.key());
             edits.push(Change::Remove {
@@ -1255,6 +1260,175 @@ impl App {
     }
 }
 
+/// An override that pins a vulnerable transitive package to a fixed version.
+struct Pin {
+    name: String,
+    version: Version,
+    /// An existing override of the package that is too old, to be raised instead of adding one.
+    existing: Option<Override>,
+}
+impl App {
+    /// The version of a vulnerable package to pin: the lowest fix in the installed major
+    /// release (or the lowest newer one), and the highest of those over all its findings.
+    fn pin_plan(&mut self, idx: &[usize]) -> Vec<Pin> {
+        let mut want: Vec<(String, Version)> = Vec::new();
+        for &i in idx {
+            for v in &self.rows[i].vulns {
+                if v.path.is_empty() || v.package == v.direct {
+                    continue;
+                }
+                let fixes: Vec<Version> = v
+                    .newer_fixes()
+                    .into_iter()
+                    .filter_map(|f| Version::parse(f).ok())
+                    .collect();
+                let major = Version::parse(&v.version).ok().map(|i| i.major);
+                let Some(fix) = fixes
+                    .iter()
+                    .find(|f| Some(f.major) == major)
+                    .or(fixes.first())
+                else {
+                    continue;
+                };
+                match want.iter_mut().find(|(n, _)| *n == v.package) {
+                    Some((_, cur)) => *cur = (*cur).clone().max(fix.clone()),
+                    None => want.push((v.package.clone(), fix.clone())),
+                }
+            }
+        }
+        let mut plan = Vec::new();
+        for (name, version) in want {
+            if self.direct.contains(&name) {
+                self.push_log(format!(
+                    "{name} is also a direct dependency: update it instead of overriding it."
+                ));
+                continue;
+            }
+            let existing = self
+                .overrides
+                .iter()
+                .find(|o| o.name == name && o.global() && o.range.is_none())
+                .cloned();
+            if let Some(o) = &existing {
+                match overrides::min_version(&o.value) {
+                    Some(v) if v >= version => {
+                        self.push_log(format!("{name} is already overridden to {}.", o.value));
+                        continue;
+                    }
+                    Some(_) => {}
+                    None => {
+                        self.push_log(format!(
+                            "{name} has an override ({}) I can't compare: edit it by hand.",
+                            o.value
+                        ));
+                        continue;
+                    }
+                }
+            }
+            plan.push(Pin {
+                name,
+                version,
+                existing,
+            });
+        }
+        plan
+    }
+    /// Where a new override of `name` goes in `package.json` for the package manager.
+    fn new_override_loc(&self, name: &str) -> Vec<String> {
+        let (root, nested): (&[&str], bool) = match self.pm {
+            Pm::Npm | Pm::Bun => (&["overrides"], true),
+            Pm::Yarn => (&["resolutions"], false),
+            Pm::Pnpm => (&["pnpm", "overrides"], false),
+        };
+        let mut loc: Vec<String> = root.iter().map(|s| s.to_string()).collect();
+        loc.push(name.to_string());
+        // npm keeps the override of a package that has nested overrides under `.`.
+        if nested
+            && self
+                .overrides
+                .iter()
+                .any(|o| o.loc.len() > loc.len() && o.loc[..loc.len()] == loc[..])
+        {
+            loc.push(".".to_string());
+        }
+        loc
+    }
+    /// Adds overrides that pin the vulnerable transitive packages of the checked packages (or
+    /// of the one under the cursor) to the version the scanners say fixes them. Asks for a
+    /// second press first.
+    fn pin_selected(&mut self) {
+        let mut idx: Vec<usize> = self
+            .visible_rows()
+            .into_iter()
+            .filter(|&i| self.rows[i].selected && !self.rows[i].busy())
+            .collect();
+        if idx.is_empty() {
+            match self.cursor_item().cloned() {
+                Some(Item::Row { idx: i, .. }) => idx.push(i),
+                Some(Item::Header { members, .. }) => idx.extend(members),
+                _ => {}
+            }
+            idx.retain(|&i| !self.rows[i].busy());
+        }
+        let plan = self.pin_plan(&idx);
+        if plan.is_empty() {
+            self.push_log("Nothing to pin: put the cursor on a package with a vulnerable dependency that a scan found a fixed version for.");
+            return;
+        }
+        let key_name = match self.pm {
+            Pm::Yarn => "resolutions",
+            Pm::Pnpm => "pnpm.overrides",
+            _ => "overrides",
+        };
+        if !self.confirm_pin {
+            self.confirm_pin = true;
+            let names: Vec<String> = plan
+                .iter()
+                .map(|p| format!("{} → ^{}", p.name, p.version))
+                .collect();
+            self.push_log(format!(
+                "📌 will set in package.json {key_name}: {}. Press p again to confirm, any other key cancels.",
+                names.join("; ")
+            ));
+            self.push_log(
+                "⚠ This forces a version the dependents didn't ask for and can break them. Test the app afterwards, then run Snyk and the audit again.",
+            );
+            return;
+        }
+        self.confirm_pin = false;
+        let mut edits = Vec::new();
+        let mut keys = Vec::new();
+        for p in &plan {
+            let new = format!("^{}", p.version);
+            let (loc, change) = match &p.existing {
+                Some(o) => (
+                    o.loc.clone(),
+                    Change::Set {
+                        loc: o.loc.clone(),
+                        old: o.value.clone(),
+                        new,
+                    },
+                ),
+                None => {
+                    let loc = self.new_override_loc(&p.name);
+                    (loc.clone(), Change::Add { loc, new })
+                }
+            };
+            let key = loc.join("\u{1f}");
+            self.changed.insert(key.clone());
+            self.busy_overrides.insert(key.clone());
+            keys.push(key);
+            edits.push(change);
+        }
+        let what: Vec<String> = plan.iter().map(|p| format!("{}@^{}", p.name, p.version)).collect();
+        self.push_log(format!("… queued override {}", what.join(", ")));
+        let _ = self.jobs.send(Job {
+            items: Vec::new(),
+            edits,
+            keys,
+        });
+    }
+}
 /// Human-readable name of an override from its key (the last path element).
 fn override_label(key: &str) -> String {
     format!("override {}", key.rsplit('\u{1f}').next().unwrap_or(key))

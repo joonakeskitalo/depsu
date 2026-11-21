@@ -72,6 +72,7 @@ depsu --pm pnpm       # skip detection
 | `u` | Show / hide up-to-date packages |
 | `o` | Overrides: hidden → compact → full |
 | `x` | Remove the selected or highlighted overrides, flagged `✂` or not (press twice to confirm) |
+| `p` | Pin a vulnerable transitive dependency to the fixed version a scan suggests, as an override (press twice to confirm) |
 | `s` | Scan with Snyk |
 | `n` | Run `npm audit` / `bun audit` (whichever the project uses) |
 | `f` | Install the version Snyk suggests |
@@ -154,6 +155,14 @@ the chain that leads to it.
 `⇢ new value`. Select them with `space` and press `i`. `depsu` edits `package.json` in place
 (keeping indentation, key order and the trailing newline) and runs the package manager's install.
 On npm, overrides on direct dependencies can't be updated separately, because of the rule above.
+
+**Pinning a fix.** When Snyk or the audit reports a vulnerable package below a direct dependency
+and lists a fixed version, `p` adds an override for it (`overrides`, `resolutions` or
+`pnpm.overrides`, depending on the package manager) set to `^<fixed version>`. It uses the lowest fix
+in the installed major release, or the lowest newer one. It works on the checked packages or the one
+under the cursor, asks for a second press, and warns that forcing a version can break dependents.
+An existing global override that is too low is raised instead. Run Snyk and the audit again
+afterwards (the old results are marked outdated).
 
 **Unneeded overrides.** An override is flagged `✂ may be removed` when the installed tree shows it
 no longer changes anything: nothing depends on the package, every dependent already asks for the

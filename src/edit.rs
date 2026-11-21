@@ -19,6 +19,8 @@ pub enum Change {
         loc: Vec<String>,
         old: String,
     },
+    /// Adds a new string entry, creating missing parent objects. Fails if the key exists.
+    Add { loc: Vec<String>, new: String },
 }
 
 /// Applies the changes and rewrites the file, keeping key order, indentation and the trailing
@@ -35,6 +37,25 @@ pub fn apply(path: &Path, changes: &[Change]) -> Result<()> {
                     Value::String(s) => *s = new.clone(),
                     _ => unreachable!("value_at only returns matching strings"),
                 };
+            }
+            Change::Add { loc, new } => {
+                let (key, parent) = loc.split_last().context("empty location")?;
+                let mut cur = &mut root;
+                for k in parent {
+                    let Value::Object(m) = cur else {
+                        bail!("`{}` in package.json is not an object", parent.join(" › "));
+                    };
+                    cur = m
+                        .entry(k.as_str())
+                        .or_insert_with(|| Value::Object(Default::default()));
+                }
+                let Value::Object(m) = cur else {
+                    bail!("`{}` in package.json is not an object", parent.join(" › "));
+                };
+                if m.contains_key(key.as_str()) {
+                    bail!("package.json changed: `{}` already exists", loc.join(" › "));
+                }
+                m.insert(key.clone(), Value::String(new.clone()));
             }
             Change::Remove { loc, old } => {
                 value_at(&mut root, loc, old)?;
@@ -163,6 +184,23 @@ mod tests {
         cleanup(&p);
     }
 
+    #[test]
+    fn adds_entries_creating_parents_and_refuses_existing() {
+        let p = file("add", "{\n  \"name\": \"x\"\n}\n");
+        let add = |l: &[&str], new: &str| Change::Add {
+            loc: loc(l),
+            new: new.into(),
+        };
+        apply(&p, &[add(&["pnpm", "overrides", "foo"], "^1.2.3")]).unwrap();
+        apply(&p, &[add(&["pnpm", "overrides", "bar"], "^2.0.0")]).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&p).unwrap(),
+            "{\n  \"name\": \"x\",\n  \"pnpm\": {\n    \"overrides\": {\n      \"foo\": \"^1.2.3\",\n      \"bar\": \"^2.0.0\"\n    }\n  }\n}\n"
+        );
+        assert!(apply(&p, &[add(&["pnpm", "overrides", "foo"], "^9.0.0")]).is_err());
+        assert!(apply(&p, &[add(&["name", "foo"], "^9.0.0")]).is_err());
+        cleanup(&p);
+    }
     #[test]
     fn refuses_stale_or_missing_entries() {
         let p = file("stale", "{\"overrides\":{\"a\":\"1.0.0\"}}");

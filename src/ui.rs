@@ -158,6 +158,9 @@ pub fn draw(f: &mut Frame, app: &mut App) {
             ));
         }
     }
+    if app.rows.iter().any(|r| !r.vulns.is_empty()) {
+        remove_hint.push_str("   p pin fix as override");
+    }
     let audit_hint = match audit::source_for(app.pm) {
         Some(src) => format!("   n {}", src.label()),
         None => String::new(),
