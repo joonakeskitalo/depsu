@@ -25,8 +25,11 @@ Illustrative output:
 - **Uses your package manager.** npm, yarn, pnpm or bun, detected from the project.
 - **Uses your registry.** Reads `.npmrc`, `.yarnrc.yml` for Yarn 2+ and `bunfig.toml` for bun, including private
   registries and auth tokens.
-- **Selection, grouping, filtering.** Group by release type (patch, minor, major) or by name
-  prefix, and filter by name.
+- **Version range.** Each row says how the version is pinned: `pinned` (exact), `~ patch`, `^ minor` or
+  `>= any`.
+- **Selection, grouping, filtering.** Group by release type (patch, minor, major), by name
+  prefix or by dependency type (dependencies, dev dependencies, optional dependencies, overrides), and
+  filter by name.
 - **Overrides.** Shows overridden packages, checks that an update is compatible with the override,
   finds overrides that are probably no longer needed, and can update or remove them.
 - **Vulnerabilities.** Lists vulnerabilities per dependency from Snyk, `npm audit` or `bun audit`,
@@ -68,10 +71,11 @@ depsu --pm pnpm       # skip detection
 | `a` | Select all / none of the shown packages |
 | `i` / `Enter` | Install the selected packages, or the highlighted one |
 | `/` | Filter by name. `Enter` keeps the filter, `Esc` clears it |
-| `g` | Group by: none → release type → name prefix |
+| `g` | Group by: none → release type → name prefix → dependency type |
 | `u` | Show / hide up-to-date packages |
 | `o` | Overrides: hidden → compact → full |
 | `x` | Remove the selected or highlighted overrides, flagged `✂` or not (press twice to confirm) |
+| `P` | Change how the selected or highlighted packages are pinned: `^` → `~` → exact → `^` (the version stays, `package.json` is edited and the install runs) |
 | `p` | Pin a vulnerable transitive dependency to the fixed version a scan suggests, as an override (press twice to confirm) |
 | `s` | Scan with Snyk |
 | `n` | Run `npm audit` / `bun audit` (whichever the project uses) |

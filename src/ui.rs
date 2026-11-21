@@ -1,4 +1,4 @@
-use crate::app::{App, Row as AppRow, ScanStatus, Status, fix_key, scan_key};
+use crate::app::{App, VersionRange, Row as AppRow, ScanStatus, Status, fix_key, scan_key};
 use crate::audit;
 use crate::overrides::{self, Compat, Override};
 use crate::package::Kind;
@@ -159,6 +159,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
             ));
         }
     }
+    remove_hint.push_str("   P pin type");
     if app.rows.iter().any(|r| !r.vulns.is_empty()) {
         remove_hint.push_str("   p pin fix as override");
     }
@@ -243,6 +244,16 @@ fn row_line(r: &AppRow, indent: usize, name_w: usize) -> Line<'static> {
     spans.push(Span::styled(
         format!("{:<4}", r.kind.label()),
         Style::new().fg(Color::DarkGray),
+    ));
+    let pin = r.range();
+    spans.push(Span::styled(
+        format!("{:<8}", pin.label()),
+        Style::new().fg(match pin {
+            VersionRange::Exact => Color::Green,
+            VersionRange::Tilde => Color::Cyan,
+            VersionRange::Caret => Color::Yellow,
+            VersionRange::AtLeast => Color::Red,
+        }),
     ));
     spans.push(Span::raw(format!(
         "{:<14}",

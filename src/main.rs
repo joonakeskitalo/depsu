@@ -36,7 +36,7 @@ KEYS:
     a              select all / none
     i, enter       install the selected packages (or the highlighted one)
     /              filter by name (enter keeps it, esc clears it)
-    g              group by: none, release type, name prefix
+    g              group by: none, release type, name prefix, dependency type
     u              show / hide up-to-date packages
     o              overrides: hidden, compact, full
     x              remove the selected / highlighted overrides (press twice to confirm)
@@ -44,6 +44,7 @@ KEYS:
     n              run npm audit / bun audit (by the project's package manager)
     f              install the version Snyk suggests
     F              install the version npm audit / bun audit suggests
+    P              change how the selected packages are pinned: ^, ~, exact
     p              override a vulnerable dependency with the fixed version a scan
                    suggests (press twice to confirm)
     v              show / hide vulnerability findings

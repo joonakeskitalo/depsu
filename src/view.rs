@@ -10,6 +10,8 @@ pub enum GroupBy {
     None,
     Release,
     Prefix,
+    /// Dependencies, dev dependencies and optional dependencies.
+    Kind,
 }
 
 impl GroupBy {
@@ -17,7 +19,8 @@ impl GroupBy {
         match self {
             GroupBy::None => GroupBy::Release,
             GroupBy::Release => GroupBy::Prefix,
-            GroupBy::Prefix => GroupBy::None,
+            GroupBy::Prefix => GroupBy::Kind,
+            GroupBy::Kind => GroupBy::None,
         }
     }
 
@@ -26,6 +29,7 @@ impl GroupBy {
             GroupBy::None => "none",
             GroupBy::Release => "release type",
             GroupBy::Prefix => "name prefix",
+            GroupBy::Kind => "dependency type",
         }
     }
 }
@@ -262,6 +266,12 @@ fn grouped(
                 let rel = rows[i].release();
                 (rel as u8, rel.label().to_string())
             }
+            GroupBy::Kind => match rows[i].kind {
+                Kind::Prod => (0, "Dependencies".to_string()),
+                Kind::Dev => (1, "Dev dependencies".to_string()),
+                Kind::Optional => (2, "Optional dependencies".to_string()),
+                Kind::Override => (3, OVERRIDDEN.to_string()),
+            },
             _ => {
                 let label = prefix_label(&rows[i].name, &counts);
                 (u8::from(label == OTHER), label)
@@ -355,6 +365,30 @@ mod tests {
             assert_eq!(l[at + 1..], ["zlib-x"], "{mode:?}");
             assert!(l[..at].iter().all(|x| x != "zlib-x"));
         }
+    }
+
+    #[test]
+    fn groups_by_dependency_type_with_overrides_last() {
+        let mut rows = sample();
+        rows[1].kind = Kind::Dev;
+        rows[2].kind = Kind::Optional;
+        let mut o = row("zlib-x", "1.0.0", "1.1.0");
+        o.kind = Kind::Override;
+        rows.push(o);
+        let items = build(&rows, GroupBy::Kind, "", Overrides::Off, true, true);
+        let l: Vec<String> = labels(&items)
+            .into_iter()
+            .filter(|x| x.starts_with('#'))
+            .collect();
+        assert_eq!(
+            l,
+            [
+                "# Dependencies",
+                "# Dev dependencies",
+                "# Optional dependencies",
+                "# Overridden packages"
+            ]
+        );
     }
 
     #[test]

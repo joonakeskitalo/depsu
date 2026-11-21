@@ -64,6 +64,28 @@ pub enum Status {
     Failed,
 }
 
+/// How a dependency's version range is constrained.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum VersionRange {
+    /// Exactly this version.
+    Exact,
+    /// Patch releases only (~).
+    Tilde,
+    /// Minor and patch releases (^).
+    Caret,
+    /// Anything newer (>=).
+    AtLeast,
+}
+impl VersionRange {
+    pub fn label(self) -> &'static str {
+        match self {
+            VersionRange::Exact => "pinned",
+            VersionRange::Tilde => "~ patch",
+            VersionRange::Caret => "^ minor",
+            VersionRange::AtLeast => ">= any",
+        }
+    }
+}
 pub struct Row {
     pub name: String,
     pub kind: Kind,
@@ -103,6 +125,15 @@ impl Row {
         self.kind != Kind::Override
             || self.overrides.len() > 1
             || self.overrides.iter().any(|o| !o.global() || o.range.is_some())
+    }
+    /// How the version is pinned, from the prefix of its spec.
+    pub fn range(&self) -> VersionRange {
+        match self.prefix {
+            "^" => VersionRange::Caret,
+            "~" => VersionRange::Tilde,
+            ">=" => VersionRange::AtLeast,
+            _ => VersionRange::Exact,
+        }
     }
     pub fn busy(&self) -> bool {
         matches!(self.status, Status::Queued | Status::Installing)
@@ -557,6 +588,17 @@ impl App {
         self.selected_overrides.retain(|k| existing.contains(k));
         // Old verdicts are stale until the new analysis arrives.
         self.unneeded.clear();
+        // A range change in `package.json` changes how a row's version is pinned.
+        for r in self.rows.iter_mut().filter(|r| r.kind != Kind::Override) {
+            if let Some((prefix, _)) = manifest
+                .deps
+                .iter()
+                .find(|d| d.name == r.name)
+                .and_then(|d| parse_spec(&d.spec))
+            {
+                r.prefix = prefix;
+            }
+        }
         self.sync_override_rows();
         for i in 0..self.rows.len() {
             if self.rows[i].kind == Kind::Override {
@@ -876,6 +918,7 @@ impl App {
             KeyCode::Char('i') | KeyCode::Enter => self.install_selected(),
             KeyCode::Char('x') => self.remove_selected(),
             KeyCode::Char('p') => self.pin_selected(),
+            KeyCode::Char('P') => self.cycle_range(),
             KeyCode::Char('s') => self.start_scan(Source::Snyk),
             KeyCode::Char('n') => self.start_scan(self.audit_source()),
             KeyCode::Char('f') => self.fix_selected(Source::Snyk),
@@ -1357,6 +1400,100 @@ fn override_base(overrides: &[Override], name: &str) -> Option<(&'static str, Ve
         .filter_map(|o| parse_spec(&o.value))
         .min_by(|a, b| a.1.cmp(&b.1))
 }
+impl App {
+    /// Changes how the checked packages (or the one under the cursor, every package of a group
+    /// on a header) are pinned, in `package.json`: ^ → ~ → exact → ^. The version stays the
+    /// same. Overridden packages change the prefix of their overrides.
+    fn cycle_range(&mut self) {
+        let mut idx: Vec<usize> = self
+            .visible_rows()
+            .into_iter()
+            .filter(|&i| self.rows[i].selected)
+            .collect();
+        if idx.is_empty() {
+            match self.cursor_item().cloned() {
+                Some(Item::Row { idx: i, .. }) => idx.push(i),
+                Some(Item::Header { members, .. }) => idx.extend(members),
+                _ => {}
+            }
+        }
+        idx.retain(|&i| !self.rows[i].busy());
+        let mut edits = Vec::new();
+        let mut keys = Vec::new();
+        let mut what = Vec::new();
+        for i in idx {
+            let r = &self.rows[i];
+            if r.kind == Kind::Override {
+                for o in &r.overrides {
+                    if self.override_busy(o) {
+                        continue;
+                    }
+                    if let Some(new) = cycled_spec(&o.value) {
+                        keys.push(o.key());
+                        what.push(format!("{} {} → {new}", r.name, o.value));
+                        edits.push(Change::Set {
+                            loc: o.loc.clone(),
+                            old: o.value.clone(),
+                            new,
+                        });
+                    }
+                }
+                continue;
+            }
+            let field = match r.kind {
+                Kind::Prod => "dependencies",
+                Kind::Dev => "devDependencies",
+                _ => "optionalDependencies",
+            };
+            let loc = vec![field.to_string(), r.name.clone()];
+            let key = loc.join("\u{1f}");
+            let Some(old) = self
+                .root_deps
+                .iter()
+                .find(|(n, _)| *n == r.name)
+                .map(|(_, s)| s.clone())
+            else {
+                continue;
+            };
+            let Some(new) = cycled_spec(&old) else {
+                continue;
+            };
+            if self.busy_overrides.contains(&key) {
+                continue;
+            }
+            // npm insists that an override of a direct dependency equals the dependency's spec.
+            if self.pm == Pm::Npm {
+                for o in r.overrides.iter().filter(|o| o.global() && o.value == old) {
+                    keys.push(o.key());
+                    edits.push(Change::Set {
+                        loc: o.loc.clone(),
+                        old: o.value.clone(),
+                        new: new.clone(),
+                    });
+                }
+            }
+            what.push(format!("{} {old} → {new}", r.name));
+            keys.push(key);
+            edits.push(Change::Set { loc, old, new });
+        }
+        if edits.is_empty() {
+            self.push_log("Nothing to change: put the cursor on a package whose version is a plain version or range.");
+            return;
+        }
+        for k in &keys {
+            self.busy_overrides.insert(k.clone());
+        }
+        for r in self.rows.iter_mut() {
+            r.selected = false;
+        }
+        self.push_log(format!("… queued range change: {}", what.join(", ")));
+        let _ = self.jobs.send(Job {
+            items: Vec::new(),
+            edits,
+            keys,
+        });
+    }
+}
 /// An override that pins a vulnerable transitive package to a fixed version.
 struct Pin {
     name: String,
@@ -1528,7 +1665,26 @@ impl App {
 }
 /// Human-readable name of an override from its key (the last path element).
 fn override_label(key: &str) -> String {
-    format!("override {}", key.rsplit('\u{1f}').next().unwrap_or(key))
+    let mut parts = key.split('\u{1f}');
+    let (first, last) = (parts.next().unwrap_or(key), parts.last());
+    match last {
+        Some(name) if DEP_FIELDS.contains(&first) => format!("version range of {name}"),
+        _ => format!("override {}", last.unwrap_or(first)),
+    }
+}
+const DEP_FIELDS: [&str; 3] = ["dependencies", "devDependencies", "optionalDependencies"];
+/// The version prefix that follows `prefix` when cycling: ^ → ~ → exact → ^ (>= goes to ^).
+fn next_prefix(prefix: &str) -> &'static str {
+    match prefix {
+        "^" => "~",
+        "~" => "",
+        _ => "^",
+    }
+}
+/// `spec` with its range type changed to the next one, if it is a plain version or range.
+fn cycled_spec(spec: &str) -> Option<String> {
+    let (prefix, v) = parse_spec(spec)?;
+    Some(format!("{}{v}", next_prefix(prefix)))
 }
 
 /// Identity of a list item that survives index changes.
@@ -1628,6 +1784,16 @@ mod tests {
             loc: vec!["overrides".into(), key.into()],
         }
     }
+    #[test]
+    fn range_type_cycles_and_keeps_the_version() {
+        assert_eq!(cycled_spec("^1.2.3").as_deref(), Some("~1.2.3"));
+        assert_eq!(cycled_spec("~1.2.3").as_deref(), Some("1.2.3"));
+        assert_eq!(cycled_spec("1.2.3").as_deref(), Some("^1.2.3"));
+        assert_eq!(cycled_spec(">=1.2.3").as_deref(), Some("^1.2.3"));
+        assert_eq!(cycled_spec("latest"), None);
+        assert_eq!(cycled_spec("workspace:*"), None);
+    }
+
     #[test]
     fn override_base_is_the_lowest_literal_version() {
         let all = [
