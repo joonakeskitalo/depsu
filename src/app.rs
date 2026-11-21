@@ -204,6 +204,12 @@ pub struct App {
     /// Waiting for the user to choose the pin type for the packages `P` was pressed on.
     pub pin_prompt: bool,
     pub log: Vec<String>,
+    /// The log is expanded to fill the screen and takes the keys (toggled with Tab).
+    pub log_focus: bool,
+    /// Lines scrolled up from the newest log line.
+    pub log_scroll: usize,
+    /// Visible log lines while expanded, set by the renderer, used for paging.
+    pub log_page: usize,
     pub pending: usize,
     pub total: usize,
     pub registry: String,
@@ -337,6 +343,9 @@ impl App {
             filter_mode: false,
             pin_prompt: false,
             log: Vec::new(),
+            log_focus: false,
+            log_scroll: 0,
+            log_page: 10,
             pending: total,
             total,
             registry,
@@ -863,6 +872,14 @@ impl App {
             }
             return;
         }
+        if key.code == KeyCode::Tab {
+            self.log_focus = !self.log_focus;
+            return;
+        }
+        if self.log_focus {
+            self.on_log_key(key);
+            return;
+        }
         if !matches!(key.code, KeyCode::Char('q') | KeyCode::Esc) {
             self.quit_warned = false;
         }
@@ -939,6 +956,23 @@ impl App {
         }
     }
 
+    fn on_log_key(&mut self, key: KeyEvent) {
+        let max = self.log.len().saturating_sub(1);
+        let page = self.log_page.max(1);
+        match key.code {
+            KeyCode::Esc => self.log_focus = false,
+            KeyCode::Char('q') => self.quit = true,
+            KeyCode::Up | KeyCode::Char('k') => self.log_scroll = (self.log_scroll + 1).min(max),
+            KeyCode::Down | KeyCode::Char('j') => {
+                self.log_scroll = self.log_scroll.saturating_sub(1)
+            }
+            KeyCode::PageUp => self.log_scroll = (self.log_scroll + page).min(max),
+            KeyCode::PageDown => self.log_scroll = self.log_scroll.saturating_sub(page),
+            KeyCode::Home | KeyCode::Char('g') => self.log_scroll = max,
+            KeyCode::End | KeyCode::Char('G') => self.log_scroll = 0,
+            _ => {}
+        }
+    }
     fn on_filter_key(&mut self, key: KeyEvent) {
         match key.code {
             KeyCode::Esc => {

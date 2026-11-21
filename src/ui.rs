@@ -12,8 +12,61 @@ use ratatui::style::{Color, Modifier, Style, Stylize};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph};
 
+fn log_line(l: &str) -> Line<'static> {
+    let color = match l.chars().next() {
+        Some('✘') | Some('!') => Color::Red,
+        Some('⚠') => Color::Yellow,
+        Some('✔') => Color::Green,
+        _ => Color::Gray,
+    };
+    Line::from(Span::styled(l.to_string(), Style::new().fg(color)))
+}
+/// The expanded, scrollable log that replaces the package list.
+fn draw_log(f: &mut Frame, app: &mut App) {
+    let [header, body, help] = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Min(3),
+        Constraint::Length(1),
+    ])
+    .areas(f.area());
+    let h = (body.height as usize).saturating_sub(1).max(1);
+    app.log_page = h;
+    app.log_scroll = app.log_scroll.min(app.log.len().saturating_sub(h));
+    let end = app.log.len() - app.log_scroll;
+    let start = end.saturating_sub(h);
+    let lines: Vec<Line> = app.log[start..end].iter().map(|l| log_line(l)).collect();
+    let title = if app.log_scroll > 0 {
+        format!("log (↑{} older)", app.log_scroll)
+    } else {
+        "log".to_string()
+    };
+    f.render_widget(
+        Line::from(vec![
+            format!(" depsu {} ", env!("CARGO_PKG_VERSION"))
+                .black()
+                .on_cyan()
+                .bold(),
+            " log".into(),
+        ]),
+        header,
+    );
+    f.render_widget(
+        Paragraph::new(lines).block(Block::default().borders(Borders::TOP).title(title)),
+        body,
+    );
+    f.render_widget(
+        Line::from(
+            " ↑/↓ scroll   PgUp/PgDn page   Home/End oldest/newest   tab or esc back to list   q quit"
+                .dark_gray(),
+        ),
+        help,
+    );
+}
 pub fn draw(f: &mut Frame, app: &mut App) {
     let log_h = 7.min(app.log.len() as u16 + 2).max(3);
+    if app.log_focus {
+        return draw_log(f, app);
+    }
     // While the nested override lists are hidden, a text summary takes their place.
     let summary_h = if app.show_overrides == Overrides::Off {
         SUMMARY_LINES
@@ -130,15 +183,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         .rev()
         .take(log_h as usize - 2)
         .rev()
-        .map(|l| {
-            let color = match l.chars().next() {
-                Some('✘') | Some('!') => Color::Red,
-                Some('⚠') => Color::Yellow,
-                Some('✔') => Color::Green,
-                _ => Color::Gray,
-            };
-            Line::from(Span::styled(l.clone(), Style::new().fg(color)))
-        })
+        .map(|l| log_line(l))
         .collect();
     f.render_widget(
         Paragraph::new(lines).block(Block::default().borders(Borders::TOP).title("log")),
@@ -195,7 +240,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         ])
     } else {
         Line::from(
-            format!(" ↑/↓ move   space select   a all   i install   / filter   g group   o overrides   u up-to-date   s snyk{audit_hint}{remove_hint}   q quit")
+            format!(" ↑/↓ move   space select   a all   i install   / filter   g group   o overrides   u up-to-date   s snyk{audit_hint}{remove_hint}   tab log   q quit")
                 .dark_gray(),
         )
     };
