@@ -2,6 +2,7 @@ mod app;
 mod audit;
 mod bunfig;
 mod edit;
+mod export;
 mod npmrc;
 mod overrides;
 mod package;

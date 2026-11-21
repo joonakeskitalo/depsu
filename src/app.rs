@@ -383,6 +383,14 @@ impl App {
         !self.busy_overrides.is_empty() || self.rows.iter().any(Row::busy)
     }
 
+    /// Name of the project directory (the repository name).
+    pub fn project_name(&self) -> String {
+        self.dir
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| self.dir.display().to_string())
+    }
+
     pub fn push_log(&mut self, msg: impl Into<String>) {
         self.log.push(msg.into());
         if self.log.len() > 200 {
@@ -948,6 +956,16 @@ impl App {
             KeyCode::Char('n') => self.start_scan(self.audit_source()),
             KeyCode::Char('f') => self.fix_selected(Source::Snyk),
             KeyCode::Char('F') => self.fix_selected(self.audit_source()),
+            KeyCode::Char('y') => {
+                let md = crate::export::markdown(self);
+                match crate::export::copy(&md) {
+                    Ok(()) => self.push_log(format!(
+                        "✔ copied Markdown report to clipboard ({} lines)",
+                        md.lines().count()
+                    )),
+                    Err(e) => self.push_log(format!("✘ copy failed: {e}")),
+                }
+            }
             KeyCode::Char('v') => {
                 self.show_vulns = !self.show_vulns;
                 self.rebuild_view();

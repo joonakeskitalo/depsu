@@ -240,7 +240,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         ])
     } else {
         Line::from(
-            format!(" ↑/↓ move   space select   a all   i install   / filter   g group   o overrides   u up-to-date   s snyk{audit_hint}{remove_hint}   tab log   q quit")
+            format!(" ↑/↓ move   space select   a all   i install   / filter   g group   o overrides   u up-to-date   s snyk{audit_hint}{remove_hint}   y copy md   tab log   q quit")
                 .dark_gray(),
         )
     };
