@@ -6,10 +6,10 @@ use crate::tree::{self, Hit};
 use crate::view::{Child, GroupBy, Item, Overrides, Release, UNNEEDED};
 use crate::vuln::{Severity, Source};
 use ratatui::Frame;
-use ratatui::layout::{Constraint, Layout};
+use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style, Stylize};
 use ratatui::text::{Line, Span, Text};
-use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph};
+use ratatui::widgets::{Block, BorderType, Borders, Clear, List, ListItem, Paragraph};
 
 fn log_line(l: &str) -> Line<'static> {
     let color = match l.chars().next() {
@@ -204,6 +204,100 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     );
 
     f.render_widget(Paragraph::new(footer), help);
+    if let Some(p) = &app.peer_prompt {
+        draw_peer_prompt(f, p);
+    }
+}
+
+/// The question about other packages an install needs changed, in a box in the middle of the
+/// screen.
+fn draw_peer_prompt(f: &mut Frame, p: &crate::app::PeerPrompt) {
+    let area = f.area();
+    let width = area.width.saturating_sub(4).min(90);
+    // Inside the border and one column of padding on each side.
+    let inner = (width as usize).saturating_sub(4);
+    let dim = Style::new().fg(Color::DarkGray);
+    let list = |v: &[(String, semver::Version)]| {
+        v.iter()
+            .map(|(n, ver)| format!("{n} {ver}"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    lines.extend(wrap(
+        Span::raw(""),
+        Span::raw(""),
+        vec![Span::raw(format!(
+            "Installing {} needs other packages to change:",
+            list(&p.plan)
+        ))],
+        inner,
+    ));
+    lines.push(Line::default());
+    for (n, fixable) in &p.needs {
+        let head = match (&n.to, fixable) {
+            (Some(to), true) => vec![
+                Span::styled(n.name.clone(), Style::new().add_modifier(Modifier::BOLD)),
+                Span::raw(format!(" {} → ", n.from)),
+                Span::styled(to.to_string(), Style::new().fg(Color::Green)),
+            ],
+            _ => vec![
+                Span::styled(
+                    format!("! {} {}", n.name, n.from),
+                    Style::new().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(": depsu can't update it to a version that fits", Style::new().fg(Color::Yellow)),
+            ],
+        };
+        lines.extend(wrap(Span::raw("  "), Span::raw("    "), head, inner));
+        lines.extend(wrap(
+            Span::raw("    "),
+            Span::raw("    "),
+            vec![Span::styled(n.why.clone(), dim)],
+            inner,
+        ));
+    }
+    lines.push(Line::default());
+    let key = |k: &str, text: String| {
+        vec![
+            Span::styled(format!("{k:<3}"), Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+            Span::raw(text),
+        ]
+    };
+    let mut keys = Vec::new();
+    if p.extra.is_empty() {
+        keys.push(key("y", "install anyway".to_string()));
+    } else {
+        keys.push(key("y", format!("also update {}", list(&p.extra))));
+        keys.push(key("n", format!("install only {}", list(&p.plan))));
+    }
+    keys.push(vec![Span::styled("any other key cancels", dim)]);
+    for k in keys {
+        lines.extend(wrap(Span::raw(""), Span::raw("   "), k, inner));
+    }
+
+    let height = (lines.len() as u16 + 4).min(area.height);
+    let rect = Rect {
+        x: area.x + (area.width.saturating_sub(width)) / 2,
+        y: area.y + (area.height.saturating_sub(height)) / 2,
+        width,
+        height,
+    };
+    f.render_widget(Clear, rect);
+    f.render_widget(
+        Paragraph::new(lines).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
+                .border_style(Style::new().fg(Color::Cyan))
+                .title(Span::styled(
+                    " Other packages must change ",
+                    Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                ))
+                .padding(ratatui::widgets::Padding::uniform(1)),
+        ),
+        rect,
+    );
 }
 
 fn header_lines(app: &App, width: u16) -> Vec<Line<'static>> {
@@ -306,30 +400,10 @@ fn wrap_hints(
 
 fn footer_lines(app: &App, width: u16) -> Vec<Line<'static>> {
     let hint = |t: &str| vec![t.to_string().dark_gray()];
-    if let Some(p) = &app.peer_prompt {
-        let opt = |k: &str, d: String| vec![k.to_string().bold(), d.into()];
-        let list = |v: &[(String, semver::Version)]| {
-            v.iter()
-                .map(|(n, ver)| format!("{n} → {ver}"))
-                .collect::<Vec<_>>()
-                .join(", ")
-        };
-        let mut atoms = Vec::new();
-        if p.extra.is_empty() {
-            atoms.push(opt("y", " install anyway".to_string()));
-        } else {
-            atoms.push(opt("y", format!(" also update {}", list(&p.extra))));
-            atoms.push(opt("n", format!(" install only {}", list(&p.plan))));
-        }
-        if !p.unresolved.is_empty() {
-            atoms.push(vec![
-                format!("can't fix: {} (see log)", p.unresolved.join(", ")).yellow(),
-            ]);
-        }
-        atoms.push(hint("any other key cancels"));
+    if app.peer_prompt.is_some() {
         return wrap_hints(
-            vec!["Other packages must change:".cyan().bold()],
-            atoms,
+            vec!["Answer the dialog above:".cyan().bold()],
+            vec![hint("y"), hint("n"), hint("any other key cancels")],
             "   ",
             width,
         );

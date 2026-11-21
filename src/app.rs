@@ -102,8 +102,8 @@ pub struct PeerPrompt {
     ovr: Vec<(Override, String)>,
     /// The other packages that can be updated so that everything fits.
     pub extra: Vec<(String, Version)>,
-    /// Packages that have to change but depsu can't update.
-    pub unresolved: Vec<String>,
+    /// Every package that has to change, and whether depsu can update it.
+    pub needs: Vec<(peers::Need, bool)>,
 }
 pub struct Row {
     pub name: String,
@@ -2077,7 +2077,7 @@ impl App {
             return;
         }
         let mut extra = Vec::new();
-        let mut unresolved = Vec::new();
+        let mut needs = Vec::new();
         let what: Vec<String> = plan.iter().map(|(n, v)| format!("{n}@{v}")).collect();
         let mut lines = vec![format!(
             "⚠ Installing {} needs other packages to change:",
@@ -2088,6 +2088,7 @@ impl App {
                 .rows
                 .iter()
                 .any(|r| r.name == n.name && r.kind != Kind::Override && !r.busy());
+            needs.push((n.clone(), updatable && n.to.is_some()));
             match &n.to {
                 Some(to) if updatable => {
                     lines.push(format!("  {} {} → {to}: {}", n.name, n.from, n.why));
@@ -2098,7 +2099,6 @@ impl App {
                         "  ! {} {}: no version depsu can install fits: {}",
                         n.name, n.from, n.why
                     ));
-                    unresolved.push(n.name.clone());
                 }
             }
         }
@@ -2112,7 +2112,7 @@ impl App {
             plan,
             ovr,
             extra,
-            unresolved,
+            needs,
         });
     }
 
@@ -3270,7 +3270,8 @@ mod tests {
         app.on_peer_check(plan_a(), Vec::new(), report);
         let p = app.peer_prompt.as_ref().unwrap();
         assert!(p.extra.is_empty());
-        assert_eq!(p.unresolved, ["b"]);
+        assert_eq!(p.needs.len(), 1);
+        assert!(!p.needs[0].1, "b can't be updated by depsu");
         // `n` means nothing here: there's nothing to leave out.
         app.on_key(key('n'));
         assert!(queued(&rx).is_empty());
@@ -3281,6 +3282,46 @@ mod tests {
         });
         app.on_key(key('y'));
         assert_eq!(queued(&rx), ["a@^2.0.0"], "y installs anyway");
+    }
+
+    /// The screen as text, one string per row.
+    fn render(app: &mut App, w: u16, h: u16) -> Vec<String> {
+        let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(w, h)).unwrap();
+        term.draw(|f| crate::ui::draw(f, app)).unwrap();
+        let buf = term.backend().buffer().clone();
+        (0..h)
+            .map(|y| (0..w).map(|x| buf[(x, y)].symbol().to_string()).collect())
+            .collect()
+    }
+
+    #[test]
+    fn the_question_is_shown_as_a_box_in_the_middle_of_the_screen() {
+        let (mut app, _rx) = app_capturing_installs();
+        app.on_peer_check(plan_a(), Vec::new(), needs_b());
+        let screen = render(&mut app, 100, 40);
+        let top = screen
+            .iter()
+            .position(|l| l.contains(" Other packages must change "))
+            .expect("the dialog is drawn");
+        let bottom = screen[top + 1..]
+            .iter()
+            .position(|l| l.contains('╰'))
+            .map(|i| top + 1 + i)
+            .expect("the dialog is closed");
+        // Centred vertically (to a row) and horizontally.
+        assert!((top as i32 - (40 - 1 - bottom) as i32).abs() <= 1, "top {top}, bottom {bottom}");
+        let left = screen[top].find('╭').unwrap();
+        let right = 100 - 1 - screen[top].chars().position(|c| c == '╮').unwrap();
+        assert!((left as i32 - right as i32).abs() <= 1, "left {left}, right {right}");
+        let body = screen[top..=bottom].join("\n");
+        assert!(body.contains("Installing a 2.0.0 needs other packages to change"));
+        assert!(body.contains("b 1.0.0 → 2.0.0"));
+        assert!(body.contains("a@2.0.0 needs b ^2.0.0"));
+        assert!(body.contains("y  also update b 2.0.0"));
+        assert!(body.contains("n  install only a 2.0.0"));
+        // Once answered, it's gone.
+        app.on_key(key('x'));
+        assert!(!render(&mut app, 100, 40).iter().any(|l| l.contains("Other packages must change")));
     }
 
     #[test]
