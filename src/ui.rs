@@ -71,7 +71,13 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         }
     }
     f.render_widget(
-        Line::from(vec![" depsu ".black().on_cyan().bold(), info.into()]),
+        Line::from(vec![
+            format!(" depsu {} ", env!("CARGO_PKG_VERSION"))
+                .black()
+                .on_cyan()
+                .bold(),
+            info.into(),
+        ]),
         header,
     );
 
