@@ -84,7 +84,7 @@ depsu --cache .depsu-cache.json   # remember versions and scans between runs
 | `n` | Run `npm audit` / `bun audit` (whichever the project uses) |
 | `v` | Show / hide vulnerability findings |
 | `R` | Fetch the latest versions again, ignoring the cache |
-| `?` | Show / hide the details panel for the highlighted package: installed packages that use it and its override summary |
+| `?` | Show / hide the details panel for the highlighted package: installed packages that use it, its peer dependencies with the versions installed, and its override summary. A package with an installed peer outside the range it declares is flagged in the list with `⚠ unmet peer: react ^18.0.0 (has 19.0.0)` |
 | `q` / `Esc` | Quit (press twice while an install is running) |
 
 `a` and `i` act only on the packages currently shown, so a filter narrows what they touch.

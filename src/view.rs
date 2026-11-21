@@ -305,6 +305,7 @@ mod tests {
             audit_fix: None,
             changed_from: None,
             unscanned: Vec::new(),
+            peers: Vec::new(),
             loading: false,
             latest_failed: false,
             installed: None,

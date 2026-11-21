@@ -107,7 +107,9 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     let footer = footer_lines(app, inner_width(f));
     let header_lines = header_lines(app, f.area().width);
     let used_by_lines = if app.show_info {
-        used_by_lines(app, inner_width(f))
+        let mut lines = used_by_lines(app, inner_width(f));
+        lines.extend(peer_lines(app, inner_width(f)));
+        lines
     } else {
         Vec::new()
     };
@@ -742,6 +744,30 @@ fn row_line(app: &App, r: &AppRow, indent: usize, name_w: usize, width: usize) -
         };
         spans.push(Span::styled(text, Style::new().fg(Color::Cyan)));
     }
+    // Peers are listed in the details panel; the list only flags the ones that don't fit.
+    let unmet: Vec<String> = r
+        .peers
+        .iter()
+        .filter(|p| p.met() == Some(false))
+        .map(|p| {
+            let have = p.installed.as_ref().map(|v| v.to_string()).unwrap_or_default();
+            format!("{} {} (has {have})", p.name, p.range)
+        })
+        .collect();
+    if !unmet.is_empty() {
+        let used: usize = spans.iter().map(|s| s.width()).sum();
+        let s = if unmet.len() == 1 { "" } else { "s" };
+        let full = format!("   ⚠ unmet peer{s}: {}", unmet.join(", "));
+        let text = if used + full.chars().count() < width {
+            full
+        } else {
+            format!("   ⚠ {} unmet peer{s}", unmet.len())
+        };
+        spans.push(Span::styled(
+            text,
+            Style::new().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+        ));
+    }
     let line = Line::from(spans);
     if r.busy() || !r.outdated {
         line.style(Style::new().add_modifier(Modifier::DIM))
@@ -1220,6 +1246,46 @@ fn used_by_lines(app: &App, width: u16) -> Vec<Line<'static>> {
     }
     lines
 }
+/// For the package under the cursor: the peer dependencies its installed copy declares, and
+/// the version of each the project has.
+fn peer_lines(app: &App, width: u16) -> Vec<Line<'static>> {
+    let Some(Item::Row { idx, .. }) = app.cursor_item() else {
+        return Vec::new();
+    };
+    let peers = &app.rows[*idx].peers;
+    if peers.is_empty() {
+        return Vec::new();
+    }
+    let (cyan, yellow) = (Style::new().fg(Color::Cyan), Style::new().fg(Color::Yellow));
+    let label = format!(
+        "{} peer dependenc{}: ",
+        peers.len(),
+        if peers.len() == 1 { "y" } else { "ies" }
+    );
+    let mut atoms: Vec<Vec<Span<'static>>> = peers
+        .iter()
+        .map(|p| {
+            vec![match (p.met(), &p.installed) {
+                (Some(false), Some(have)) => Span::styled(
+                    format!("{} {}, but {have} is installed", p.name, p.range),
+                    yellow,
+                ),
+                (_, Some(have)) => Span::styled(format!("{} {} ({have})", p.name, p.range), cyan),
+                (_, None) => Span::styled(format!("{} {} (not installed)", p.name, p.range), cyan),
+            }]
+        })
+        .collect();
+    atoms[0].insert(0, Span::styled(label, cyan));
+    let mut lines = wrap_hints(Vec::new(), atoms, ", ", width);
+    if lines.len() > MAX_USED_BY_LINES {
+        lines.truncate(MAX_USED_BY_LINES);
+        if let Some(last) = lines.last_mut() {
+            last.spans.push(Span::styled(" …", Style::new().fg(Color::DarkGray)));
+        }
+    }
+    lines
+}
+
 /// Most lines the list of dependents takes in the selected section.
 const MAX_USED_BY_LINES: usize = 4;
 

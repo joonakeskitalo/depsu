@@ -101,6 +101,43 @@ pub enum VersionRange {
     /// Anything newer (>=).
     AtLeast,
 }
+/// A peer dependency an installed package declares.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Peer {
+    pub name: String,
+    pub range: String,
+    /// The version of the peer the project has, `None` if it isn't installed.
+    pub installed: Option<Version>,
+}
+
+impl Peer {
+    /// `Some(false)` when the installed peer is outside the range. `None` when the peer isn't
+    /// installed (it may be optional) or the range can't be read.
+    pub fn met(&self) -> Option<bool> {
+        overrides::satisfies(&self.range, self.installed.as_ref()?)
+    }
+}
+
+/// The peer dependencies the installed copy of `name` declares, with the version of each the
+/// project has.
+fn peers_of(
+    dir: &std::path::Path,
+    lock: Option<&HashMap<String, Version>>,
+    name: &str,
+) -> Vec<Peer> {
+    let mut peers: Vec<Peer> = crate::tree::installed_peers(dir, name)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(peer, range)| Peer {
+            installed: resolved_version(dir, lock, &peer),
+            name: peer,
+            range,
+        })
+        .collect();
+    peers.sort_by(|a, b| a.name.cmp(&b.name));
+    peers
+}
+
 /// A package uninstalled in this session, kept so it can be restored.
 pub struct RemovedPkg {
     pub row: Row,
@@ -213,6 +250,8 @@ pub struct Row {
     /// they ran, or they ran in another session at another version). Their findings, or
     /// their absence, say nothing about this version.
     pub unscanned: Vec<Source>,
+    /// The peer dependencies its installed copy declares.
+    pub peers: Vec<Peer>,
     /// The latest version hasn't arrived from the registry yet.
     pub loading: bool,
     /// Looking up the latest version failed.
@@ -738,6 +777,7 @@ impl App {
         let lock = crate::tree::npm_lock_versions(&self.dir);
         for r in self.rows.iter_mut() {
             r.installed = resolved_version(&self.dir, lock.as_ref(), &r.name);
+            r.peers = peers_of(&self.dir, lock.as_ref(), &r.name);
         }
     }
 
@@ -877,6 +917,7 @@ impl App {
                 audit_fix: None,
                 changed_from: None,
                 unscanned: Vec::new(),
+                peers: Vec::new(),
                 loading: true,
                 latest_failed: false,
                 installed: None,
@@ -1044,6 +1085,7 @@ impl App {
             audit_fix: None,
             changed_from: None,
             unscanned: Vec::new(),
+            peers: Vec::new(),
             loading: false,
             latest_failed: false,
             installed: None,
@@ -1323,6 +1365,7 @@ impl App {
     fn insert_row(&mut self, mut row: Row) {
         let lock = crate::tree::npm_lock_versions(&self.dir);
         row.installed = resolved_version(&self.dir, lock.as_ref(), &row.name);
+        row.peers = peers_of(&self.dir, lock.as_ref(), &row.name);
         // Keep rows sorted by (kind, name) so late arrivals don't shuffle randomly.
         let key = |r: &Row| (r.kind.label(), r.name.clone());
         let pos = self.rows.partition_point(|r| key(r) < key(&row));
@@ -4541,6 +4584,65 @@ mod tests {
         assert!(md.contains("## Packages\n"));
         assert!(!md.contains("with vulnerabilities") && !md.contains("Other packages"));
         assert!(md.contains("| a | dep |") && md.contains("| b | dep |"));
+    }
+
+    /// `a` declares peers `react ^18.0.0` (not installed) and `b ^2.0.0` (1.0.0 is).
+    fn app_with_peers() -> App {
+        let mut app = app_with_cache("1.0.0", |_| {});
+        let dir = app.dir.join("node_modules").join("a");
+        std::fs::write(
+            dir.join("package.json"),
+            r#"{"name":"a","version":"1.0.0","peerDependencies":{"react":"^18.0.0","b":"^2.0.0"}}"#,
+        )
+        .unwrap();
+        app.read_installed_versions();
+        app
+    }
+
+    #[test]
+    fn a_package_knows_its_peers_and_whether_they_fit() {
+        let app = app_with_peers();
+        let peers = &row(&app, "a").peers;
+        assert_eq!(peers.len(), 2);
+        assert_eq!((peers[0].name.as_str(), peers[0].range.as_str()), ("b", "^2.0.0"));
+        assert_eq!(peers[0].installed, Some(Version::new(1, 0, 0)));
+        assert_eq!(peers[0].met(), Some(false));
+        assert_eq!(peers[1].name, "react");
+        assert_eq!(peers[1].met(), None, "not installed");
+        assert!(row(&app, "b").peers.is_empty());
+    }
+
+    #[test]
+    fn the_list_flags_only_unmet_peers() {
+        let mut app = app_with_peers();
+        let (line, colour) = line_and_colour(&mut app, "unmet", "⚠");
+        assert!(line.contains("⚠ unmet peer: b ^2.0.0 (has 1.0.0)"), "{line}");
+        assert_eq!(colour, Some(ratatui::style::Color::Yellow));
+        // The peer that isn't installed, and peers that fit, stay out of the list.
+        let screen = render(&mut app, 200, 30).join("\n");
+        assert!(!screen.contains("react ^18"), "{screen}");
+        assert_eq!(screen.matches("unmet").count(), 1, "only a has an unmet peer");
+
+        // Too narrow for the details: just the count.
+        let screen = render(&mut app, 80, 20).join("\n");
+        assert!(screen.contains("⚠ 1 unmet peer"), "{screen}");
+        assert!(!screen.contains("(has 1.0.0)"), "{screen}");
+
+        // Once the peer fits, the warning is gone.
+        install(&app.dir.clone(), "b", "2.0.0");
+        app.read_installed_versions();
+        assert!(!render(&mut app, 200, 30).join("\n").contains("unmet"));
+    }
+
+    #[test]
+    fn the_details_panel_lists_the_peers_with_their_versions() {
+        let mut app = app_with_peers();
+        app.on_key(key('?'));
+        let screen = render(&mut app, 200, 40).join("\n");
+        assert!(
+            screen.contains("2 peer dependencies: b ^2.0.0, but 1.0.0 is installed, react ^18.0.0 (not installed)"),
+            "{screen}"
+        );
     }
 
     #[test]
