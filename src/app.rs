@@ -9,7 +9,7 @@ use crate::pm::Pm;
 use crate::registry;
 use crate::snyk;
 use crate::tree::{Analyzer, Hit};
-use crate::view::{self, Child, GroupBy, Item, Overrides, REMOVED, Release, UNNEEDED};
+use crate::view::{self, Child, GroupBy, Item, Overrides, REMOVED, Release, UNNEEDED, VulnView};
 use crate::vuln::{Report, Severity, Source, Vuln};
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::widgets::ListState;
@@ -207,7 +207,7 @@ pub struct App {
     pub table: ListState,
     pub show_overrides: Overrides,
     pub show_uptodate: bool,
-    pub show_vulns: bool,
+    pub vuln_view: VulnView,
     pub snyk: Scan,
     pub audit: Scan,
     pub view: Vec<Item>,
@@ -353,7 +353,7 @@ impl App {
             table: ListState::default(),
             show_overrides: Overrides::Off,
             show_uptodate: true,
-            show_vulns: true,
+            vuln_view: VulnView::All,
             snyk: Scan::default(),
             audit: Scan::default(),
             view: Vec::new(),
@@ -795,7 +795,7 @@ impl App {
             &self.filter,
             self.show_overrides,
             self.show_uptodate,
-            self.show_vulns,
+            self.vuln_view,
         );
         self.append_unneeded_section();
         self.append_removed_section();
@@ -1065,6 +1065,7 @@ impl App {
         global.push("/ filter".into());
         global.push("g group".into());
         global.push("o overrides".into());
+        global.push(format!("v vulns: {}", self.vuln_view.label()));
         global.push("s snyk".into());
         if let Some(src) = audit::source_for(self.pm) {
             global.push(format!("n {}", src.label()));
@@ -1226,7 +1227,7 @@ impl App {
                 }
             }
             KeyCode::Char('v') => {
-                self.show_vulns = !self.show_vulns;
+                self.vuln_view = self.vuln_view.next();
                 self.rebuild_view();
             }
             _ => {}

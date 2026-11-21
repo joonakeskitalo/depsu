@@ -111,6 +111,9 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     if app.group_by != GroupBy::None {
         info.push_str(&format!(" · group: {}", app.group_by.label()));
     }
+    if app.vuln_view != crate::view::VulnView::All {
+        info.push_str(&format!(" · vulns: {}", app.vuln_view.label()));
+    }
     if app.show_overrides != Overrides::Off {
         info.push_str(&format!(" · overrides: {}", app.show_overrides.label()));
     }
