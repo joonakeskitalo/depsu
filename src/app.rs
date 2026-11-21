@@ -1065,7 +1065,6 @@ impl App {
         global.push("/ filter".into());
         global.push("g group".into());
         global.push("o overrides".into());
-        global.push("u up-to-date".into());
         global.push("s snyk".into());
         if let Some(src) = audit::source_for(self.pm) {
             global.push(format!("n {}", src.label()));
@@ -1181,10 +1180,6 @@ impl App {
             KeyCode::Char('/') => self.filter_mode = true,
             KeyCode::Char('o') => {
                 self.show_overrides = self.show_overrides.next();
-                self.rebuild_view();
-            }
-            KeyCode::Char('u') => {
-                self.show_uptodate = !self.show_uptodate;
                 self.rebuild_view();
             }
             KeyCode::Char('g') => {

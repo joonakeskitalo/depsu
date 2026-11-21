@@ -72,7 +72,6 @@ depsu --pm pnpm       # skip detection
 | `i` / `Enter` | Install the selected packages, or the highlighted one |
 | `/` | Filter by name. `Enter` keeps the filter, `Esc` clears it |
 | `g` | Group by: none → release type → name prefix → dependency type |
-| `u` | Show / hide up-to-date packages |
 | `o` | Overrides: hidden → compact → full |
 | `x` | Remove the selected or highlighted overrides, flagged `✂` or not (press twice to confirm) |
 | `P` | Choose how the selected or highlighted packages are pinned: exact (`e`), caret `^` (`c`), tilde `~` (`t`) or at least `>=` (`m`). Letters are used because `^` and `~` are dead keys on Nordic keyboards. The version stays, `package.json` is edited and the install runs |
