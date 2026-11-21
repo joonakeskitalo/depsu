@@ -58,7 +58,7 @@ fn draw_log(f: &mut Frame, app: &mut App) {
                 .black()
                 .on_cyan()
                 .bold(),
-            " log".into(),
+            format!(" {} · log", app.project_name()).into(),
         ]),
         header,
     );
@@ -102,7 +102,13 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     if outdated_total > 0 && app.shown_up_to_date() > 0 {
         state.push_str(&format!(" · {} up to date", app.shown_up_to_date()));
     }
-    let mut info = format!(" {} · {} · {}", app.pm.name(), app.registry, state);
+    let mut info = format!(
+        " {} · {} · {} · {}",
+        app.project_name(),
+        app.pm.name(),
+        app.registry,
+        state
+    );
     if app.group_by != GroupBy::None {
         info.push_str(&format!(" · group: {}", app.group_by.label()));
     }
