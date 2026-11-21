@@ -5308,6 +5308,64 @@ mod tests {
         assert!(!row(&app, "b").selected && app.selected_overrides.is_empty());
     }
 
+    /// The rows of the dialog box on `screen`: from its top border to its bottom border.
+    fn dialog_rows(screen: &[String], title: &str) -> Vec<String> {
+        let top = screen.iter().position(|l| l.contains(title)).expect("dialog drawn");
+        let bottom = top
+            + screen[top..]
+                .iter()
+                .position(|l| l.contains('╰'))
+                .expect("the dialog's bottom border is on the screen");
+        screen[top..=bottom].to_vec()
+    }
+
+    #[test]
+    fn a_long_delete_list_fits_the_dialog() {
+        let (mut app, _rx) = app_capturing_installs();
+        // 30 packages with long names, each used by another installed package.
+        let names: Vec<String> = (0..30).map(|i| format!("@some-long-scope/package-number-{i:02}")).collect();
+        for n in &names {
+            app.dependents.insert(
+                n.clone(),
+                vec![crate::tree::Dependent {
+                    name: format!("{n}-consumer"),
+                    version: None,
+                    range: "^1.0.0".into(),
+                    direct: n.clone(),
+                }],
+            );
+        }
+        let overrides: Vec<Override> = (0..8).map(|i| ovr(&format!("o{i}"), "1.0.0", &format!("o{i}"))).collect();
+        app.delete_prompt = Some(DeletePrompt {
+            packages: names.clone(),
+            overrides,
+            warnings: names
+                .iter()
+                .map(|n| format!("{n} is used by {n}-consumer: they may stop working without it"))
+                .collect(),
+        });
+        for (w, h) in [(100u16, 30u16), (60, 24), (120, 50)] {
+            let screen = render(&mut app, w, h);
+            let rows = dialog_rows(&screen, " Delete 38 items ");
+            let body = rows.join("\n");
+            assert!(body.contains("y / enter delete"), "{w}x{h}: the keys must stay visible\n{body}");
+            assert!(body.contains("Uninstall 30 packages:"), "{w}x{h}\n{body}");
+            assert!(body.contains("Remove 8 overrides from package.json:"), "{w}x{h}\n{body}");
+            assert!(body.contains("… and "), "{w}x{h}: the cut lists say how much is left\n{body}");
+            assert!(rows.len() <= h as usize, "{w}x{h}");
+            // Every row of the box is closed on both sides: no text runs past the border.
+            let top: Vec<char> = rows[0].chars().collect();
+            let left = top.iter().position(|&c| c == '╭').unwrap();
+            let right = top.iter().position(|&c| c == '╮').unwrap();
+            for r in &rows[1..rows.len() - 1] {
+                let c: Vec<char> = r.chars().collect();
+                assert!(c[left] == '│' && c[right] == '│', "{w}x{h}: {r:?}");
+            }
+            let bottom: Vec<char> = rows.last().unwrap().chars().collect();
+            assert!(bottom[left] == '╰' && bottom[right] == '╯', "{w}x{h}");
+        }
+    }
+
     #[test]
     fn any_other_key_keeps_everything() {
         let (mut app, rx) = app_to_delete_from();

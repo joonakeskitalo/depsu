@@ -305,30 +305,19 @@ fn draw_delete_prompt(f: &mut Frame, app: &App, p: &crate::app::DeletePrompt) {
     let inner = (width as usize).saturating_sub(4);
     let bold = Style::new().add_modifier(Modifier::BOLD);
     let red = Style::new().fg(Color::Red);
-    let mut lines: Vec<Line<'static>> = Vec::new();
-    // Long lists are cut so the dialog fits the screen.
-    let room = (f.area().height as usize).saturating_sub(16).max(3);
-    let list = |title: String, items: Vec<String>, lines: &mut Vec<Line<'static>>| {
-        if items.is_empty() {
-            return;
-        }
-        lines.push(Line::from(Span::styled(title, bold)));
-        let more = items.len().saturating_sub(room);
-        for it in items.into_iter().take(room) {
-            lines.extend(wrap(
-                Span::styled("  ✂ ", red),
-                Span::raw("    "),
-                vec![Span::raw(it)],
-                inner,
-            ));
-        }
-        if more > 0 {
-            lines.push(Line::from(Span::styled(
-                format!("    … and {more} more"),
-                Style::new().fg(Color::DarkGray),
-            )));
-        }
-        lines.push(Line::default());
+    let yellow = Style::new().fg(Color::Yellow);
+    let dim = Style::new().fg(Color::DarkGray);
+    let s = |n: usize| if n == 1 { "" } else { "s" };
+
+    // Each section: a title (if any), and its items already wrapped to the dialog's width.
+    struct Section {
+        title: Option<String>,
+        items: Vec<Vec<Line<'static>>>,
+        /// What the "… and N more" line counts.
+        noun: &'static str,
+    }
+    let item = |prefix: Span<'static>, text: String, style: Style| {
+        wrap(prefix, Span::raw("    "), vec![Span::styled(text, style)], inner)
     };
     let packages: Vec<String> = p
         .packages
@@ -338,27 +327,88 @@ fn draw_delete_prompt(f: &mut Frame, app: &App, p: &crate::app::DeletePrompt) {
             None => n.clone(),
         })
         .collect();
-    let s = |n: usize| if n == 1 { "" } else { "s" };
-    list(
-        format!("Uninstall {} package{}:", packages.len(), s(packages.len())),
-        packages,
-        &mut lines,
-    );
-    let overrides: Vec<String> = p.overrides.iter().map(|o| o.describe()).collect();
-    list(
-        format!("Remove {} override{} from package.json:", overrides.len(), s(overrides.len())),
-        overrides,
-        &mut lines,
-    );
-    for w in &p.warnings {
-        lines.extend(wrap(
-            Span::styled("⚠ ", Style::new().fg(Color::Yellow)),
-            Span::raw("  "),
-            vec![Span::styled(w.clone(), Style::new().fg(Color::Yellow))],
-            inner,
-        ));
+    let mut sections = vec![
+        Section {
+            title: Some(format!("Uninstall {} package{}:", packages.len(), s(packages.len()))),
+            items: packages
+                .into_iter()
+                .map(|t| item(Span::styled("  ✂ ", red), t, Style::new()))
+                .collect(),
+            noun: "",
+        },
+        Section {
+            title: Some(format!(
+                "Remove {} override{} from package.json:",
+                p.overrides.len(),
+                s(p.overrides.len())
+            )),
+            items: p
+                .overrides
+                .iter()
+                .map(|o| item(Span::styled("  ✂ ", red), o.describe(), Style::new()))
+                .collect(),
+            noun: "",
+        },
+        Section {
+            title: None,
+            items: p
+                .warnings
+                .iter()
+                .map(|w| {
+                    wrap(
+                        Span::styled("⚠ ", yellow),
+                        Span::raw("  "),
+                        vec![Span::styled(w.clone(), yellow)],
+                        inner,
+                    )
+                })
+                .collect(),
+            noun: " warnings",
+        },
+    ];
+    sections.retain(|sec| !sec.items.is_empty());
+
+    // Fit the screen: the border and padding take 4 rows, the keys line 1, and each section
+    // its title and a blank line after it. The longest section is shortened first; a
+    // shortened one ends with "… and N more".
+    let budget = (f.area().height as usize).saturating_sub(4);
+    let fixed: usize = 1 + sections
+        .iter()
+        .map(|sec| sec.title.is_some() as usize + 1)
+        .sum::<usize>();
+    let mut shown: Vec<usize> = sections.iter().map(|sec| sec.items.len()).collect();
+    let height = |shown: &[usize]| -> usize {
+        fixed
+            + sections
+                .iter()
+                .zip(shown)
+                .map(|(sec, &n)| {
+                    sec.items[..n].iter().map(Vec::len).sum::<usize>()
+                        + (n < sec.items.len()) as usize
+                })
+                .sum::<usize>()
+    };
+    while height(&shown) > budget {
+        // The section using the most rows gives one item up, keeping at least one.
+        let rows = |i: usize| sections[i].items[..shown[i]].iter().map(Vec::len).sum::<usize>();
+        let Some(i) = (0..sections.len()).filter(|&i| shown[i] > 1).max_by_key(|&i| rows(i)) else {
+            break;
+        };
+        shown[i] -= 1;
     }
-    if !p.warnings.is_empty() {
+
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    for (sec, n) in sections.into_iter().zip(shown) {
+        if let Some(t) = sec.title {
+            lines.push(Line::from(Span::styled(t, bold)));
+        }
+        let more = sec.items.len() - n;
+        for it in sec.items.into_iter().take(n) {
+            lines.extend(it);
+        }
+        if more > 0 {
+            lines.push(Line::from(Span::styled(format!("    … and {more} more{}", sec.noun), dim)));
+        }
         lines.push(Line::default());
     }
     lines.push(Line::from(vec![
@@ -366,7 +416,7 @@ fn draw_delete_prompt(f: &mut Frame, app: &App, p: &crate::app::DeletePrompt) {
         Span::raw(" / "),
         Span::styled("enter", Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
         Span::raw(" delete   "),
-        Span::styled("any other key cancels", Style::new().fg(Color::DarkGray)),
+        Span::styled("any other key cancels", dim),
     ]));
     let n = p.packages.len() + p.overrides.len();
     draw_dialog(f, &format!("Delete {n} item{}", s(n)), lines, width);
@@ -440,8 +490,17 @@ fn draw_peer_fix(f: &mut Frame, p: &crate::app::PeerFix) {
 }
 
 /// A box in the middle of the screen with `lines` and `title`, at most `max_width` wide.
-fn draw_dialog(f: &mut Frame, title: &str, lines: Vec<Line<'static>>, width: u16) {
+fn draw_dialog(f: &mut Frame, title: &str, mut lines: Vec<Line<'static>>, width: u16) {
     let area = f.area();
+    // Taller than the screen: cut the middle, keeping the last line, which says which keys
+    // to press.
+    let room = (area.height as usize).saturating_sub(4);
+    if lines.len() > room && room >= 2 {
+        let last = lines.pop().unwrap_or_default();
+        lines.truncate(room - 2);
+        lines.push(Line::from(Span::styled("…", Style::new().fg(Color::DarkGray))));
+        lines.push(last);
+    }
     let height = (lines.len() as u16 + 4).min(area.height);
     let rect = Rect {
         x: area.x + (area.width.saturating_sub(width)) / 2,
