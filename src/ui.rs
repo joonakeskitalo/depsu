@@ -249,7 +249,18 @@ fn draw_commit_dialog(f: &mut Frame, p: &crate::app::CommitPrompt) {
         ),
     ]));
     lines.push(Line::default());
-    lines.push(Line::from(Span::styled("Changes", bold)));
+    let body_kept = crate::commit::body_for(&p.plan, &p.title).is_some();
+    lines.push(Line::from(vec![
+        Span::styled("Changes", bold),
+        Span::styled(
+            if body_kept || p.plan.body.is_empty() {
+                ""
+            } else {
+                "   (the title says it all, so the commit gets no body)"
+            },
+            dim,
+        ),
+    ]));
     // The body, cut so the dialog fits the screen.
     let room = (f.area().height as usize).saturating_sub(22).max(3);
     let body: Vec<&str> = p.plan.body.lines().collect();

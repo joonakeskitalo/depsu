@@ -247,6 +247,9 @@ pub fn changes(
 pub struct Plan {
     pub title: String,
     pub body: String,
+    /// Each change as the title words it with versions (`eslint 8.57.0 to 9.0.0`), to tell
+    /// whether a title already says everything the body does.
+    pub items: Vec<String>,
     /// The files to commit, relative to the project directory.
     pub files: Vec<String>,
     pub branch: String,
@@ -368,21 +371,39 @@ pub fn prepare(dir: &Path, pm: Pm) -> Result<Plan, String> {
     Ok(Plan {
         title: title(&changes),
         body: body(&changes),
+        items: changes.iter().map(|c| c.parts().1).collect(),
         files: changed,
         branch,
         other_staged,
     })
 }
 
-/// Commits the plan's files with `title` and the plan's body. Returns the new commit's short
-/// hash.
+/// `item` appears in `title` as a whole: not as the end of a longer package name.
+fn mentions(title: &str, item: &str) -> bool {
+    title.match_indices(item).any(|(i, _)| {
+        let before = title[..i].chars().next_back();
+        let after = title[i + item.len()..].chars().next();
+        before.is_none_or(|c| c == ' ' || c == ',')
+            && after.is_none_or(|c| c == ' ' || c == ',' || c == ')')
+    })
+}
+
+/// The body to commit with `title`: none when the title already names every change with its
+/// versions, since the body would only repeat it.
+pub fn body_for<'a>(plan: &'a Plan, title: &str) -> Option<&'a str> {
+    let repeats = !plan.items.is_empty() && plan.items.iter().all(|i| mentions(title, i));
+    (!plan.body.is_empty() && !repeats).then_some(plan.body.as_str())
+}
+
+/// Commits the plan's files with `title`, and the plan's body unless the title already says
+/// it all. Returns the new commit's short hash.
 pub fn run(dir: &Path, plan: &Plan, title: &str) -> Result<String, String> {
     let mut add = vec!["add", "-A", "--"];
     add.extend(plan.files.iter().map(String::as_str));
     git(dir, &add)?;
     let mut commit = vec!["commit", "-m", title];
-    if !plan.body.is_empty() {
-        commit.extend(["-m", plan.body.as_str()]);
+    if let Some(body) = body_for(plan, title) {
+        commit.extend(["-m", body]);
     }
     // With paths, git commits only those files, whatever else is staged.
     commit.push("--");
@@ -526,6 +547,48 @@ mod tests {
         );
     }
 
+    fn plan_for(changes: &[Change]) -> Plan {
+        Plan {
+            title: title(changes),
+            body: body(changes),
+            items: changes.iter().map(|c| c.parts().1).collect(),
+            files: vec!["package.json".into()],
+            branch: "main".into(),
+            other_staged: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn the_body_is_left_out_when_the_title_already_says_it_all() {
+        // One change.
+        let p = plan_for(&[up("eslint", "8.57.0", "9.0.0")]);
+        assert_eq!(body_for(&p, &p.title), None);
+        // Two, both with versions in the title.
+        let p = plan_for(&[up("eslint", "8.57.0", "9.0.0"), up("prettier", "3.2.0", "3.3.3")]);
+        assert_eq!(p.title, "chore: upgrade eslint 8.57.0 to 9.0.0 and prettier 3.2.0 to 3.3.3");
+        assert_eq!(body_for(&p, &p.title), None);
+        // Another type or a scope doesn't matter, only the changes do.
+        assert_eq!(body_for(&p, "fix(deps): upgrade eslint 8.57.0 to 9.0.0 and prettier 3.2.0 to 3.3.3"), None);
+    }
+
+    #[test]
+    fn the_body_stays_when_it_says_more_than_the_title() {
+        // A title with names only.
+        let many: Vec<Change> = ["eslint", "prettier", "typescript", "vite"]
+            .iter()
+            .map(|n| up(n, "1.0.0", "2.0.0"))
+            .collect();
+        let p = plan_for(&many);
+        assert_eq!(p.title, "chore: upgrade eslint, prettier, typescript and vite");
+        assert_eq!(body_for(&p, &p.title), Some(p.body.as_str()));
+        // A title the user edited the versions out of.
+        let p = plan_for(&[up("eslint", "8.57.0", "9.0.0")]);
+        assert_eq!(body_for(&p, "chore: upgrade eslint to v9"), Some("- upgrade eslint 8.57.0 to 9.0.0"));
+        // A longer package name containing the change's text doesn't count.
+        let p = plan_for(&[up("lint", "1.0.0", "2.0.0")]);
+        assert!(body_for(&p, "chore: upgrade eslint 1.0.0 to 2.0.0").is_some());
+    }
+
     #[test]
     fn nothing_changed_gives_no_changes() {
         let m = json!({"dependencies": {"a": "^1.0.0"}});
@@ -584,7 +647,8 @@ mod tests {
         let hash = run(&dir, &plan, &plan.title).unwrap();
         assert!(!hash.is_empty());
         assert_eq!(sh(&root, &["log", "-1", "--format=%s"]), "chore: upgrade eslint 8.57.1 to 9.0.0");
-        assert_eq!(sh(&root, &["log", "-1", "--format=%b"]), "- upgrade eslint 8.57.1 to 9.0.0");
+        // The title says it all: no body repeating it.
+        assert_eq!(sh(&root, &["log", "-1", "--format=%b"]), "");
         let files = sh(&root, &["show", "--name-only", "--format=", "HEAD"]);
         assert_eq!(files, "app/package-lock.json\napp/package.json");
         // The rest is where it was: notes.txt still staged, README.md still modified.

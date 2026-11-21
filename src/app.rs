@@ -5456,6 +5456,7 @@ mod tests {
         assert!(screen.contains(" Commit to git "), "{screen}");
         assert!(screen.contains("Title  chore: upgrade a 1.0.0 to 2.0.0█"), "{screen}");
         assert!(screen.contains("- upgrade a 1.0.0 to 2.0.0"), "{screen}");
+        assert!(screen.contains("the title says it all, so the commit gets no body"), "{screen}");
         assert!(screen.contains("Files  package.json, package-lock.json   on main"), "{screen}");
 
         // The title can be edited: `chore:` → `fix(deps):`.
@@ -5463,6 +5464,8 @@ mod tests {
             press(&mut app, KeyCode::Backspace);
         }
         type_text(&mut app, "fix(deps): upgrade a to 2.0.0");
+        // Without the versions the title no longer says it all: the body comes back.
+        assert!(!render(&mut app, 120, 40).join("\n").contains("says it all"));
         press(&mut app, KeyCode::Enter);
         wait_until(&mut app, |a| a.commit_prompt.is_none());
         assert!(app.log.last().unwrap().contains("committed") && app.log.last().unwrap().contains("fix(deps): upgrade a to 2.0.0"), "{:?}", app.log);
