@@ -32,6 +32,7 @@ fn draw_log(f: &mut Frame, app: &mut App) {
             hint("tab or esc back to list"),
             hint("q quit"),
         ],
+        "   ",
         f.area().width,
     );
     let [header, body, help] = Layout::vertical([
@@ -73,6 +74,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         return draw_log(f, app);
     }
     let footer = footer_lines(app, f.area().width);
+    let header_lines = header_lines(app, f.area().width);
     // While the nested override lists are hidden, a text summary takes their place.
     let summary_h = if app.show_overrides == Overrides::Off {
         SUMMARY_LINES
@@ -80,7 +82,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         0
     };
     let [header, body, summary, log, help] = Layout::vertical([
-        Constraint::Length(1),
+        Constraint::Length(header_lines.len() as u16),
         Constraint::Min(3),
         Constraint::Length(summary_h),
         Constraint::Length(log_h),
@@ -88,67 +90,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     ])
     .areas(f.area());
 
-    let outdated_total = app.rows.iter().filter(|r| r.outdated).count();
-    let mut state = if app.loading() {
-        format!("checking {}/{}…", app.total - app.pending, app.total)
-    } else if outdated_total == 0 {
-        "all dependencies are up to date".to_string()
-    } else if app.shown() != outdated_total {
-        format!("{} of {outdated_total} outdated", app.shown())
-    } else {
-        format!("{outdated_total} outdated")
-    };
-    if outdated_total > 0 && app.shown_up_to_date() > 0 {
-        state.push_str(&format!(" · {} up to date", app.shown_up_to_date()));
-    }
-    let mut info = format!(
-        " {} · {} · {} · {}",
-        app.project_name(),
-        app.pm.name(),
-        app.registry,
-        state
-    );
-    if app.group_by != GroupBy::None {
-        info.push_str(&format!(" · group: {}", app.group_by.label()));
-    }
-    if app.vuln_view != crate::view::VulnView::All {
-        info.push_str(&format!(" · vulns: {}", app.vuln_view.label()));
-    }
-    if app.show_overrides != Overrides::Off {
-        info.push_str(&format!(" · overrides: {}", app.show_overrides.label()));
-    }
-    if !app.show_uptodate {
-        info.push_str(" · up-to-date hidden");
-    }
-    let audit_source = app.audit_source();
-    for (source, scan) in [(Source::Snyk, &app.snyk), (audit_source, &app.audit)] {
-        let label = source.label();
-        match scan.status {
-            ScanStatus::NotRun => {}
-            ScanStatus::Running => info.push_str(&format!(" · {label}: scanning…")),
-            ScanStatus::Failed => info.push_str(&format!(" · {label}: failed (see log)")),
-            ScanStatus::Done { total: 0, .. } => info.push_str(&format!(" · {label}: clean")),
-            ScanStatus::Done { total, severe } => info.push_str(&format!(
-                " · {label}: {total} vulnerabilities ({severe} high+)"
-            )),
-        }
-        if scan.stale {
-            info.push_str(&format!(
-                " · {label} results outdated, press {}",
-                scan_key(source)
-            ));
-        }
-    }
-    f.render_widget(
-        Line::from(vec![
-            format!(" depsu {} ", env!("CARGO_PKG_VERSION"))
-                .black()
-                .on_cyan()
-                .bold(),
-            info.into(),
-        ]),
-        header,
-    );
+    f.render_widget(Paragraph::new(header_lines), header);
 
     let grouped = app.group_by != GroupBy::None;
     let indent = if grouped { 2 } else { 0 };
@@ -209,8 +151,74 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     f.render_widget(Paragraph::new(footer), help);
 }
 
+fn header_lines(app: &App, width: u16) -> Vec<Line<'static>> {
+    let outdated_total = app.rows.iter().filter(|r| r.outdated).count();
+    let mut state = if app.loading() {
+        format!("checking {}/{}…", app.total - app.pending, app.total)
+    } else if outdated_total == 0 {
+        "all dependencies are up to date".to_string()
+    } else if app.shown() != outdated_total {
+        format!("{} of {outdated_total} outdated", app.shown())
+    } else {
+        format!("{outdated_total} outdated")
+    };
+    if outdated_total > 0 && app.shown_up_to_date() > 0 {
+        state.push_str(&format!(" · {} up to date", app.shown_up_to_date()));
+    }
+    let mut info: Vec<String> = vec![
+        app.project_name(),
+        app.pm.name().to_string(),
+        app.registry.clone(),
+        state,
+    ];
+    if app.group_by != GroupBy::None {
+        info.push(format!("group: {}", app.group_by.label()));
+    }
+    if app.vuln_view != crate::view::VulnView::All {
+        info.push(format!("vulns: {}", app.vuln_view.label()));
+    }
+    if app.show_overrides != Overrides::Off {
+        info.push(format!("overrides: {}", app.show_overrides.label()));
+    }
+    if !app.show_uptodate {
+        info.push("up-to-date hidden".to_string());
+    }
+    let audit_source = app.audit_source();
+    for (source, scan) in [(Source::Snyk, &app.snyk), (audit_source, &app.audit)] {
+        let label = source.label();
+        match scan.status {
+            ScanStatus::NotRun => {}
+            ScanStatus::Running => info.push(format!("{label}: scanning…")),
+            ScanStatus::Failed => info.push(format!("{label}: failed (see log)")),
+            ScanStatus::Done { total: 0, .. } => info.push(format!("{label}: clean")),
+            ScanStatus::Done { total, severe } => info.push(format!(
+                "{label}: {total} vulnerabilities ({severe} high+)"
+            )),
+        }
+        if scan.stale {
+            info.push(format!(
+                "{label} results outdated, press {}",
+                scan_key(source)
+            ));
+        }
+    }
+    let badge = format!(" depsu {} ", env!("CARGO_PKG_VERSION"))
+        .black()
+        .on_cyan()
+        .bold();
+    let mut atoms: Vec<Vec<Span<'static>>> = info.into_iter().map(|i| vec![Span::raw(i)]).collect();
+    atoms[0].insert(0, Span::raw(" "));
+    atoms[0].insert(0, badge);
+    wrap_hints(Vec::new(), atoms, " · ", width)
+}
+
 /// Lays out hint items (each a group of spans) over as many lines as the width needs.
-fn wrap_hints(prefix: Vec<Span<'static>>, atoms: Vec<Vec<Span<'static>>>, width: u16) -> Vec<Line<'static>> {
+fn wrap_hints(
+    prefix: Vec<Span<'static>>,
+    atoms: Vec<Vec<Span<'static>>>,
+    sep: &str,
+    width: u16,
+) -> Vec<Line<'static>> {
     let width = width as usize;
     let mut lines = Vec::new();
     let mut cur = vec![Span::raw(" ")];
@@ -218,14 +226,14 @@ fn wrap_hints(prefix: Vec<Span<'static>>, atoms: Vec<Vec<Span<'static>>>, width:
     let mut first = true;
     let mut push = |atom: Vec<Span<'static>>, sep: &str, lines: &mut Vec<Line<'static>>| {
         let w: usize = atom.iter().map(|s| s.width()).sum();
-        if !first && cur_w + sep.len() + w > width && cur_w > 1 {
+        if !first && cur_w + sep.chars().count() + w > width && cur_w > 1 {
             lines.push(Line::from(std::mem::replace(&mut cur, vec![Span::raw(" ")])));
             cur_w = 1;
             first = true;
         }
         if !first {
             cur.push(Span::raw(sep.to_string()));
-            cur_w += sep.len();
+            cur_w += sep.chars().count();
         }
         cur_w += w;
         cur.extend(atom);
@@ -235,7 +243,7 @@ fn wrap_hints(prefix: Vec<Span<'static>>, atoms: Vec<Vec<Span<'static>>>, width:
         push(prefix, "", &mut lines);
     }
     for atom in atoms {
-        push(atom, "   ", &mut lines);
+        push(atom, sep, &mut lines);
     }
     lines.push(Line::from(cur));
     lines
@@ -254,6 +262,7 @@ fn footer_lines(app: &App, width: u16) -> Vec<Line<'static>> {
                 opt("m", " at least >="),
                 hint("any other key cancels"),
             ],
+            "   ",
             width,
         );
     }
@@ -261,6 +270,7 @@ fn footer_lines(app: &App, width: u16) -> Vec<Line<'static>> {
         return wrap_hints(
             vec!["/".cyan().bold(), app.filter.clone().into(), "█".cyan()],
             vec![hint("enter keep"), hint("esc clear")],
+            "   ",
             width,
         );
     }
@@ -278,6 +288,7 @@ fn footer_lines(app: &App, width: u16) -> Vec<Line<'static>> {
         lines.extend(wrap_hints(
             vec!["item:".cyan().bold()],
             item.iter().map(|h| hint(h)).collect(),
+            "   ",
             width,
         ));
     }
@@ -285,12 +296,14 @@ fn footer_lines(app: &App, width: u16) -> Vec<Line<'static>> {
         lines.extend(wrap_hints(
             vec!["scan:".cyan().bold()],
             scan.iter().map(|h| hint(h)).collect(),
+            "   ",
             width,
         ));
     }
     lines.extend(wrap_hints(
         prefix,
         global.iter().map(|h| hint(h)).collect(),
+        "   ",
         width,
     ));
     lines
