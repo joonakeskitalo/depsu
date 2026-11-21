@@ -5503,8 +5503,8 @@ mod tests {
         let screen = render(&mut app, 120, 40).join("\n");
         assert!(screen.contains(" Commit to git "), "{screen}");
         assert!(screen.contains("Title  chore: upgrade a 1.0.0 to 2.0.0█"), "{screen}");
-        assert!(screen.contains("- upgrade a 1.0.0 to 2.0.0"), "{screen}");
-        assert!(screen.contains("the title says it all, so the commit gets no body"), "{screen}");
+        assert_eq!(screen.matches("upgrade a 1.0.0 to 2.0.0").count(), 1, "the title isn't repeated\n{screen}");
+        assert!(screen.contains("Body   (none: the title says it all)"), "{screen}");
         assert!(screen.contains("Files  package.json, package-lock.json   on main"), "{screen}");
 
         // The title can be edited: `chore:` → `fix(deps):`.
@@ -5513,8 +5513,20 @@ mod tests {
         }
         type_text(&mut app, "fix(deps): upgrade a to 2.0.0");
         // Without the versions the title no longer says it all: the body comes back.
-        assert!(!render(&mut app, 120, 40).join("\n").contains("says it all"));
+        let screen = render(&mut app, 120, 40).join("\n");
+        assert!(screen.contains("Body   - upgrade a 1.0.0 to 2.0.0"), "{screen}");
+        let before = dialog_rows(&render(&mut app, 120, 40), " Commit to git ");
         press(&mut app, KeyCode::Enter);
+        // Committing doesn't move anything in the dialog: the status replaces the keys.
+        if app.commit_prompt.as_ref().is_some_and(|p| p.busy) {
+            let during = dialog_rows(&render(&mut app, 120, 40), " Commit to git ");
+            assert_eq!(during.len(), before.len(), "{}", during.join("\n"));
+            // Only the title's cursor goes (it can't be edited while git runs).
+            let plain = |rows: &[String]| -> Vec<String> { rows.iter().map(|r| r.replace('█', " ")).collect() };
+            assert_eq!(plain(&during[..during.len() - 4]), plain(&before[..before.len() - 4]));
+            assert!(during.join("\n").contains("Committing…"));
+            assert!(!during.join("\n").contains("enter commit"));
+        }
         wait_until(&mut app, |a| a.commit_prompt.is_none());
         assert!(app.log.last().unwrap().contains("committed") && app.log.last().unwrap().contains("fix(deps): upgrade a to 2.0.0"), "{:?}", app.log);
         assert_eq!(git(&dir, &["log", "-1", "--format=%s"]), "fix(deps): upgrade a to 2.0.0");
@@ -5573,8 +5585,8 @@ mod tests {
             "- upgrade a 1.0.0 to 1.0.1\n- override qs to ^6.0.4\n\nFixes:\n- UPGRADE: Bad (high)\n- NESTED: Bad (high)"
         );
         let screen = render(&mut app, 120, 40).join("\n");
-        assert!(screen.contains("Fixes:") && screen.contains("- NESTED: Bad (high)"), "{screen}");
-        assert!(screen.contains("in the title, so the body lists only the fixes"), "{screen}");
+        assert!(screen.contains("Body   Fixes:") && screen.contains("- NESTED: Bad (high)"), "{screen}");
+        assert_eq!(screen.matches("upgrade a 1.0.0 to 1.0.1").count(), 1, "only in the title\n{screen}");
 
         press(&mut app, KeyCode::Enter);
         wait_until(&mut app, |a| a.commit_prompt.is_none());

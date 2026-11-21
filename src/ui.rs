@@ -249,30 +249,30 @@ fn draw_commit_dialog(f: &mut Frame, p: &crate::app::CommitPrompt) {
         ),
     ]));
     lines.push(Line::default());
-    // What the body holds, given the title as it is now.
-    let in_title = crate::commit::title_has_changes(&p.plan, &p.title);
-    let fixes = crate::commit::fixes_for(&p.plan, &p.title);
-    let note = match (in_title, fixes.is_empty() && !p.plan.fixes.is_empty(), p.plan.fixes.is_empty()) {
-        (true, _, true) | (true, true, _) => "   (the title says it all, so the commit gets no body)",
-        (true, false, false) => "   (in the title, so the body lists only the fixes)",
-        (false, true, false) => "   (the title names the fixes, so the body lists only the changes)",
-        _ => "",
-    };
-    lines.push(Line::from(vec![Span::styled("Changes", bold), Span::styled(note, dim)]));
-    // The changes and fixes, cut so the dialog fits the screen.
-    let room = (f.area().height as usize).saturating_sub(22).max(3);
-    let body: Vec<&str> = p.plan.body.lines().collect();
-    for l in body.iter().take(room) {
-        lines.extend(wrap(Span::raw("  "), Span::raw("    "), vec![Span::raw(l.to_string())], inner));
+    // The body as it will be committed with the title as it is now: what the title already
+    // says is left out, so nothing is shown twice.
+    let body = crate::commit::body_for(&p.plan, &p.title).unwrap_or_default();
+    let body: Vec<&str> = body.lines().collect();
+    let room = (f.area().height as usize).saturating_sub(20).max(3);
+    if body.is_empty() {
+        let why = if p.plan.body.is_empty() {
+            "(none: no dependency changes found, only other edits to these files)"
+        } else {
+            "(none: the title says it all)"
+        };
+        lines.push(Line::from(vec![Span::styled("Body   ", bold), Span::styled(why, dim)]));
+    }
+    for (i, l) in body.iter().take(room).enumerate() {
+        let label = if i == 0 { "Body   " } else { "       " };
+        lines.extend(wrap(
+            Span::styled(label, bold),
+            Span::raw("         "),
+            vec![Span::raw(l.to_string())],
+            inner,
+        ));
     }
     if body.len() > room {
-        lines.push(Line::from(Span::styled(format!("    … and {} more", body.len() - room), dim)));
-    }
-    if body.is_empty() {
-        lines.push(Line::from(Span::styled(
-            "  (no dependency changes found, only other edits to these files)",
-            dim,
-        )));
+        lines.push(Line::from(Span::styled(format!("       … and {} more lines", body.len() - room), dim)));
     }
     lines.push(Line::default());
     lines.extend(wrap(
@@ -299,10 +299,7 @@ fn draw_commit_dialog(f: &mut Frame, p: &crate::app::CommitPrompt) {
         ));
     }
     lines.push(Line::default());
-    if p.busy {
-        lines.push(Line::from(Span::styled("Committing… (git hooks may take a while)", dim)));
-        lines.push(Line::default());
-    } else if let Some(e) = &p.error {
+    if let Some(e) = p.error.as_ref().filter(|_| !p.busy) {
         for l in e.lines() {
             lines.extend(wrap(
                 Span::raw(""),
@@ -319,9 +316,14 @@ fn draw_commit_dialog(f: &mut Frame, p: &crate::app::CommitPrompt) {
             Span::raw(format!(" {t}   ")),
         ]
     };
-    let mut keys = key("enter", "commit");
-    keys.extend(key("esc", "cancel"));
-    lines.push(Line::from(keys));
+    // While git runs, the status takes the keys' place, so the dialog keeps its size.
+    if p.busy {
+        lines.push(Line::from(Span::styled("Committing… (git hooks may take a while)", dim)));
+    } else {
+        let mut keys = key("enter", "commit");
+        keys.extend(key("esc", "cancel"));
+        lines.push(Line::from(keys));
+    }
     draw_dialog(f, "Commit to git", lines, width);
 }
 
