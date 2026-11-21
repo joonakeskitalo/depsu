@@ -212,8 +212,8 @@ counts against your organisation's test quota**, so it never runs automatically.
   when that differs from `node_modules`. A package whose version can't be determined (not
   installed, no npm lockfile) is not recorded. After an install
   or revert, a package shows the findings recorded for its new version if that version was
-  scanned before. `↻ not scanned at this version` means no scanner has looked at the installed
-  version yet. Press `s` or `n` to scan it. Findings are matched by the version of your direct
+  scanned before. `↻ npm audit (n) hasn't scanned this version` names each scanner that has
+  results, but none for the installed version, with the key that runs it. Findings are matched by the version of your direct
   dependency, so a change deeper in the tree (for example from editing overrides) still needs a
   new scan.
 - `snyk fix: <version>` on a row is Snyk's suggested version for that dependency. It fixes

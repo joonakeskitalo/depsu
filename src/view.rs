@@ -304,7 +304,7 @@ mod tests {
             snyk_fix: None,
             audit_fix: None,
             changed_from: None,
-            scan_outdated: false,
+            unscanned: Vec::new(),
             loading: false,
             latest_failed: false,
             installed: None,

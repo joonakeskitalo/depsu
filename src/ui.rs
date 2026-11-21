@@ -705,10 +705,10 @@ fn row_line(app: &App, r: &AppRow, indent: usize, name_w: usize, width: usize) -
             ));
         }
     }
-    // The installed version differs from the one the last scan looked at.
-    if r.scan_outdated {
+    // A scanner with results hasn't looked at the version installed now.
+    if r.scan_outdated() {
         spans.push(Span::styled(
-            "   ↻ not scanned at this version",
+            format!("   {}", unscanned_label(&r.unscanned)),
             Style::new().fg(Color::Yellow),
         ));
     }
@@ -748,6 +748,16 @@ fn row_line(app: &App, r: &AppRow, indent: usize, name_w: usize, width: usize) -
     } else {
         line
     }
+}
+
+/// E.g. `↻ npm audit hasn't scanned this version (n)`, naming the scanners and their keys.
+pub fn unscanned_label(sources: &[Source]) -> String {
+    let names: Vec<String> = sources
+        .iter()
+        .map(|s| format!("{} ({})", s.label(), scan_key(*s)))
+        .collect();
+    let verb = if sources.len() == 1 { "hasn't" } else { "haven't" };
+    format!("↻ {} {verb} scanned this version", names.join(" and "))
 }
 
 fn severity_color(s: Severity) -> Color {

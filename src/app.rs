@@ -209,9 +209,10 @@ pub struct Row {
     /// The version this package had when the session started, if an install in this session
     /// changed it. Kept in memory only, so the change can be reverted.
     pub changed_from: Option<Version>,
-    /// The version changed since the last vulnerability scan, so the findings (or their
-    /// absence) no longer describe what is installed.
-    pub scan_outdated: bool,
+    /// Scanners that have results, but not for the version installed now (it changed since
+    /// they ran, or they ran in another session at another version). Their findings, or
+    /// their absence, say nothing about this version.
+    pub unscanned: Vec<Source>,
     /// The latest version hasn't arrived from the registry yet.
     pub loading: bool,
     /// Looking up the latest version failed.
@@ -251,6 +252,10 @@ impl Row {
     /// `package.json`, which the scanners don't look at.
     pub fn scanned_version(&self) -> Option<String> {
         self.installed.as_ref().map(Version::to_string)
+    }
+    /// Some scanner with results hasn't looked at the version installed now.
+    pub fn scan_outdated(&self) -> bool {
+        !self.unscanned.is_empty()
     }
     pub fn busy(&self) -> bool {
         matches!(self.status, Status::Queued | Status::Installing)
@@ -762,7 +767,7 @@ impl App {
             r.vulns.clear();
             r.snyk_fix = None;
             r.audit_fix = None;
-            r.scan_outdated = false;
+            r.unscanned.clear();
             let version = r.scanned_version();
             for &source in &sources {
                 let found = version
@@ -778,7 +783,7 @@ impl App {
                         }
                     }
                     None => {
-                        r.scan_outdated = true;
+                        r.unscanned.push(source);
                         missing.insert(source);
                     }
                 }
@@ -871,7 +876,7 @@ impl App {
                 snyk_fix: None,
                 audit_fix: None,
                 changed_from: None,
-                scan_outdated: false,
+                unscanned: Vec::new(),
                 loading: true,
                 latest_failed: false,
                 installed: None,
@@ -1038,7 +1043,7 @@ impl App {
             snyk_fix: None,
             audit_fix: None,
             changed_from: None,
-            scan_outdated: false,
+            unscanned: Vec::new(),
             loading: false,
             latest_failed: false,
             installed: None,
@@ -3470,7 +3475,7 @@ mod tests {
         assert_eq!(ids(&app, "a"), ["A-1"]);
         assert_eq!(ids(&app, "b"), ["B-1"]);
         assert!(row(&app, "a").snyk_fix.is_some());
-        assert!(!row(&app, "a").scan_outdated);
+        assert!(!row(&app, "a").scan_outdated());
         assert!(!app.snyk.stale);
         assert_eq!(app.snyk.status, ScanStatus::Done { total: 2, severe: 2 });
     }
@@ -3485,10 +3490,10 @@ mod tests {
         let a = row(&app, "a");
         assert!(a.vulns.is_empty(), "findings of another version must not show");
         assert!(a.snyk_fix.is_none());
-        assert!(a.scan_outdated);
+        assert!(a.scan_outdated());
         // `b` is at the scanned version, so its findings still apply.
         assert_eq!(ids(&app, "b"), ["B-1"]);
-        assert!(!row(&app, "b").scan_outdated);
+        assert!(!row(&app, "b").scan_outdated());
         assert!(app.snyk.stale, "a package hasn't been scanned at its version");
     }
 
@@ -3505,18 +3510,18 @@ mod tests {
         switch_version(&mut app, "a", "1.1.0");
         assert!(row(&app, "a").vulns.is_empty(), "1.1.0 is clean");
         assert!(row(&app, "a").snyk_fix.is_none());
-        assert!(!row(&app, "a").scan_outdated, "1.1.0 was scanned");
+        assert!(!row(&app, "a").scan_outdated(), "1.1.0 was scanned");
         assert!(!app.snyk.stale);
 
         switch_version(&mut app, "a", "1.2.0");
         assert!(row(&app, "a").vulns.is_empty());
-        assert!(row(&app, "a").scan_outdated, "1.2.0 was never scanned");
+        assert!(row(&app, "a").scan_outdated(), "1.2.0 was never scanned");
         assert!(app.snyk.stale);
 
         // Back to the first version: its findings come back.
         switch_version(&mut app, "a", "1.0.0");
         assert_eq!(ids(&app, "a"), ["A-OLD"]);
-        assert!(!row(&app, "a").scan_outdated);
+        assert!(!row(&app, "a").scan_outdated());
         assert!(!app.snyk.stale);
     }
 
@@ -3530,7 +3535,7 @@ mod tests {
         // Upgrading `a` hides the finding: the new version hasn't been scanned.
         switch_version(&mut app, "a", "1.1.0");
         assert!(row(&app, "a").vulns.is_empty());
-        assert!(row(&app, "a").scan_outdated);
+        assert!(row(&app, "a").scan_outdated());
         // The scan was stored per version, also for the clean package `b`.
         assert_eq!(stored(&app).findings("snyk", "a", "1.0.0").unwrap().vulns.len(), 1);
         assert!(stored(&app).findings("snyk", "a", "1.1.0").is_none());
@@ -3554,7 +3559,7 @@ mod tests {
         });
         assert_eq!(ids(&app, "a"), ["SNYK-A"]);
         assert!(row(&app, "a").audit_fix.is_none());
-        assert!(row(&app, "a").scan_outdated, "npm audit hasn't seen a@1.0.0");
+        assert!(row(&app, "a").scan_outdated(), "npm audit hasn't seen a@1.0.0");
         assert!(!app.snyk.stale);
         assert!(app.audit.stale);
     }
@@ -3570,19 +3575,19 @@ mod tests {
         assert_eq!(row(&app, "a").current, Version::new(1, 0, 0));
         assert_eq!(row(&app, "a").installed, Some(Version::new(1, 0, 5)));
         assert_eq!(ids(&app, "a"), ["A-1.0.5"]);
-        assert!(!row(&app, "a").scan_outdated);
+        assert!(!row(&app, "a").scan_outdated());
         // `b` isn't installed and there's no lockfile: its version is unknown, so no
         // finding is looked up for it, not even under the package.json version.
         assert!(row(&app, "b").installed.is_none());
         assert!(row(&app, "b").vulns.is_empty());
-        assert!(row(&app, "b").scan_outdated);
+        assert!(row(&app, "b").scan_outdated());
 
         // The lockfile moves `a` to 1.0.6 without package.json changing.
         install(&app.dir.clone(), "a", "1.0.6");
         app.read_installed_versions();
         app.refresh_findings();
         assert!(row(&app, "a").vulns.is_empty(), "1.0.6 was never scanned");
-        assert!(row(&app, "a").scan_outdated);
+        assert!(row(&app, "a").scan_outdated());
 
         // A scan now is recorded under 1.0.6, leaving the other versions' findings alone.
         let mut report = Report::default();
@@ -3654,7 +3659,7 @@ mod tests {
         // Back in A: still clean.
         let a = open(&dir_a);
         assert!(row(&a, "a").vulns.is_empty(), "B's findings must not show in A");
-        assert!(!row(&a, "a").scan_outdated, "A's own scan still applies");
+        assert!(!row(&a, "a").scan_outdated(), "A's own scan still applies");
         // And B keeps its finding.
         let b = open(&dir_b);
         assert_eq!(ids(&b, "a"), ["ONLY-IN-B"]);
@@ -3737,7 +3742,7 @@ mod tests {
         shared.save(&path).unwrap();
         let a = open(&dir_a);
         assert!(row(&a, "a").vulns.is_empty(), "0.9.0's findings must not show for 1.0.0");
-        assert!(row(&a, "a").scan_outdated, "1.0.0 hasn't been scanned");
+        assert!(row(&a, "a").scan_outdated(), "1.0.0 hasn't been scanned");
         std::fs::remove_dir_all(base).unwrap();
     }
 
@@ -4263,6 +4268,41 @@ mod tests {
         // Once answered, it's gone.
         app.on_key(key('x'));
         assert!(!render(&mut app, 100, 40).iter().any(|l| l.contains("Other packages must change")));
+    }
+
+    #[test]
+    fn the_row_names_the_scanner_that_has_not_scanned_its_version() {
+        // npm audit ran at a@0.9.0 in an earlier session; a@1.0.0 is installed now.
+        let mut app = app_with_cache("1.0.0", |c| {
+            c.set_findings("npm audit", "a", "0.9.0", Findings::default());
+            c.set_findings("npm audit", "b", "1.0.0", Findings::default());
+        });
+        assert_eq!(row(&app, "a").unscanned, [Source::NpmAudit]);
+
+        // Scanning with Snyk now covers Snyk, but not npm audit.
+        app.apply_scan(Source::Snyk, Report::default(), false);
+        assert_eq!(row(&app, "a").unscanned, [Source::NpmAudit]);
+        assert!(row(&app, "b").unscanned.is_empty());
+        assert!(!app.snyk.stale);
+        assert!(app.audit.stale);
+        let screen = render(&mut app, 140, 30).join("\n");
+        assert!(
+            screen.contains("↻ npm audit (n) hasn't scanned this version"),
+            "{screen}"
+        );
+
+        // After npm audit, nothing is missing.
+        app.apply_scan(Source::NpmAudit, Report::default(), false);
+        assert!(row(&app, "a").unscanned.is_empty());
+        assert!(!render(&mut app, 140, 30).join("\n").contains("↻"));
+    }
+
+    #[test]
+    fn both_scanners_are_named_when_neither_has_scanned_the_version() {
+        assert_eq!(
+            crate::ui::unscanned_label(&[Source::Snyk, Source::NpmAudit]),
+            "↻ snyk (s) and npm audit (n) haven't scanned this version"
+        );
     }
 
     #[test]
