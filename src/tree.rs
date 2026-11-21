@@ -270,6 +270,8 @@ pub struct Dependent {
     pub version: Option<Version>,
     /// The range it declares for the dependency.
     pub range: String,
+    /// The project's direct dependency that brings it in (its own name if it is one).
+    pub direct: String,
 }
 impl Analyzer {
     pub fn has_overrides(&self) -> bool {
@@ -286,7 +288,7 @@ impl Analyzer {
             if let Some(c) = self.resolve(&dir, dep)
                 && visited.insert(c.clone())
             {
-                self.dependents_walk(&c, dep, 0, &mut visited, &mut budget, &mut out);
+                self.dependents_walk(&c, dep, dep, 0, &mut visited, &mut budget, &mut out);
             }
         }
         out
@@ -295,6 +297,7 @@ impl Analyzer {
         &mut self,
         dir: &Path,
         name: &str,
+        direct: &str,
         depth: usize,
         visited: &mut HashSet<PathBuf>,
         budget: &mut usize,
@@ -313,11 +316,12 @@ impl Analyzer {
                 name: name.to_string(),
                 version: pkg.version.clone(),
                 range: range.clone(),
+                direct: direct.to_string(),
             });
             if let Some(c) = self.resolve(dir, dep)
                 && visited.insert(c.clone())
             {
-                self.dependents_walk(&c, dep, depth + 1, visited, budget, out);
+                self.dependents_walk(&c, dep, direct, depth + 1, visited, budget, out);
             }
         }
     }
@@ -738,6 +742,8 @@ mod tests {
         assert_eq!(d["b"][0].name, "a");
         assert_eq!(d["b"][0].range, "^2");
         assert_eq!(d["c"][0].name, "b");
+        assert_eq!(d["c"][0].direct, "a", "b is pulled in by the direct dependency a");
+        assert_eq!(d["b"][0].direct, "a");
         assert!(!d.contains_key("a"), "the project's own dependency on a doesn't count");
         std::fs::remove_dir_all(dir).unwrap();
     }

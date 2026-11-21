@@ -434,7 +434,16 @@ fn row_line(app: &App, r: &AppRow, indent: usize, name_w: usize, width: usize) -
     let users = app.dependents_of(&r.name);
     if !users.is_empty() {
         let used: usize = spans.iter().map(|s| s.width()).sum();
-        let mut names: Vec<&str> = users.iter().map(|d| d.name.as_str()).collect();
+        let mut names: Vec<String> = users
+            .iter()
+            .map(|d| {
+                if d.direct == d.name {
+                    d.name.clone()
+                } else {
+                    format!("{} (via {})", d.name, d.direct)
+                }
+            })
+            .collect();
         names.sort();
         names.dedup();
         let with_names = format!("   used by {}", names.join(", "));
@@ -876,7 +885,12 @@ fn used_by_line(app: &App, width: usize) -> Line<'static> {
     let mut parts: Vec<String> = Vec::new();
     for d in deps {
         let version = d.version.as_ref().map(|v| format!("@{v}")).unwrap_or_default();
-        parts.push(format!("{}{version} ({})", d.name, d.range));
+        let via = if d.direct == d.name {
+            String::new()
+        } else {
+            format!(" via {}", d.direct)
+        };
+        parts.push(format!("{}{version} ({}){via}", d.name, d.range));
     }
     parts.sort();
     let mut text = format!(" used by {} installed package(s): ", parts.len());
