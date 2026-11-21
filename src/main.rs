@@ -3,6 +3,7 @@ mod blocked;
 mod audit;
 mod bunfig;
 mod cache;
+mod commit;
 mod edit;
 mod export;
 mod npmrc;
@@ -50,6 +51,8 @@ KEYS:
     n              run npm audit / bun audit (by the project's package manager)
     e              install a version you type for the highlighted package
     f              fix the unmet peers of the highlighted package
+    c              commit package.json and the lockfile, titled as a conventional
+                   commit of the changes (e.g. 'chore: upgrade eslint 8.57.0 to 9.0.0')
     +              add a package as a dependency, dev dependency or override
     R              fetch the latest versions again (ignoring the cache)
     ?              show / hide the details panel

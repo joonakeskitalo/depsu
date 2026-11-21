@@ -483,8 +483,12 @@ struct Walk {
 /// The versions npm's lockfile (`package-lock.json` in `dir`) pins the project's direct
 /// dependencies to, by name. Reads lockfile v2/v3 (`packages`) and v1 (`dependencies`).
 pub fn npm_lock_versions(dir: &Path) -> Option<HashMap<String, Version>> {
-    let text = std::fs::read_to_string(dir.join("package-lock.json")).ok()?;
-    let json: serde_json::Value = serde_json::from_str(&text).ok()?;
+    npm_lock_versions_from(&std::fs::read_to_string(dir.join("package-lock.json")).ok()?)
+}
+
+/// Like `npm_lock_versions`, from the lockfile's text.
+pub fn npm_lock_versions_from(text: &str) -> Option<HashMap<String, Version>> {
+    let json: serde_json::Value = serde_json::from_str(text).ok()?;
     let mut out = HashMap::new();
     let version = |v: &serde_json::Value| Version::parse(v.get("version")?.as_str()?).ok();
     if let Some(pkgs) = json.get("packages").and_then(|p| p.as_object()) {

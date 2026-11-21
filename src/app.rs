@@ -56,6 +56,10 @@ pub enum Event {
         version: Option<Version>,
         result: Result<registry::Packument, String>,
     },
+    /// The changes to commit were looked at.
+    CommitPrepared(Result<crate::commit::Plan, String>),
+    /// git committed (the short hash), or failed.
+    Committed(Result<String, String>),
     /// Versions the registry refuses to hand out were found.
     Blocked {
         plan: Vec<(String, Version)>,
@@ -245,6 +249,16 @@ struct Adding {
     kind: Kind,
     version: Version,
     latest: Version,
+}
+
+/// The commit `c` proposes, with its title as the user edits it.
+pub struct CommitPrompt {
+    pub plan: crate::commit::Plan,
+    pub title: String,
+    /// Why the commit failed, e.g. a git hook's output.
+    pub error: Option<String>,
+    /// git is committing.
+    pub busy: bool,
 }
 
 /// What `d` is about to delete, waiting for the user to confirm.
@@ -459,6 +473,8 @@ pub struct App {
     pub delete_prompt: Option<DeletePrompt>,
     /// Versions the registry refuses, and what can be installed instead.
     pub blocked_prompt: Option<BlockedPrompt>,
+    /// The commit `c` proposes.
+    pub commit_prompt: Option<CommitPrompt>,
     /// Packages to install with an exact version the next time they are queued, because a
     /// range would resolve to a blocked version again.
     exact_once: HashSet<String>,
@@ -629,6 +645,7 @@ impl App {
             peer_fix: None,
             delete_prompt: None,
             blocked_prompt: None,
+            commit_prompt: None,
             exact_once: HashSet::new(),
             prober: {
                 let (rc, agent) = (rc.clone(), agent.clone());
@@ -1075,6 +1092,8 @@ impl App {
                     blocked,
                     after_failure,
                 } => self.on_blocked(plan, ovr, blocked, after_failure),
+                Event::CommitPrepared(result) => self.on_commit_prepared(result),
+                Event::Committed(result) => self.on_committed(result),
                 Event::VersionChecked {
                     name,
                     version,
@@ -1765,6 +1784,7 @@ impl App {
         }
         global.push("/ filter".into());
         global.push("+ add package".into());
+        global.push("c commit".into());
         global.push("R fetch versions".into());
         global.push(format!("? details: {}", if self.show_info { "on" } else { "off" }));
         global.push("g group".into());
@@ -1840,6 +1860,10 @@ impl App {
         }
         if self.filter_mode {
             self.on_filter_key(key);
+            return;
+        }
+        if self.commit_prompt.is_some() {
+            self.on_commit_key(key);
             return;
         }
         if let Some(p) = self.blocked_prompt.take() {
@@ -2002,6 +2026,7 @@ impl App {
             KeyCode::Char('r') => self.revert_selected(),
             KeyCode::Char('e') => self.ask_version(),
             KeyCode::Char('f') => self.fix_unmet_peers(),
+            KeyCode::Char('c') => self.prepare_commit(),
             KeyCode::Char('+') => {
                 self.input = Some(Input::new(InputPurpose::Add {
                     add_as: AddAs::Dependency,
@@ -2167,6 +2192,94 @@ impl App {
             notes,
             choice: 0,
         });
+    }
+
+    /// Looks at what changed in package.json and the lockfile since the last commit.
+    fn prepare_commit(&mut self) {
+        if self.installing() {
+            self.push_log("Wait for the install to finish before committing.");
+            return;
+        }
+        self.push_log("… looking at what changed since the last commit");
+        let (dir, pm, tx) = (self.dir.clone(), self.pm, self.events_tx.clone());
+        thread::spawn(move || {
+            let _ = tx.send(Event::CommitPrepared(crate::commit::prepare(&dir, pm)));
+        });
+    }
+
+    fn on_commit_prepared(&mut self, result: Result<crate::commit::Plan, String>) {
+        let plan = match result {
+            Ok(p) => p,
+            Err(e) => return self.push_log(format!("✘ Can't commit: {e}")),
+        };
+        if plan.files.is_empty() {
+            return self.push_log("Nothing to commit: package.json and the lockfile are unchanged.");
+        }
+        self.filter_mode = false;
+        self.pin_prompt = false;
+        self.input = None;
+        self.commit_prompt = Some(CommitPrompt {
+            title: plan.title.clone(),
+            plan,
+            error: None,
+            busy: false,
+        });
+    }
+
+    fn on_commit_key(&mut self, key: KeyEvent) {
+        let Some(p) = &mut self.commit_prompt else {
+            return;
+        };
+        // While git runs (hooks can take a while), keys wait.
+        if p.busy {
+            return;
+        }
+        match key.code {
+            KeyCode::Esc => {
+                self.commit_prompt = None;
+                self.push_log("Nothing committed.");
+            }
+            KeyCode::Enter => {
+                let title = p.title.trim().to_string();
+                if title.is_empty() {
+                    p.error = Some("The commit needs a title.".into());
+                    return;
+                }
+                p.busy = true;
+                p.error = None;
+                let (dir, plan, tx) = (self.dir.clone(), p.plan.clone(), self.events_tx.clone());
+                thread::spawn(move || {
+                    let _ = tx.send(Event::Committed(crate::commit::run(&dir, &plan, &title)));
+                });
+            }
+            KeyCode::Backspace => {
+                p.title.pop();
+            }
+            KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => p.title.push(c),
+            _ => {}
+        }
+    }
+
+    fn on_committed(&mut self, result: Result<String, String>) {
+        match result {
+            Ok(hash) => {
+                if let Some(p) = self.commit_prompt.take() {
+                    self.push_log(format!("✔ committed {hash}: {}", p.title.trim()));
+                }
+            }
+            Err(e) => {
+                // The dialog stays open with git's message, e.g. a failing hook.
+                let tail: Vec<&str> = e.lines().rev().take(6).collect::<Vec<_>>().into_iter().rev().collect();
+                if let Some(p) = &mut self.commit_prompt {
+                    p.busy = false;
+                    p.error = Some(tail.join("\n"));
+                }
+                self.push_log("✘ git commit failed:");
+                for l in e.lines().rev().take(6).collect::<Vec<_>>().into_iter().rev() {
+                    self.push_log(format!("  {l}"));
+                }
+            }
+        }
     }
 
     /// Asks which version to install for the package under the cursor.
@@ -5306,6 +5419,94 @@ mod tests {
         app.on_key(key('d'));
         let w = &app.delete_prompt.as_ref().unwrap().warnings;
         assert!(w.iter().any(|w| w.starts_with("Not flagged ✂ unneeded: a.")), "{w:?}");
+    }
+
+    fn git(dir: &std::path::Path, args: &[&str]) -> String {
+        let o = std::process::Command::new("git").args(args).current_dir(dir).output().unwrap();
+        assert!(o.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&o.stderr));
+        String::from_utf8_lossy(&o.stdout).trim().to_string()
+    }
+
+    #[test]
+    fn c_commits_the_changes_with_a_conventional_title() {
+        let (mut app, _rx) = app_capturing_installs();
+        let dir = app.dir.clone();
+        let lock = |v: &str| {
+            format!(r#"{{"lockfileVersion":3,"packages":{{"node_modules/a":{{"version":"{v}"}}}}}}"#)
+        };
+        std::fs::write(dir.join("package.json"), r#"{"dependencies":{"a":"^1.0.0"}}"#).unwrap();
+        std::fs::write(dir.join("package-lock.json"), lock("1.0.0")).unwrap();
+        std::fs::write(dir.join(".gitignore"), "node_modules\ncache.json*\n").unwrap();
+        git(&dir, &["init", "-q", "-b", "main"]);
+        for (k, v) in [("user.name", "t"), ("user.email", "t@example.com"), ("commit.gpgsign", "false")] {
+            git(&dir, &["config", k, v]);
+        }
+        git(&dir, &["add", "-A"]);
+        git(&dir, &["commit", "-q", "-m", "init"]);
+        // An upgrade, as an install of a@2.0.0 would leave it.
+        std::fs::write(dir.join("package.json"), r#"{"dependencies":{"a":"^2.0.0"}}"#).unwrap();
+        std::fs::write(dir.join("package-lock.json"), lock("2.0.0")).unwrap();
+
+        assert!(app.hints().2.contains(&"c commit".to_string()));
+        app.on_key(key('c'));
+        wait_until(&mut app, |a| a.commit_prompt.is_some());
+        let p = app.commit_prompt.as_ref().unwrap();
+        assert_eq!(p.title, "chore: upgrade a 1.0.0 to 2.0.0");
+        let screen = render(&mut app, 120, 40).join("\n");
+        assert!(screen.contains(" Commit to git "), "{screen}");
+        assert!(screen.contains("Title  chore: upgrade a 1.0.0 to 2.0.0█"), "{screen}");
+        assert!(screen.contains("- upgrade a 1.0.0 to 2.0.0"), "{screen}");
+        assert!(screen.contains("Files  package.json, package-lock.json   on main"), "{screen}");
+
+        // The title can be edited: `chore:` → `fix(deps):`.
+        for _ in 0.."chore: upgrade a 1.0.0 to 2.0.0".len() {
+            press(&mut app, KeyCode::Backspace);
+        }
+        type_text(&mut app, "fix(deps): upgrade a to 2.0.0");
+        press(&mut app, KeyCode::Enter);
+        wait_until(&mut app, |a| a.commit_prompt.is_none());
+        assert!(app.log.last().unwrap().contains("committed") && app.log.last().unwrap().contains("fix(deps): upgrade a to 2.0.0"), "{:?}", app.log);
+        assert_eq!(git(&dir, &["log", "-1", "--format=%s"]), "fix(deps): upgrade a to 2.0.0");
+        assert_eq!(git(&dir, &["log", "-1", "--format=%b"]), "- upgrade a 1.0.0 to 2.0.0");
+
+        // Nothing left: c says so.
+        app.on_key(key('c'));
+        wait_until(&mut app, |a| a.log.last().is_some_and(|l| l.starts_with("Nothing to commit")));
+        assert!(app.commit_prompt.is_none());
+    }
+
+    #[test]
+    fn a_failing_commit_keeps_the_dialog_open_with_git_s_message() {
+        let (mut app, _rx) = app_capturing_installs();
+        let dir = app.dir.clone();
+        std::fs::write(dir.join("package.json"), r#"{"dependencies":{"a":"^1.0.0"}}"#).unwrap();
+        std::fs::write(dir.join(".gitignore"), "node_modules\ncache.json*\n").unwrap();
+        git(&dir, &["init", "-q", "-b", "main"]);
+        for (k, v) in [("user.name", "t"), ("user.email", "t@example.com"), ("commit.gpgsign", "false")] {
+            git(&dir, &["config", k, v]);
+        }
+        git(&dir, &["add", "-A"]);
+        git(&dir, &["commit", "-q", "-m", "init"]);
+        // A pre-commit hook that refuses.
+        let hook = dir.join(".git/hooks/pre-commit");
+        std::fs::write(&hook, "#!/bin/sh\necho 'lint failed: 3 problems' >&2\nexit 1\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        std::fs::write(dir.join("package.json"), r#"{"dependencies":{"a":"^2.0.0"}}"#).unwrap();
+
+        app.on_key(key('c'));
+        wait_until(&mut app, |a| a.commit_prompt.is_some());
+        press(&mut app, KeyCode::Enter);
+        wait_until(&mut app, |a| a.commit_prompt.as_ref().is_some_and(|p| p.error.is_some()));
+        let p = app.commit_prompt.as_ref().unwrap();
+        assert!(!p.busy);
+        assert!(p.error.as_ref().unwrap().contains("lint failed: 3 problems"), "{:?}", p.error);
+        assert_eq!(git(&dir, &["log", "-1", "--format=%s"]), "init", "nothing was committed");
+        press(&mut app, KeyCode::Esc);
+        assert!(app.commit_prompt.is_none());
     }
 
     #[test]

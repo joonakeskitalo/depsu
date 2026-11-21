@@ -218,11 +218,102 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     if let Some(p) = &app.blocked_prompt {
         draw_blocked_prompt(f, p);
     }
+    if let Some(p) = &app.commit_prompt {
+        draw_commit_dialog(f, p);
+    }
     if let Some(input) = &app.input
         && let crate::app::InputPurpose::Add { add_as } = &input.purpose
     {
         draw_add_dialog(f, app, input, *add_as);
     }
+}
+
+/// The commit `c` proposes: its title to edit, what it contains, and which files.
+fn draw_commit_dialog(f: &mut Frame, p: &crate::app::CommitPrompt) {
+    let width = f.area().width.saturating_sub(4).min(90);
+    let inner = (width as usize).saturating_sub(4);
+    let bold = Style::new().add_modifier(Modifier::BOLD);
+    let dim = Style::new().fg(Color::DarkGray);
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    let mut title = vec![Span::styled(p.title.clone(), bold)];
+    if !p.busy {
+        title.push(Span::styled("█", Style::new().fg(Color::Cyan)));
+    }
+    lines.extend(wrap(Span::styled("Title  ", bold), Span::raw("       "), title, inner));
+    let n = p.title.trim().chars().count();
+    lines.push(Line::from(vec![
+        Span::raw("       "),
+        Span::styled(
+            format!("a conventional commit, edit as you like ({n} characters)"),
+            if n > 72 { Style::new().fg(Color::Yellow) } else { dim },
+        ),
+    ]));
+    lines.push(Line::default());
+    lines.push(Line::from(Span::styled("Changes", bold)));
+    // The body, cut so the dialog fits the screen.
+    let room = (f.area().height as usize).saturating_sub(22).max(3);
+    let body: Vec<&str> = p.plan.body.lines().collect();
+    for l in body.iter().take(room) {
+        lines.extend(wrap(Span::raw("  "), Span::raw("    "), vec![Span::raw(l.to_string())], inner));
+    }
+    if body.len() > room {
+        lines.push(Line::from(Span::styled(format!("    … and {} more", body.len() - room), dim)));
+    }
+    if body.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "  (no dependency changes found, only other edits to these files)",
+            dim,
+        )));
+    }
+    lines.push(Line::default());
+    lines.extend(wrap(
+        Span::styled("Files  ", bold),
+        Span::raw("       "),
+        vec![
+            Span::raw(p.plan.files.join(", ")),
+            Span::styled(format!("   on {}", p.plan.branch), dim),
+        ],
+        inner,
+    ));
+    if !p.plan.other_staged.is_empty() {
+        lines.extend(wrap(
+            Span::raw("       "),
+            Span::raw("       "),
+            vec![Span::styled(
+                format!(
+                    "Also staged, left out of this commit: {}",
+                    p.plan.other_staged.join(", ")
+                ),
+                Style::new().fg(Color::Yellow),
+            )],
+            inner,
+        ));
+    }
+    lines.push(Line::default());
+    if p.busy {
+        lines.push(Line::from(Span::styled("Committing… (git hooks may take a while)", dim)));
+        lines.push(Line::default());
+    } else if let Some(e) = &p.error {
+        for l in e.lines() {
+            lines.extend(wrap(
+                Span::raw(""),
+                Span::raw("  "),
+                vec![Span::styled(l.to_string(), Style::new().fg(Color::Red))],
+                inner,
+            ));
+        }
+        lines.push(Line::default());
+    }
+    let key = |k: &str, t: &str| {
+        vec![
+            Span::styled(k.to_string(), Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+            Span::raw(format!(" {t}   ")),
+        ]
+    };
+    let mut keys = key("enter", "commit");
+    keys.extend(key("esc", "cancel"));
+    lines.push(Line::from(keys));
+    draw_dialog(f, "Commit to git", lines, width);
 }
 
 /// Versions the registry refuses to hand out, and what it hands out instead.
@@ -805,6 +896,14 @@ fn footer_lines(app: &App, width: u16) -> Vec<Line<'static>> {
             "█".cyan(),
         ];
         return wrap_hints(prefix, hints.iter().map(|h| hint(h)).collect(), "   ", width);
+    }
+    if app.commit_prompt.is_some() {
+        return wrap_hints(
+            vec!["Commit:".cyan().bold()],
+            vec![hint("type to edit the title"), hint("enter commit"), hint("esc cancel")],
+            "   ",
+            width,
+        );
     }
     if let Some(p) = &app.blocked_prompt {
         let mut keys = Vec::new();
