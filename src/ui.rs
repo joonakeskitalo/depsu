@@ -23,10 +23,22 @@ fn log_line(l: &str) -> Line<'static> {
 }
 /// The expanded, scrollable log that replaces the package list.
 fn draw_log(f: &mut Frame, app: &mut App) {
+    let hint = |t: &str| vec![t.to_string().dark_gray()];
+    let footer = wrap_hints(
+        Vec::new(),
+        vec![
+            hint("↑/↓ scroll"),
+            hint("PgUp/PgDn page"),
+            hint("Home/End oldest/newest"),
+            hint("tab or esc back to list"),
+            hint("q quit"),
+        ],
+        f.area().width,
+    );
     let [header, body, help] = Layout::vertical([
         Constraint::Length(1),
         Constraint::Min(3),
-        Constraint::Length(1),
+        Constraint::Length(footer.len() as u16),
     ])
     .areas(f.area());
     let h = (body.height as usize).saturating_sub(1).max(1);
@@ -54,19 +66,14 @@ fn draw_log(f: &mut Frame, app: &mut App) {
         Paragraph::new(lines).block(Block::default().borders(Borders::TOP).title(title)),
         body,
     );
-    f.render_widget(
-        Line::from(
-            " ↑/↓ scroll   PgUp/PgDn page   Home/End oldest/newest   tab or esc back to list   q quit"
-                .dark_gray(),
-        ),
-        help,
-    );
+    f.render_widget(Paragraph::new(footer), help);
 }
 pub fn draw(f: &mut Frame, app: &mut App) {
     let log_h = 7.min(app.log.len() as u16 + 2).max(3);
     if app.log_focus {
         return draw_log(f, app);
     }
+    let footer = footer_lines(app, f.area().width);
     // While the nested override lists are hidden, a text summary takes their place.
     let summary_h = if app.show_overrides == Overrides::Off {
         SUMMARY_LINES
@@ -78,7 +85,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         Constraint::Min(3),
         Constraint::Length(summary_h),
         Constraint::Length(log_h),
-        Constraint::Length(1),
+        Constraint::Length(footer.len() as u16),
     ])
     .areas(f.area());
 
@@ -190,61 +197,121 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         log,
     );
 
-    // Hints for actions that only exist when there is something to act on.
-    let mut remove_hint = String::new();
-    if app.has_overrides() {
-        remove_hint.push_str("   x remove override");
+    f.render_widget(Paragraph::new(footer), help);
+}
+
+/// Lays out hint items (each a group of spans) over as many lines as the width needs.
+fn wrap_hints(prefix: Vec<Span<'static>>, atoms: Vec<Vec<Span<'static>>>, width: u16) -> Vec<Line<'static>> {
+    let width = width as usize;
+    let mut lines = Vec::new();
+    let mut cur = vec![Span::raw(" ")];
+    let mut cur_w = 1;
+    let mut first = true;
+    let mut push = |atom: Vec<Span<'static>>, sep: &str, lines: &mut Vec<Line<'static>>| {
+        let w: usize = atom.iter().map(|s| s.width()).sum();
+        if !first && cur_w + sep.len() + w > width && cur_w > 1 {
+            lines.push(Line::from(std::mem::replace(&mut cur, vec![Span::raw(" ")])));
+            cur_w = 1;
+            first = true;
+        }
+        if !first {
+            cur.push(Span::raw(sep.to_string()));
+            cur_w += sep.len();
+        }
+        cur_w += w;
+        cur.extend(atom);
+        first = false;
+    };
+    if !prefix.is_empty() {
+        push(prefix, "", &mut lines);
     }
-    for source in [Source::Snyk, app.audit_source()] {
-        if app.rows.iter().any(|r| r.fix_of(source).is_some()) {
-            remove_hint.push_str(&format!(
-                "   {} {} fix",
-                fix_key(source),
-                if source.is_audit() { "audit" } else { "snyk" }
-            ));
+    for atom in atoms {
+        push(atom, "   ", &mut lines);
+    }
+    lines.push(Line::from(cur));
+    lines
+}
+
+fn footer_lines(app: &App, width: u16) -> Vec<Line<'static>> {
+    let hint = |t: &str| vec![t.to_string().dark_gray()];
+    if app.pin_prompt {
+        let opt = |k: &str, d: &str| vec![k.to_string().bold(), d.to_string().into()];
+        return wrap_hints(
+            vec!["Pin type:".cyan().bold()],
+            vec![
+                opt("e", " exact"),
+                opt("c", " caret ^ (minor)"),
+                opt("t", " tilde ~ (patch)"),
+                opt("m", " at least >="),
+                hint("any other key cancels"),
+            ],
+            width,
+        );
+    }
+    if app.filter_mode {
+        return wrap_hints(
+            vec!["/".cyan().bold(), app.filter.clone().into(), "█".cyan()],
+            vec![hint("enter keep"), hint("esc clear")],
+            width,
+        );
+    }
+    let mut hints: Vec<String> = Vec::new();
+    let mut prefix = Vec::new();
+    if app.filter.is_empty() {
+        for h in [
+            "↑/↓ move",
+            "space select",
+            "a all",
+            "i install",
+            "/ filter",
+            "g group",
+            "o overrides",
+            "u up-to-date",
+            "s snyk",
+        ] {
+            hints.push(h.to_string());
+        }
+        if let Some(src) = audit::source_for(app.pm) {
+            hints.push(format!("n {}", src.label()));
+        }
+    } else {
+        prefix = vec![format!("filter: {}", app.filter).cyan()];
+        for h in [
+            "/ edit",
+            "esc clear",
+            "space select",
+            "a all",
+            "i install",
+            "g group",
+            "o overrides",
+            "u up-to-date",
+        ] {
+            hints.push(h.to_string());
         }
     }
-    remove_hint.push_str("   P pin type");
-    if app.rows.iter().any(|r| !r.vulns.is_empty()) {
-        remove_hint.push_str("   p pin fix as override");
+    // Hints for actions that only exist when there is something to act on.
+    if app.filter.is_empty() {
+        if app.has_overrides() {
+            hints.push("x remove override".to_string());
+        }
+        for source in [Source::Snyk, app.audit_source()] {
+            if app.rows.iter().any(|r| r.fix_of(source).is_some()) {
+                hints.push(format!(
+                    "{} {} fix",
+                    fix_key(source),
+                    if source.is_audit() { "audit" } else { "snyk" }
+                ));
+            }
+        }
+        hints.push("P pin type".to_string());
+        if app.rows.iter().any(|r| !r.vulns.is_empty()) {
+            hints.push("p pin fix as override".to_string());
+        }
     }
-    let audit_hint = match audit::source_for(app.pm) {
-        Some(src) => format!("   n {}", src.label()),
-        None => String::new(),
-    };
-    let footer: Line = if app.pin_prompt {
-        Line::from(vec![
-            " Pin type: ".cyan().bold(),
-            "e".bold(),
-            " exact   ".into(),
-            "c".bold(),
-            " caret ^ (minor)   ".into(),
-            "t".bold(),
-            " tilde ~ (patch)   ".into(),
-            "m".bold(),
-            " at least >=   ".into(),
-            "any other key cancels".dark_gray(),
-        ])
-    } else if app.filter_mode {
-        Line::from(vec![
-            " /".cyan().bold(),
-            app.filter.clone().into(),
-            "█".cyan(),
-            "   enter keep   esc clear".dark_gray(),
-        ])
-    } else if !app.filter.is_empty() {
-        Line::from(vec![
-            format!(" filter: {}", app.filter).cyan(),
-            "   / edit   esc clear   space select   a all   i install   g group   o overrides   u up-to-date"
-                .dark_gray(),
-        ])
-    } else {
-        Line::from(
-            format!(" ↑/↓ move   space select   a all   i install   / filter   g group   o overrides   u up-to-date   s snyk{audit_hint}{remove_hint}   y copy md   tab log   q quit")
-                .dark_gray(),
-        )
-    };
-    f.render_widget(footer, help);
+    hints.push("y copy md".to_string());
+    hints.push("tab log".to_string());
+    hints.push("q quit".to_string());
+    wrap_hints(prefix, hints.iter().map(|h| hint(h)).collect(), width)
 }
 
 fn header_line(app: &App, label: &str, members: &[usize]) -> Line<'static> {
