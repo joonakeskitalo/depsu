@@ -38,6 +38,7 @@ OPTIONS:
 
 KEYS:
     up/down, j/k   move                 home/end  first / last
+    , .            page up / page down (also PgUp / PgDn)
     space          select (package, group header or override line)
     a              select all / none
     i, enter       install the selected packages (or the highlighted one, or the

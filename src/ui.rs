@@ -27,7 +27,7 @@ fn draw_log(f: &mut Frame, app: &mut App) {
         Vec::new(),
         vec![
             hint("↑/↓ scroll"),
-            hint("PgUp/PgDn page"),
+            hint(", . page"),
             hint("Home/End oldest/newest"),
             hint("tab or esc back to list"),
             hint("q quit"),
@@ -171,6 +171,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         .collect();
     let list = List::new(items)
         .highlight_style(Style::new().add_modifier(Modifier::REVERSED));
+    app.list_page = body.height as usize;
     f.render_stateful_widget(list, body, &mut app.table);
     let info_title = match app.cursor_item() {
         Some(Item::Row { idx, .. }) => format!("selected: {}", app.rows[*idx].name),

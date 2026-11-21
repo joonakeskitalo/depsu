@@ -69,6 +69,7 @@ depsu --cache .depsu-cache.json   # remember versions and scans between runs
 | Key | Action |
 |---|---|
 | `↑` `↓` / `j` `k`, `Home` `End` | Move |
+| `,` `.` (or `PgUp` `PgDn`) | Page up / page down, in the list and in the log |
 | `space` | Select a package (up to date or not), a whole group (on its header) or an override line |
 | `a` | Select all / none of the shown packages |
 | `i` / `Enter` | Install the selected packages, or the highlighted one. On a vulnerability finding, install the version that fixes it. If the update needs other installed packages to change (peer dependencies), depsu lists them and asks: `y` update them too, `n` install only what you picked, any other key cancels. Packages that would need different install flags (dependency vs dev dependency, exact vs range) are written into `package.json` together and installed with one `install`, so the package manager resolves them at once; if that fails, `package.json` is put back |

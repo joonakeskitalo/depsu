@@ -498,6 +498,8 @@ pub struct App {
     pub log_scroll: usize,
     /// Visible log lines while expanded, set by the renderer, used for paging.
     pub log_page: usize,
+    /// Rows the package list shows, set by the renderer, used for paging (`,` and `.`).
+    pub list_page: usize,
     /// Latest versions and findings per package version. Always kept in memory; written to
     /// `cache_path` when `--cache` was given.
     cache: Cache,
@@ -669,6 +671,7 @@ impl App {
             log_focus: false,
             log_scroll: 0,
             log_page: 10,
+            list_page: 10,
             cache: Cache::default(),
             cache_path: None,
             cache_dirty: false,
@@ -1773,6 +1776,7 @@ impl App {
         let mut scan: Vec<String> = Vec::new();
         if !self.view.is_empty() {
             global.push("↑/↓ move".into());
+            global.push(", . page".into());
         }
         let cursor_selectable = match self.cursor_item() {
             Some(Item::Row { idx, .. }) => self.rows[*idx].can_select(),
@@ -2017,6 +2021,13 @@ impl App {
             }
             KeyCode::Down | KeyCode::Char('j') => self.move_cursor(1),
             KeyCode::Up | KeyCode::Char('k') => self.move_cursor(-1),
+            // A page is what the list shows, less a row that stays in view for context.
+            KeyCode::Char(',') | KeyCode::PageUp => {
+                self.move_cursor(-(self.list_page.saturating_sub(1).max(1) as isize))
+            }
+            KeyCode::Char('.') | KeyCode::PageDown => {
+                self.move_cursor(self.list_page.saturating_sub(1).max(1) as isize)
+            }
             KeyCode::Home => self.table.select((!self.view.is_empty()).then_some(0)),
             KeyCode::End => {
                 let last = (0..self.view.len()).rev().find(|&i| self.selectable(i));
@@ -2079,8 +2090,8 @@ impl App {
             KeyCode::Down | KeyCode::Char('j') => {
                 self.log_scroll = self.log_scroll.saturating_sub(1)
             }
-            KeyCode::PageUp => self.log_scroll = (self.log_scroll + page).min(max),
-            KeyCode::PageDown => self.log_scroll = self.log_scroll.saturating_sub(page),
+            KeyCode::PageUp | KeyCode::Char(',') => self.log_scroll = (self.log_scroll + page).min(max),
+            KeyCode::PageDown | KeyCode::Char('.') => self.log_scroll = self.log_scroll.saturating_sub(page),
             KeyCode::Home | KeyCode::Char('g') => self.log_scroll = max,
             KeyCode::End | KeyCode::Char('G') => self.log_scroll = 0,
             _ => {}
@@ -5644,6 +5655,49 @@ mod tests {
         assert_eq!(git(&dir, &["log", "-1", "--format=%s"]), "init", "nothing was committed");
         press(&mut app, KeyCode::Esc);
         assert!(app.commit_prompt.is_none());
+    }
+
+    #[test]
+    fn comma_and_dot_page_up_and_down() {
+        let (mut app, _rx) = app_capturing_installs();
+        for i in 0..60 {
+            let name = format!("p{i:02}");
+            app.current.insert(name.clone(), (Kind::Prod, "^", Version::new(1, 0, 0)));
+            app.on_fetched(name, Version::new(1, 0, 0));
+        }
+        render(&mut app, 120, 30);
+        let page = app.list_page;
+        assert!(page > 5 && page < 30, "the list's height: {page}");
+        let at = |app: &App| app.table.selected().unwrap();
+        app.table.select(Some(0));
+
+        app.on_key(key('.'));
+        assert_eq!(at(&app), page - 1, "a page down, keeping a row of context");
+        app.on_key(key('.'));
+        assert_eq!(at(&app), 2 * (page - 1));
+        app.on_key(key(','));
+        assert_eq!(at(&app), page - 1);
+        // At the ends it stops.
+        for _ in 0..20 {
+            app.on_key(key('.'));
+        }
+        assert_eq!(at(&app), app.view.len() - 1);
+        for _ in 0..20 {
+            app.on_key(key(','));
+        }
+        assert_eq!(at(&app), 0);
+        assert!(app.hints().2.contains(&", . page".to_string()));
+
+        // In the log, too.
+        for i in 0..100 {
+            app.push_log(format!("line {i}"));
+        }
+        app.on_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        render(&mut app, 120, 30);
+        app.on_key(key(','));
+        assert_eq!(app.log_scroll, app.log_page);
+        app.on_key(key('.'));
+        assert_eq!(app.log_scroll, 0);
     }
 
     #[test]
