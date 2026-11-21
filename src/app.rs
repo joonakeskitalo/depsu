@@ -9,7 +9,7 @@ use crate::pm::Pm;
 use crate::registry;
 use crate::snyk;
 use crate::tree::{Analyzer, Hit};
-use crate::view::{self, Child, GroupBy, Item, Overrides, Release, UNNEEDED};
+use crate::view::{self, Child, GroupBy, Item, Overrides, REMOVED, Release, UNNEEDED};
 use crate::vuln::{Report, Severity, Source, Vuln};
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::widgets::ListState;
@@ -75,6 +75,13 @@ pub enum VersionRange {
     Caret,
     /// Anything newer (>=).
     AtLeast,
+}
+/// A package uninstalled in this session, kept so it can be restored.
+pub struct RemovedPkg {
+    pub row: Row,
+    /// The range it had in `package.json`.
+    pub spec: String,
+    pub status: Status,
 }
 pub struct Row {
     pub name: String,
@@ -162,7 +169,10 @@ pub struct Update {
     pub release: Release,
 }
 
+#[derive(Default)]
 struct Job {
+    /// Packages to uninstall, before anything else runs.
+    uninstall: Vec<String>,
     /// (name, spec, kind, exact)
     items: Vec<(String, String, Kind, bool)>,
     edits: Vec<Change>,
@@ -233,6 +243,12 @@ pub struct App {
     unneeded: HashMap<String, Unneeded>,
     root_deps: Vec<(String, String)>,
     confirm_remove: bool,
+    confirm_uninstall: bool,
+    /// Packages being reinstalled from the removed section.
+    restoring: HashSet<String>,
+    pub removed: Vec<RemovedPkg>,
+    /// Packages queued for uninstall, whose rows go away when the job succeeds.
+    uninstalling: HashSet<String>,
     confirm_pin: bool,
     /// Override keys being added or removed, which call for a rescan.
     changed: HashSet<String>,
@@ -365,6 +381,10 @@ impl App {
             unneeded: HashMap::new(),
             root_deps,
             confirm_remove: false,
+            confirm_uninstall: false,
+            restoring: HashSet::new(),
+            removed: Vec::new(),
+            uninstalling: HashSet::new(),
             confirm_pin: false,
             changed: HashSet::new(),
             cursor_moved: false,
@@ -383,7 +403,9 @@ impl App {
     }
 
     pub fn installing(&self) -> bool {
-        !self.busy_overrides.is_empty() || self.rows.iter().any(Row::busy)
+        !self.busy_overrides.is_empty()
+            || self.rows.iter().any(Row::busy)
+            || self.removed.iter().any(|p| matches!(p.status, Status::Queued | Status::Installing))
     }
 
     /// Name of the project directory (the repository name).
@@ -421,6 +443,9 @@ impl App {
                 Event::InstallStarted { names } => {
                     for r in self.rows.iter_mut().filter(|r| names.contains(&r.name)) {
                         r.status = Status::Installing;
+                    }
+                    for p in self.removed.iter_mut().filter(|p| names.contains(&p.row.name)) {
+                        p.status = Status::Installing;
                     }
                 }
                 Event::InstallFinished {
@@ -515,6 +540,61 @@ impl App {
             .cloned()
             .chain(keys.iter().map(|k| override_label(k)))
             .collect();
+        let mut names = names;
+        let gone: Vec<String> = names
+            .iter()
+            .filter(|n| self.uninstalling.remove(*n))
+            .cloned()
+            .collect();
+        let restored: Vec<String> = names
+            .iter()
+            .filter(|n| self.restoring.remove(*n))
+            .cloned()
+            .collect();
+        if result.is_ok() {
+            names.retain(|n| !gone.contains(n) && !restored.contains(n));
+            let (out, keep): (Vec<Row>, Vec<Row>) = std::mem::take(&mut self.rows)
+                .into_iter()
+                .partition(|r| gone.contains(&r.name));
+            self.rows = keep;
+            for mut row in out {
+                self.current.remove(&row.name);
+                self.direct.remove(&row.name);
+                row.selected = false;
+                row.status = Status::Idle;
+                let spec = self
+                    .root_deps
+                    .iter()
+                    .find(|(n, _)| *n == row.name)
+                    .map(|(_, s)| s.clone())
+                    .unwrap_or_else(|| format!("{}{}", row.prefix, row.current));
+                self.removed.push(RemovedPkg {
+                    row,
+                    spec,
+                    status: Status::Idle,
+                });
+            }
+            for n in &restored {
+                if let Some(pos) = self.removed.iter().position(|p| p.row.name == *n) {
+                    let mut row = self.removed.remove(pos).row;
+                    row.status = Status::Idle;
+                    self.current
+                        .insert(row.name.clone(), (row.kind, row.prefix, row.current.clone()));
+                    self.analyze(&row.name);
+                    self.insert_row(row);
+                }
+            }
+            if !gone.is_empty() || !restored.is_empty() {
+                for scan in [&mut self.snyk, &mut self.audit] {
+                    scan.stale |= scan.report.is_some();
+                }
+            }
+        } else {
+            names.retain(|n| !restored.contains(n));
+            for p in self.removed.iter_mut().filter(|p| restored.contains(&p.row.name)) {
+                p.status = Status::Failed;
+            }
+        }
         match result {
             Ok(()) => {
                 self.push_log(format!("✔ done: {}", what.join(", ")));
@@ -718,6 +798,7 @@ impl App {
             self.show_vulns,
         );
         self.append_unneeded_section();
+        self.append_removed_section();
         let pos = if self.cursor_moved {
             anchor.and_then(|a| self.view.iter().position(|it| anchor_of(it) == a))
         } else {
@@ -758,6 +839,70 @@ impl App {
         });
         self.view
             .extend(keys.into_iter().map(|key| Item::Override { key }));
+    }
+
+    fn append_removed_section(&mut self) {
+        let needle = self.filter.trim().to_lowercase();
+        let names: Vec<String> = self
+            .removed
+            .iter()
+            .map(|p| p.row.name.clone())
+            .filter(|n| needle.is_empty() || n.to_lowercase().contains(&needle))
+            .collect();
+        if names.is_empty() {
+            return;
+        }
+        self.view.push(Item::Header {
+            label: REMOVED.to_string(),
+            members: Vec::new(),
+        });
+        self.view
+            .extend(names.into_iter().map(|name| Item::Removed { name }));
+    }
+
+    pub fn removed_pkg(&self, name: &str) -> Option<&RemovedPkg> {
+        self.removed.iter().find(|p| p.row.name == name)
+    }
+
+    /// Reinstalls a package uninstalled in this session, at its old version and range.
+    fn restore_removed(&mut self, name: &str) {
+        let Some(p) = self.removed.iter_mut().find(|p| p.row.name == name) else {
+            return;
+        };
+        if matches!(p.status, Status::Queued | Status::Installing) {
+            return;
+        }
+        p.status = Status::Queued;
+        let version = p.row.current.to_string();
+        let item = (name.to_string(), version.clone(), p.row.kind, true);
+        let mut edits = Vec::new();
+        let mut keys = Vec::new();
+        // Install the exact version, then put the original range back in package.json.
+        if p.spec != version {
+            let field = match p.row.kind {
+                Kind::Optional => "optionalDependencies",
+                Kind::Dev => "devDependencies",
+                _ => "dependencies",
+            };
+            let loc = vec![field.to_string(), name.to_string()];
+            keys.push(loc.join("\u{1f}"));
+            edits.push(Change::Set {
+                loc,
+                old: version.clone(),
+                new: p.spec.clone(),
+            });
+        }
+        for k in &keys {
+            self.busy_overrides.insert(k.clone());
+        }
+        self.restoring.insert(name.to_string());
+        self.push_log(format!("… queued restore of {name}@{version}"));
+        let _ = self.jobs.send(Job {
+            items: vec![item],
+            edits,
+            keys,
+            ..Default::default()
+        });
     }
 
     pub fn cursor_item(&self) -> Option<&Item> {
@@ -818,10 +963,6 @@ impl App {
         self.overrides.iter().find(|o| o.key() == key)
     }
 
-    pub fn has_overrides(&self) -> bool {
-        !self.overrides.is_empty()
-    }
-
     /// Why the override looks unnecessary, if it does.
     pub fn unneeded(&self, o: &Override) -> Option<&Unneeded> {
         self.unneeded.get(&o.key())
@@ -859,6 +1000,116 @@ impl App {
             .filter_map(|it| self.detail_override(it))
             .filter(|o| seen.insert(o.key()))
             .collect()
+    }
+
+    // ---- hotkey hints ----------------------------------------------------------------
+
+    /// Rows an action acts on: the checked ones that pass `ok`, else the one under the cursor
+    /// (every member of a group header) if it passes.
+    fn acting_rows(&self, ok: impl Fn(&Row) -> bool) -> Vec<usize> {
+        let mut idx: Vec<usize> = self
+            .visible_rows()
+            .into_iter()
+            .filter(|&i| self.rows[i].selected && ok(&self.rows[i]))
+            .collect();
+        if idx.is_empty() {
+            match self.cursor_item() {
+                Some(Item::Row { idx: i, .. }) => idx.push(*i),
+                Some(Item::Header { members, .. }) => idx.extend(members.iter().copied()),
+                _ => {}
+            }
+            idx.retain(|&i| ok(&self.rows[i]));
+        }
+        idx
+    }
+
+    /// The override under the cursor, if the cursor is on an override line.
+    fn cursor_override(&self) -> Option<&Override> {
+        self.cursor_item().and_then(|it| self.detail_override(it))
+    }
+
+    /// Hotkey hints for the actions that can be performed on the current selection or cursor
+    /// item right now.
+    pub fn hints(&self) -> Vec<String> {
+        let mut h: Vec<String> = Vec::new();
+        let mut add = |s: String| h.push(s);
+        if !self.view.is_empty() {
+            add("↑/↓ move".into());
+        }
+        let cursor_selectable = match self.cursor_item() {
+            Some(Item::Row { idx, .. }) => self.rows[*idx].can_select(),
+            Some(Item::Header { members, .. }) => {
+                members.iter().any(|&i| self.rows[i].can_select())
+            }
+            Some(it) => self.detail_override(it).is_some(),
+            None => false,
+        };
+        if cursor_selectable {
+            add("space select".into());
+        }
+        if self.visible_rows().iter().any(|&i| self.rows[i].can_select()) {
+            add("a all".into());
+        }
+        let ovr_updatable = |o: &Override| !self.override_busy(o) && self.update_target(o).is_some();
+        let install = self
+            .visible_overrides()
+            .into_iter()
+            .any(|o| self.selected_overrides.contains(&o.key()) && ovr_updatable(o))
+            || !self.acting_rows(Row::actionable).is_empty()
+            || self
+                .cursor_override()
+                .is_some_and(|o| ovr_updatable(o));
+        if install {
+            add("i install".into());
+        }
+        add("/ filter".into());
+        add("g group".into());
+        add("o overrides".into());
+        add("u up-to-date".into());
+        add("s snyk".into());
+        if let Some(src) = audit::source_for(self.pm) {
+            add(format!("n {}", src.label()));
+        }
+        let remove = self
+            .visible_overrides()
+            .into_iter()
+            .any(|o| self.selected_overrides.contains(&o.key()) && !self.override_busy(o))
+            || self.cursor_override().is_some_and(|o| !self.override_busy(o));
+        if remove {
+            add("x remove override".into());
+        }
+        for source in [Source::Snyk, self.audit_source()] {
+            if !self.acting_rows(|r| !r.busy() && r.fix_of(source).is_some()).is_empty() {
+                add(format!(
+                    "{} {} fix",
+                    fix_key(source),
+                    if source.is_audit() { "audit" } else { "snyk" }
+                ));
+            }
+        }
+        if !self.acting_rows(|r| !r.busy()).is_empty() {
+            add("P pin type".into());
+        }
+        if !self.acting_rows(|r| !r.busy() && !r.vulns.is_empty()).is_empty() {
+            add("p pin fix as override".into());
+        }
+        if !self.acting_rows(|r| !r.busy() && r.kind != Kind::Override).is_empty() {
+            add("d uninstall".into());
+        }
+        if !self.acting_rows(|r| !r.busy() && r.changed_from.is_some()).is_empty() {
+            add("r revert".into());
+        }
+        if let Some(Item::Removed { name }) = self.cursor_item()
+            && self
+                .removed_pkg(name)
+                .is_some_and(|p| !matches!(p.status, Status::Queued | Status::Installing))
+        {
+            add("r restore".into());
+        }
+        add("y copy md".into());
+        add("tab log".into());
+        add("q quit".into());
+        h
     }
 
     // ---- keys ------------------------------------------------------------------------
@@ -907,6 +1158,9 @@ impl App {
         }
         if key.code != KeyCode::Char('x') {
             self.confirm_remove = false;
+        }
+        if key.code != KeyCode::Char('d') {
+            self.confirm_uninstall = false;
         }
         if key.code != KeyCode::Char('p') {
             self.confirm_pin = false;
@@ -965,6 +1219,7 @@ impl App {
             KeyCode::Char('f') => self.fix_selected(Source::Snyk),
             KeyCode::Char('F') => self.fix_selected(self.audit_source()),
             KeyCode::Char('r') => self.revert_selected(),
+            KeyCode::Char('d') => self.uninstall_selected(),
             KeyCode::Char('y') => {
                 let md = crate::export::markdown(self);
                 match crate::export::copy(&md) {
@@ -1056,6 +1311,7 @@ impl App {
                     self.rows[i].selected = !all;
                 }
             }
+            Item::Removed { .. } => {}
             Item::Detail { .. } | Item::Override { .. } => {
                 let Some(o) = self.detail_override(&item) else {
                     return;
@@ -1121,7 +1377,7 @@ impl App {
                         ovr.push((o.clone(), u.value));
                     }
                 }
-                None => {}
+                Some(Item::Removed { .. }) | None => {}
             }
             idx.retain(|&i| self.rows[i].actionable());
         }
@@ -1152,9 +1408,52 @@ impl App {
         self.dispatch('i', pkgs, ovr);
     }
 
+    /// Uninstalls the checked packages, or the one under the cursor. Asks to press `d` again.
+    fn uninstall_selected(&mut self) {
+        let can = |a: &App, i: usize| a.rows[i].kind != Kind::Override && !a.rows[i].busy();
+        let mut idx: Vec<usize> = self
+            .visible_rows()
+            .into_iter()
+            .filter(|&i| self.rows[i].selected && can(self, i))
+            .collect();
+        if idx.is_empty() {
+            if let Some(Item::Row { idx: i, .. }) = self.cursor_item().cloned() {
+                idx.push(i);
+            }
+            idx.retain(|&i| can(self, i));
+        }
+        if idx.is_empty() {
+            self.push_log("Nothing to uninstall: put the cursor on a package, or select some with space.");
+            return;
+        }
+        let names: Vec<String> = idx.iter().map(|&i| self.rows[i].name.clone()).collect();
+        if !self.confirm_uninstall {
+            self.confirm_uninstall = true;
+            self.push_log(format!(
+                "✂ will uninstall: {}. Press d again to confirm, any other key cancels.",
+                names.join(", ")
+            ));
+            return;
+        }
+        self.confirm_uninstall = false;
+        for &i in &idx {
+            self.rows[i].selected = false;
+            self.rows[i].status = Status::Queued;
+        }
+        self.uninstalling.extend(names.iter().cloned());
+        self.push_log(format!("… queued uninstall of {}", names.join(", ")));
+        let _ = self.jobs.send(Job {
+            uninstall: names,
+            ..Default::default()
+        });
+    }
     /// Reinstalls the version the checked packages (or the one under the cursor) had when the
     /// session started. Only packages changed in this session can be reverted.
     fn revert_selected(&mut self) {
+        if let Some(Item::Removed { name }) = self.cursor_item().cloned() {
+            self.restore_removed(&name);
+            return;
+        }
         let can = |a: &App, i: usize| a.rows[i].changed_from.is_some() && !a.rows[i].busy();
         let mut idx: Vec<usize> = self
             .visible_rows()
@@ -1208,7 +1507,12 @@ impl App {
             self.busy_overrides.insert(k.clone());
         }
         self.push_log(format!("… queued revert to {}", what.join(", ")));
-        let _ = self.jobs.send(Job { items, edits, keys });
+        let _ = self.jobs.send(Job {
+            items,
+            edits,
+            keys,
+            ..Default::default()
+        });
     }
     /// Installs the version `source` suggests for the checked packages, or for the one under
     /// the cursor (every package of a group when on a group header).
@@ -1302,7 +1606,12 @@ impl App {
         let mut what: Vec<String> = items.iter().map(|i| format!("{}@{}", i.0, i.1)).collect();
         what.extend(keys.iter().map(|k| override_label(k)));
         self.push_log(format!("… queued {}", what.join(", ")));
-        let _ = self.jobs.send(Job { items, edits, keys });
+        let _ = self.jobs.send(Job {
+            items,
+            edits,
+            keys,
+            ..Default::default()
+        });
     }
 
     // ---- vulnerability scans -----------------------------------------------------------
@@ -1514,6 +1823,7 @@ impl App {
             items: Vec::new(),
             edits,
             keys,
+            ..Default::default()
         });
     }
 }
@@ -1631,6 +1941,7 @@ impl App {
             items: Vec::new(),
             edits,
             keys,
+            ..Default::default()
         });
     }
 }
@@ -1800,6 +2111,7 @@ impl App {
             items: Vec::new(),
             edits,
             keys,
+            ..Default::default()
         });
     }
 }
@@ -1826,6 +2138,7 @@ fn anchor_of(item: &Item) -> (u8, String) {
         Item::Header { label, .. } => (0, label.clone()),
         Item::Row { name, .. } => (1, name.clone()),
         Item::Override { key } => (3, key.clone()),
+        Item::Removed { name } => (4, name.clone()),
         Item::Detail {
             row, key, child, ..
         } => (
@@ -1840,7 +2153,12 @@ fn anchor_of(item: &Item) -> (u8, String) {
 
 fn install_worker(dir: PathBuf, pm: Pm, jobs: Receiver<Job>, tx: Sender<Event>) {
     while let Ok(job) = jobs.recv() {
-        let names: Vec<String> = job.items.iter().map(|i| i.0.clone()).collect();
+        let names: Vec<String> = job
+            .items
+            .iter()
+            .map(|i| i.0.clone())
+            .chain(job.uninstall.iter().cloned())
+            .collect();
         let _ = tx.send(Event::InstallStarted {
             names: names.clone(),
         });
@@ -1859,6 +2177,9 @@ fn install_worker(dir: PathBuf, pm: Pm, jobs: Receiver<Job>, tx: Sender<Event>) 
 }
 
 fn run_job(dir: &std::path::Path, pm: Pm, job: &Job) -> Result<(), String> {
+    if !job.uninstall.is_empty() {
+        run_pm(dir, pm, &pm.uninstall_args(&job.uninstall))?;
+    }
     // One command per (kind, exact) group.
     let mut groups: Vec<((Kind, bool), Vec<String>)> = Vec::new();
     for (name, spec, kind, exact) in &job.items {

@@ -1,5 +1,4 @@
-use crate::app::{App, VersionRange, Row as AppRow, ScanStatus, Status, fix_key, scan_key};
-use crate::audit;
+use crate::app::{App, VersionRange, Row as AppRow, ScanStatus, Status, scan_key};
 use crate::overrides::{self, Compat, Override};
 use crate::package::Kind;
 use crate::pm::Pm;
@@ -164,6 +163,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         .map(|item| match item {
             Item::Header { label, members } => ListItem::new(header_line(app, label, members)),
             Item::Row { idx, .. } => ListItem::new(row_line(&app.rows[*idx], indent, name_w)),
+            Item::Removed { name } => ListItem::new(removed_line(app, name)),
             Item::Override { key } => {
                 ListItem::new(Text::from(orphan_lines(app, key, body.width as usize)))
             }
@@ -261,69 +261,45 @@ fn footer_lines(app: &App, width: u16) -> Vec<Line<'static>> {
             width,
         );
     }
-    let mut hints: Vec<String> = Vec::new();
+    let mut hints = app.hints();
     let mut prefix = Vec::new();
-    if app.filter.is_empty() {
-        for h in [
-            "↑/↓ move",
-            "space select",
-            "a all",
-            "i install",
-            "/ filter",
-            "g group",
-            "o overrides",
-            "u up-to-date",
-            "s snyk",
-        ] {
-            hints.push(h.to_string());
-        }
-        if let Some(src) = audit::source_for(app.pm) {
-            hints.push(format!("n {}", src.label()));
-        }
-    } else {
+    if !app.filter.is_empty() {
         prefix = vec![format!("filter: {}", app.filter).cyan()];
-        for h in [
-            "/ edit",
-            "esc clear",
-            "space select",
-            "a all",
-            "i install",
-            "g group",
-            "o overrides",
-            "u up-to-date",
-        ] {
-            hints.push(h.to_string());
+        if let Some(pos) = hints.iter().position(|h| h == "/ filter") {
+            hints[pos] = "/ edit".to_string();
+            hints.insert(pos + 1, "esc clear".to_string());
         }
     }
-    // Hints for actions that only exist when there is something to act on.
-    if app.filter.is_empty() {
-        if app.has_overrides() {
-            hints.push("x remove override".to_string());
-        }
-        for source in [Source::Snyk, app.audit_source()] {
-            if app.rows.iter().any(|r| r.fix_of(source).is_some()) {
-                hints.push(format!(
-                    "{} {} fix",
-                    fix_key(source),
-                    if source.is_audit() { "audit" } else { "snyk" }
-                ));
-            }
-        }
-        hints.push("P pin type".to_string());
-        if app.rows.iter().any(|r| !r.vulns.is_empty()) {
-            hints.push("p pin fix as override".to_string());
-        }
-    }
-    if app.rows.iter().any(|r| r.changed_from.is_some()) {
-        hints.push("r revert".to_string());
-    }
-    hints.push("y copy md".to_string());
-    hints.push("tab log".to_string());
-    hints.push("q quit".to_string());
     wrap_hints(prefix, hints.iter().map(|h| hint(h)).collect(), width)
 }
 
+fn removed_line(app: &App, name: &str) -> Line<'static> {
+    let Some(p) = app.removed_pkg(name) else {
+        return Line::from(name.to_string());
+    };
+    let note = match p.status {
+        Status::Queued => "restoring…".to_string(),
+        Status::Installing => "restoring…".to_string(),
+        Status::Failed => "restore failed, press r to retry".to_string(),
+        Status::Idle => "press r to restore".to_string(),
+    };
+    Line::from(format!(
+        "↩ {name}  was {}{}  {note}",
+        p.spec,
+        if p.spec == p.row.current.to_string() {
+            String::new()
+        } else {
+            format!(" (installed {})", p.row.current)
+        }
+    ))
+    .style(Style::new().fg(Color::Magenta))
+}
+
 fn header_line(app: &App, label: &str, members: &[usize]) -> Line<'static> {
+    if label == crate::view::REMOVED && members.is_empty() {
+        return Line::from(format!("✂ {label} ({})", app.removed.len()))
+            .style(Style::new().fg(Color::Magenta).add_modifier(Modifier::BOLD));
+    }
     if label == UNNEEDED && members.is_empty() {
         let n = app
             .view

@@ -117,6 +117,10 @@ pub enum Item {
         idx: usize,
         name: String,
     },
+    /// A package uninstalled in this session, in the removed section; `r` restores it.
+    Removed {
+        name: String,
+    },
     /// An override listed on its own, in the section of overrides that look unnecessary.
     Override {
         key: String,
@@ -180,6 +184,7 @@ pub const UP_TO_DATE: &str = "Up to date";
 pub const OVERRIDDEN: &str = "Overridden packages";
 /// Label of the section listing overrides that look unnecessary.
 pub const UNNEEDED: &str = "Unneeded overrides";
+pub const REMOVED: &str = "Removed this session";
 
 /// Group label for a package name. Scoped packages group by scope; unscoped ones by the
 /// text before the first `-`, but only when at least two outdated packages share it.
@@ -331,6 +336,7 @@ mod tests {
                 Item::Row { name, .. } => name.clone(),
                 Item::Detail { child, .. } => format!("  - {child:?}"),
                 Item::Override { key } => format!("  ✂ {key}"),
+                Item::Removed { name } => format!("  ↩ {name}"),
             })
             .collect()
     }
@@ -498,7 +504,7 @@ mod tests {
                     Item::Detail { child, last, .. } => {
                         format!("{child:?}{}", if *last { "$" } else { "" })
                     }
-                    Item::Header { .. } | Item::Override { .. } => "H".into(),
+                    Item::Header { .. } | Item::Override { .. } | Item::Removed { .. } => "H".into(),
                 })
                 .collect()
         };
@@ -524,7 +530,7 @@ mod tests {
                 .map(|i| match i {
                     Item::Row { name, .. } => name.clone(),
                     Item::Header { label, .. } => format!("# {label}"),
-                    Item::Detail { .. } | Item::Override { .. } => "-".into(),
+                    Item::Detail { .. } | Item::Override { .. } | Item::Removed { .. } => "-".into(),
                 })
                 .collect()
         };

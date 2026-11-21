@@ -80,6 +80,12 @@ impl Pm {
         a
     }
 
+    pub fn uninstall_args(self, names: &[String]) -> Vec<String> {
+        let mut a: Vec<String> = vec![if self == Pm::Npm { "uninstall" } else { "remove" }.into()];
+        a.extend(names.iter().cloned());
+        a
+    }
+
     /// Executable name (Windows uses `.cmd` shims).
     pub fn program(self) -> String {
         if cfg!(windows) {
