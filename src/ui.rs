@@ -932,7 +932,7 @@ fn header_line(app: &App, label: &str, members: &[usize]) -> Line<'static> {
             .iter()
             .filter(|i| matches!(i, Item::Override { .. }))
             .count();
-        return Line::from(format!("✂ {label} ({n}), press x to remove"))
+        return Line::from(format!("✂ {label} ({n}), press d to remove"))
             .style(Style::new().fg(Color::Magenta).add_modifier(Modifier::BOLD));
     }
     let sel = members.iter().filter(|&&i| app.rows[i].selected).count();

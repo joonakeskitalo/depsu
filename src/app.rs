@@ -502,7 +502,6 @@ pub struct App {
     /// Overrides that look unnecessary, by key.
     unneeded: HashMap<String, Unneeded>,
     root_deps: Vec<(String, String)>,
-    confirm_remove: bool,
     /// Packages being reinstalled from the removed section.
     restoring: HashSet<String>,
     pub removed: Vec<RemovedPkg>,
@@ -665,7 +664,6 @@ impl App {
             busy_overrides: HashSet::new(),
             unneeded: HashMap::new(),
             root_deps,
-            confirm_remove: false,
             restoring: HashSet::new(),
             removed: Vec::new(),
             dependents: HashMap::new(),
@@ -1778,16 +1776,6 @@ impl App {
         if self.snyk.report.is_some() || self.audit.report.is_some() {
             scan.push(format!("v vulns: {}", if self.show_vulns { "shown" } else { "hidden" }));
         }
-        let remove = self
-            .visible_overrides()
-            .into_iter()
-            .any(|o| self.selected_overrides.contains(&o.key()) && !self.override_busy(o))
-            || self.cursor_override().is_some_and(|o| !self.override_busy(o))
-            || matches!(self.cursor_item(), Some(Item::Row { idx, .. })
-                if self.rows[*idx].overrides.iter().any(|o| !self.override_busy(o)));
-        if remove {
-            item.push("x remove override".into());
-        }
         if matches!(self.cursor_vuln_fix(), Some(Ok(_))) {
             item.push("i install fix".into());
         }
@@ -1960,9 +1948,6 @@ impl App {
         ) {
             self.confirm_conflicts = None;
         }
-        if key.code != KeyCode::Char('x') {
-            self.confirm_remove = false;
-        }
         if key.code != KeyCode::Char('p') {
             self.confirm_pin = false;
         }
@@ -2008,7 +1993,6 @@ impl App {
                 }
             }
             KeyCode::Char('i') | KeyCode::Enter => self.install_selected(),
-            KeyCode::Char('x') => self.remove_selected(),
             KeyCode::Char('p') => self.pin_selected(),
             KeyCode::Char('P') => self.ask_pin_type(),
             KeyCode::Char('s') => self.start_scan(Source::Snyk),
@@ -2297,7 +2281,7 @@ impl App {
             AddAs::Override => {
                 if let Some(o) = self.overrides.iter().find(|o| o.name == name && o.global()) {
                     return self.add_error(format!(
-                        "{name} is already overridden ({}). Remove that override with x first.",
+                        "{name} is already overridden ({}). Delete that override with d first.",
                         o.value
                     ));
                 }
@@ -2834,10 +2818,19 @@ impl App {
                 ));
             }
         }
-        if !overrides.is_empty() {
-            warnings.push(
-                "Removing overrides can bring back vulnerable versions: scan again afterwards".into(),
-            );
+        let flagged = overrides.iter().all(|o| self.unneeded(o).is_some());
+        if !overrides.is_empty() && !flagged {
+            let unflagged: Vec<&str> = overrides
+                .iter()
+                .filter(|o| self.unneeded(o).is_none())
+                .map(|o| o.name.as_str())
+                .collect();
+            warnings.push(format!(
+                "Not flagged ✂ unneeded: {}. Removing them can change which versions get installed and bring back vulnerable ones: scan again afterwards",
+                unflagged.join(", ")
+            ));
+        } else if !overrides.is_empty() {
+            warnings.push("Scan again afterwards to check nothing vulnerable came back".into());
         }
         self.delete_prompt = Some(DeletePrompt {
             packages,
@@ -3327,97 +3320,6 @@ pub fn scan_key(source: Source) -> char {
     if source.is_audit() { 'n' } else { 's' }
 }
 
-impl App {
-    /// Removes the checked overrides that look unnecessary, or the one under the cursor.
-    /// Asks for a second press first, since the verdict is a heuristic.
-    fn remove_selected(&mut self) {
-        let mut targets: Vec<Override> = self
-            .visible_overrides()
-            .into_iter()
-            .filter(|o| self.selected_overrides.contains(&o.key()))
-            .filter(|o| !self.override_busy(o))
-            .cloned()
-            .collect();
-        if targets.is_empty()
-            && let Some(item) = self.cursor_item().cloned()
-            && let Some(o) = self.detail_override(&item)
-            && !self.override_busy(o)
-        {
-            targets.push(o.clone());
-        }
-        // On a package: all overrides that target it.
-        if targets.is_empty()
-            && let Some(Item::Row { idx, .. }) = self.cursor_item().cloned()
-        {
-            targets.extend(
-                self.rows[idx]
-                    .overrides
-                    .iter()
-                    .filter(|o| !self.override_busy(o))
-                    .cloned(),
-            );
-        }
-        if targets.is_empty() {
-            self.push_log("Nothing to remove: put the cursor on an override or on a package that has one, or select overrides with space.");
-            return;
-        }
-
-        if !self.confirm_remove {
-            self.confirm_remove = true;
-            let names: Vec<String> = targets.iter().map(|o| o.describe()).collect();
-            self.push_log(format!(
-                "✂ will remove from package.json: {}. Press x again to confirm, any other key cancels.",
-                names.join("; ")
-            ));
-            for o in &targets {
-                let users = self.dependents_of(&o.name);
-                if users.is_empty() {
-                    continue;
-                }
-                let mut names: Vec<&str> = users.iter().map(|d| d.name.as_str()).collect();
-                names.sort();
-                names.dedup();
-                let more = names.len().saturating_sub(5);
-                let mut list = names.iter().take(5).copied().collect::<Vec<_>>().join(", ");
-                if more > 0 {
-                    list.push_str(&format!(", +{more} more"));
-                }
-                self.push_log(format!(
-                    "⚠ {} is used by {list}: removing its override can change which version they get.",
-                    o.name
-                ));
-            }
-            if targets.iter().any(|o| self.unneeded(o).is_none()) {
-                self.push_log(
-                    "⚠ Not flagged as unneeded: changed it can change which versions get installed and reintroduce vulnerabilities.",
-                );
-            }
-            return;
-        }
-        self.confirm_remove = false;
-
-        let mut edits = Vec::new();
-        let mut keys = Vec::new();
-        for o in &targets {
-            keys.push(o.key());
-            self.changed.insert(o.key());
-            self.selected_overrides.remove(&o.key());
-            self.busy_overrides.insert(o.key());
-            edits.push(Change::Remove {
-                loc: o.loc.clone(),
-                old: o.value.clone(),
-            });
-        }
-        let what: Vec<String> = keys.iter().map(|k| override_label(k)).collect();
-        self.push_log(format!("… queued removal of {}", what.join(", ")));
-        let _ = self.jobs.send(Job {
-            items: Vec::new(),
-            edits,
-            keys,
-            ..Default::default()
-        });
-    }
-}
 
 /// The version an overridden package is at: the lowest of its overrides that name a literal
 /// version, with that override's prefix.
@@ -5364,6 +5266,46 @@ mod tests {
             let bottom: Vec<char> = rows.last().unwrap().chars().collect();
             assert!(bottom[left] == '╰' && bottom[right] == '╯', "{w}x{h}");
         }
+    }
+
+    #[test]
+    fn d_removes_an_unneeded_override_and_x_no_longer_does_anything() {
+        let (mut app, rx) = app_capturing_installs();
+        let o = ovr("lodash", "4.17.21", "lodash");
+        app.unneeded.insert(o.key(), Unneeded::Unused);
+        app.overrides = vec![o];
+        app.rebuild_view();
+        let screen = render(&mut app, 120, 30).join("\n");
+        assert!(screen.contains("Unneeded overrides (1), press d to remove"), "{screen}");
+        cursor_to(&mut app, |it| matches!(it, Item::Override { .. }));
+        assert!(app.hints().0.contains(&"d remove override".to_string()));
+        assert!(!app.hints().0.iter().any(|h| h.starts_with("x ")));
+
+        app.on_key(key('x'));
+        assert!(app.delete_prompt.is_none() && rx.try_recv().is_err(), "x is free now");
+
+        app.on_key(key('d'));
+        let p = app.delete_prompt.as_ref().expect("asks first");
+        assert_eq!(p.overrides[0].name, "lodash");
+        assert!(p.warnings.iter().any(|w| w.starts_with("Scan again")), "{:?}", p.warnings);
+        app.on_key(key('y'));
+        let job = rx.try_recv().expect("queued");
+        assert_eq!(
+            job.edits,
+            [Change::Remove {
+                loc: vec!["overrides".into(), "lodash".into()],
+                old: "4.17.21".into()
+            }]
+        );
+    }
+
+    #[test]
+    fn removing_an_override_not_flagged_unneeded_warns_in_the_dialog() {
+        let (mut app, _rx) = app_to_delete_from();
+        cursor_to(&mut app, |it| matches!(it, Item::Detail { child: Child::Own(0), .. }));
+        app.on_key(key('d'));
+        let w = &app.delete_prompt.as_ref().unwrap().warnings;
+        assert!(w.iter().any(|w| w.starts_with("Not flagged ✂ unneeded: a.")), "{w:?}");
     }
 
     #[test]
