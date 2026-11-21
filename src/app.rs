@@ -43,6 +43,19 @@ pub enum Event {
     InstallStarted {
         names: Vec<String>,
     },
+    /// The registry answered whether the version typed for a package exists.
+    VersionChecked {
+        name: String,
+        version: Version,
+        result: Result<registry::Packument, String>,
+    },
+    /// The registry answered about a package to add.
+    AddChecked {
+        name: String,
+        add_as: AddAs,
+        version: Option<Version>,
+        result: Result<registry::Packument, String>,
+    },
     /// The peer dependency check of an install is done.
     PeerCheck {
         plan: Vec<(String, Version)>,
@@ -95,6 +108,72 @@ pub struct RemovedPkg {
     pub spec: String,
     pub status: Status,
 }
+/// Looks a package up in the registry. Replaceable so tests run without the network.
+pub type Fetcher = Arc<dyn Fn(&str) -> Result<registry::Packument, String> + Send + Sync>;
+
+/// Text the user is typing: a version in the footer (`e`), or a package in the add dialog
+/// (`+`).
+pub struct Input {
+    pub purpose: InputPurpose,
+    pub text: String,
+    /// Why the last attempt didn't work, shown in the dialog.
+    pub error: Option<String>,
+    /// The package being looked up in the registry, while the dialog waits for it.
+    pub looking_up: Option<String>,
+}
+
+impl Input {
+    fn new(purpose: InputPurpose) -> Input {
+        Input {
+            purpose,
+            text: String::new(),
+            error: None,
+            looking_up: None,
+        }
+    }
+}
+
+pub enum InputPurpose {
+    /// A version to install for an existing package (`e`).
+    Version { name: String },
+    /// A package to add to the project (`+`).
+    Add { add_as: AddAs },
+}
+
+/// What a package is added as.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AddAs {
+    Dependency,
+    Dev,
+    /// An entry in `overrides` (npm, bun), `resolutions` (yarn) or `pnpm.overrides`.
+    Override,
+}
+
+impl AddAs {
+    pub const ALL: [AddAs; 3] = [AddAs::Dependency, AddAs::Dev, AddAs::Override];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            AddAs::Dependency => "dependency",
+            AddAs::Dev => "dev dependency",
+            AddAs::Override => "override",
+        }
+    }
+
+    fn step(self, by: isize) -> AddAs {
+        let i = AddAs::ALL.iter().position(|a| *a == self).unwrap_or(0) as isize;
+        AddAs::ALL[(i + by).rem_euclid(AddAs::ALL.len() as isize) as usize]
+    }
+}
+
+/// A package being added: what to install and what the registry says is the latest.
+#[derive(Clone)]
+struct Adding {
+    kind: Kind,
+    version: Version,
+    latest: Version,
+}
+
 /// An install waiting for the user to decide about the other packages it needs changed.
 pub struct PeerPrompt {
     /// What the user asked to install: (name, version).
@@ -275,6 +354,11 @@ pub struct App {
     pub peer_prompt: Option<PeerPrompt>,
     /// The peer dependencies of an install are being checked.
     peer_checking: bool,
+    /// Text the user is typing: a version (`e`) or a package to add (`+`).
+    pub input: Option<Input>,
+    /// Packages being added, by name.
+    adding: HashMap<String, Adding>,
+    fetcher: Fetcher,
     pub log: Vec<String>,
     /// The log is expanded to fill the screen and takes the keys (toggled with Tab).
     pub log_focus: bool,
@@ -434,6 +518,12 @@ impl App {
             pin_prompt: false,
             peer_prompt: None,
             peer_checking: false,
+            input: None,
+            adding: HashMap::new(),
+            fetcher: {
+                let (rc, agent) = (rc.clone(), agent.clone());
+                Arc::new(move |n: &str| registry::packument(&rc, &agent, n))
+            },
             log: Vec::new(),
             log_focus: false,
             log_scroll: 0,
@@ -798,7 +888,8 @@ impl App {
     }
 
     pub fn installing(&self) -> bool {
-        !self.busy_overrides.is_empty()
+        !self.adding.is_empty()
+            || !self.busy_overrides.is_empty()
             || self.rows.iter().any(Row::busy)
             || self.removed.iter().any(|p| matches!(p.status, Status::Queued | Status::Installing))
     }
@@ -855,6 +946,17 @@ impl App {
                     }
                 }
                 Event::PeerCheck { plan, ovr, report } => self.on_peer_check(plan, ovr, report),
+                Event::VersionChecked {
+                    name,
+                    version,
+                    result,
+                } => self.on_version_checked(name, version, result),
+                Event::AddChecked {
+                    name,
+                    add_as,
+                    version,
+                    result,
+                } => self.on_add_checked(name, add_as, version, result),
                 Event::InstallFinished {
                     names,
                     keys,
@@ -969,6 +1071,11 @@ impl App {
         keys: Vec<String>,
         result: Result<(), String>,
     ) {
+        let ok = result.is_ok();
+        let added: Vec<(String, Adding)> = names
+            .iter()
+            .filter_map(|n| Some((n.clone(), self.adding.remove(n)?)))
+            .collect();
         let mut removed = false;
         for k in &keys {
             self.busy_overrides.remove(k);
@@ -1078,6 +1185,15 @@ impl App {
                 {
                     self.push_log(format!("  {line}"));
                 }
+            }
+        }
+        // A package that was added gets a row, like the others had from the start.
+        if ok {
+            for (name, a) in added {
+                self.current
+                    .insert(name.clone(), (a.kind, "^", a.version.clone()));
+                self.direct.insert(name.clone());
+                self.on_fetched(name, a.latest);
             }
         }
         // An install changes `node_modules` and usually `package.json` (also when it failed
@@ -1510,6 +1626,7 @@ impl App {
             item.push("i install".into());
         }
         global.push("/ filter".into());
+        global.push("+ add package".into());
         global.push("R fetch versions".into());
         global.push(format!("? details: {}", if self.show_info { "on" } else { "off" }));
         global.push("g group".into());
@@ -1540,6 +1657,12 @@ impl App {
         if !self.acting_rows(|r| !r.busy() && !r.vulns.is_empty()).is_empty() {
             item.push("p pin fix as override".into());
         }
+        if let Some(Item::Row { idx, .. }) = self.cursor_item()
+            && self.rows[*idx].kind != Kind::Override
+            && !self.rows[*idx].busy()
+        {
+            item.push("e set version".into());
+        }
         if !self.acting_rows(|r| !r.busy() && r.kind != Kind::Override).is_empty() {
             item.push("d uninstall".into());
         }
@@ -1567,6 +1690,10 @@ impl App {
             self.quit = true;
             return;
         }
+        if self.input.is_some() {
+            self.on_input_key(key);
+            return;
+        }
         if self.filter_mode {
             self.on_filter_key(key);
             return;
@@ -1579,7 +1706,12 @@ impl App {
                     self.queue_install(plan, p.ovr);
                 }
                 KeyCode::Char('n') if !p.extra.is_empty() => self.queue_install(p.plan, p.ovr),
-                _ => self.push_log("Install cancelled."),
+                _ => {
+                    for (name, _) in &p.plan {
+                        self.adding.remove(name);
+                    }
+                    self.push_log("Install cancelled.");
+                }
             }
             return;
         }
@@ -1674,6 +1806,12 @@ impl App {
             KeyCode::Char('?') => self.show_info = !self.show_info,
             KeyCode::Char('R') => self.refetch_latest(),
             KeyCode::Char('r') => self.revert_selected(),
+            KeyCode::Char('e') => self.ask_version(),
+            KeyCode::Char('+') => {
+                self.input = Some(Input::new(InputPurpose::Add {
+                    add_as: AddAs::Dependency,
+                }))
+            }
             KeyCode::Char('d') => self.uninstall_selected(),
             KeyCode::Char('y') => {
                 let md = crate::export::markdown(self);
@@ -1710,6 +1848,247 @@ impl App {
             _ => {}
         }
     }
+    fn on_input_key(&mut self, key: KeyEvent) {
+        let Some(input) = &mut self.input else {
+            return;
+        };
+        // While the registry is asked, only cancelling does anything.
+        if input.looking_up.is_some() && key.code != KeyCode::Esc {
+            return;
+        }
+        match key.code {
+            KeyCode::Esc => self.input = None,
+            KeyCode::Enter => match &input.purpose {
+                InputPurpose::Version { name } => {
+                    let (name, text) = (name.clone(), input.text.clone());
+                    self.input = None;
+                    self.submit_version(name, &text);
+                }
+                InputPurpose::Add { add_as } => {
+                    let (add_as, text) = (*add_as, input.text.clone());
+                    self.submit_add(add_as, &text);
+                }
+            },
+            KeyCode::Backspace => {
+                input.text.pop();
+                input.error = None;
+            }
+            KeyCode::Tab | KeyCode::Down | KeyCode::BackTab | KeyCode::Up => {
+                if let InputPurpose::Add { add_as } = &mut input.purpose {
+                    let by = if matches!(key.code, KeyCode::BackTab | KeyCode::Up) { -1 } else { 1 };
+                    *add_as = add_as.step(by);
+                    input.error = None;
+                }
+            }
+            KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                input.text.push(c);
+                input.error = None;
+            }
+            _ => {}
+        }
+    }
+
+    // ---- choosing a version, adding a package -------------------------------------------
+
+    /// Asks which version to install for the package under the cursor.
+    fn ask_version(&mut self) {
+        let Some(Item::Row { idx, .. }) = self.cursor_item() else {
+            self.push_log("Put the cursor on a package to choose its version.");
+            return;
+        };
+        let r = &self.rows[*idx];
+        if r.kind == Kind::Override {
+            self.push_log(format!(
+                "{} isn't a dependency of the project: its version comes from its overrides.",
+                r.name
+            ));
+            return;
+        }
+        if r.busy() {
+            return;
+        }
+        self.input = Some(Input::new(InputPurpose::Version {
+            name: r.name.clone(),
+        }));
+    }
+
+    fn submit_version(&mut self, name: String, text: &str) {
+        let Some(version) = parse_version(text) else {
+            self.push_log(format!(
+                "✘ {:?} isn't a version like 1.2.3. To change how it is pinned (^, ~), use P.",
+                text.trim()
+            ));
+            return;
+        };
+        self.push_log(format!("… looking up {name}@{version}"));
+        let (fetch, tx) = (self.fetcher.clone(), self.events_tx.clone());
+        thread::spawn(move || {
+            let result = fetch(&name);
+            let _ = tx.send(Event::VersionChecked {
+                name,
+                version,
+                result,
+            });
+        });
+    }
+
+    fn on_version_checked(
+        &mut self,
+        name: String,
+        version: Version,
+        result: Result<registry::Packument, String>,
+    ) {
+        let doc = match result {
+            Ok(d) => d,
+            Err(e) => return self.push_log(format!("✘ could not look up {name}: {e}")),
+        };
+        if !doc.versions.contains_key(&version) {
+            return self.push_log(no_such_version(&name, &version, &doc));
+        }
+        let Some(i) = self.rows.iter().position(|r| r.name == name) else {
+            return;
+        };
+        if self.rows[i].busy() {
+            return;
+        }
+        // The version was typed, so a clash with an override is reported but doesn't stop it.
+        self.dispatch(None, vec![(i, version)], Vec::new());
+    }
+
+    /// Shows `msg` in the add dialog, which stays open so the text can be fixed.
+    fn add_error(&mut self, msg: String) {
+        if let Some(input) = &mut self.input {
+            input.error = Some(msg);
+            input.looking_up = None;
+        }
+    }
+
+    /// Checks `text` (`name` or `name@version`), then asks the registry about it while the
+    /// dialog waits.
+    fn submit_add(&mut self, add_as: AddAs, text: &str) {
+        let text = text.trim();
+        // `@scope/name@1.2.3`: the version separator is the last `@` after the first character.
+        let (name, version) = match text.get(1..).and_then(|t| t.rfind('@')) {
+            Some(i) => (&text[..i + 1], Some(&text[i + 2..])),
+            None => (text, None),
+        };
+        if name.is_empty() {
+            return self.add_error("Type the name of a package.".into());
+        }
+        if !valid_package_name(name) {
+            return self.add_error(format!("{name:?} isn't a package name."));
+        }
+        let version = match version.map(parse_version) {
+            None => None,
+            Some(Some(v)) => Some(v),
+            Some(None) => {
+                return self.add_error(format!(
+                    "{:?} isn't a version like 1.2.3. Leave it out to add the latest.",
+                    version.unwrap_or("")
+                ));
+            }
+        };
+        match add_as {
+            AddAs::Dependency | AddAs::Dev => {
+                if self.direct.contains(name) {
+                    return self.add_error(format!(
+                        "{name} is already a dependency. Close this and press e on it to choose its version."
+                    ));
+                }
+                if self.adding.contains_key(name) {
+                    return self.add_error(format!("{name} is already being added."));
+                }
+            }
+            AddAs::Override => {
+                if let Some(o) = self.overrides.iter().find(|o| o.name == name && o.global()) {
+                    return self.add_error(format!(
+                        "{name} is already overridden ({}). Remove that override with x first.",
+                        o.value
+                    ));
+                }
+                if self.pm == Pm::Npm && self.direct.contains(name) {
+                    return self.add_error(format!(
+                        "{name} is a dependency of the project: npm needs its override to equal its version in package.json. Press e on it to choose its version instead."
+                    ));
+                }
+            }
+        }
+        if let Some(input) = &mut self.input {
+            input.looking_up = Some(name.to_string());
+            input.error = None;
+        }
+        let (fetch, tx, name) = (self.fetcher.clone(), self.events_tx.clone(), name.to_string());
+        thread::spawn(move || {
+            let result = fetch(&name);
+            let _ = tx.send(Event::AddChecked {
+                name,
+                add_as,
+                version,
+                result,
+            });
+        });
+    }
+
+    fn on_add_checked(
+        &mut self,
+        name: String,
+        add_as: AddAs,
+        version: Option<Version>,
+        result: Result<registry::Packument, String>,
+    ) {
+        // The dialog was closed, or something else was asked for since.
+        if self.input.as_ref().and_then(|i| i.looking_up.as_deref()) != Some(name.as_str()) {
+            return;
+        }
+        let doc = match result {
+            Ok(d) => d,
+            Err(e) => return self.add_error(format!("Could not look up {name}: {e}")),
+        };
+        let version = match version {
+            Some(v) if doc.versions.contains_key(&v) => v,
+            Some(v) => {
+                let msg = no_such_version(&name, &v, &doc);
+                return self.add_error(msg.trim_start_matches("✘ ").to_string());
+            }
+            None => match &doc.latest {
+                Some(l) => l.clone(),
+                None => return self.add_error(format!("{name} has no `latest` version.")),
+            },
+        };
+        self.input = None;
+        let latest = doc.latest.clone().unwrap_or_else(|| version.clone());
+        match add_as {
+            AddAs::Override => self.add_override(&name, &version),
+            AddAs::Dependency | AddAs::Dev => {
+                let kind = if add_as == AddAs::Dev { Kind::Dev } else { Kind::Prod };
+                self.adding.insert(
+                    name.clone(),
+                    Adding {
+                        kind,
+                        version: version.clone(),
+                        latest,
+                    },
+                );
+                self.start_install(vec![(name, version)], Vec::new());
+            }
+        }
+    }
+
+    /// Adds an override that forces `name` to `version` everywhere in the dependency tree.
+    fn add_override(&mut self, name: &str, version: &Version) {
+        let loc = self.new_override_loc(name);
+        let key = loc.join("\u{1f}");
+        let new = format!("^{version}");
+        self.changed.insert(key.clone());
+        self.busy_overrides.insert(key.clone());
+        self.push_log(format!("… queued override {name} → {new}"));
+        let _ = self.jobs.send(Job {
+            edits: vec![Change::Add { loc, new }],
+            keys: vec![key],
+            ..Default::default()
+        });
+    }
+
     fn on_filter_key(&mut self, key: KeyEvent) {
         match key.code {
             KeyCode::Esc => {
@@ -1840,7 +2219,7 @@ impl App {
             && !self.rows.iter().any(|r| r.selected && r.actionable())
         {
             match fix {
-                Ok((i, target)) => self.dispatch('i', vec![(i, target)], Vec::new()),
+                Ok((i, target)) => self.dispatch(Some('i'), vec![(i, target)], Vec::new()),
                 Err(msg) => self.push_log(msg),
             }
             return;
@@ -1897,7 +2276,7 @@ impl App {
             .into_iter()
             .map(|i| (i, self.rows[i].latest.clone()))
             .collect();
-        self.dispatch('i', pkgs, ovr);
+        self.dispatch(Some('i'), pkgs, ovr);
     }
 
     /// Uninstalls the checked packages, or the one under the cursor. Asks to press `d` again.
@@ -2015,7 +2394,14 @@ impl App {
     /// Queues the installs of `pkgs` (row index, version to install) and the override updates.
     /// `key` is the key the user pressed, which must be pressed again to go ahead when an
     /// update clashes with an override.
-    fn dispatch(&mut self, key: char, pkgs: Vec<(usize, Version)>, ovr: Vec<(Override, String)>) {
+    /// `key` is the key that must be pressed again to go ahead despite override conflicts;
+    /// `None` when the user typed the version, so the conflict is only reported.
+    fn dispatch(
+        &mut self,
+        key: Option<char>,
+        pkgs: Vec<(usize, Version)>,
+        ovr: Vec<(Override, String)>,
+    ) {
         if pkgs.is_empty() && ovr.is_empty() {
             return;
         }
@@ -2029,25 +2415,45 @@ impl App {
             })
             .map(|(i, _)| self.rows[*i].name.as_str())
             .collect();
-        if !conflicts.is_empty() && self.confirm_conflicts != Some(key) {
-            let msg = format!(
-                "⚠ conflicts with overrides: {}. Press {key} again to install anyway, any other key cancels.",
-                conflicts.join(", ")
-            );
-            self.confirm_conflicts = Some(key);
-            self.push_log(msg);
-            return;
+        if !conflicts.is_empty() {
+            match key {
+                Some(key) if self.confirm_conflicts != Some(key) => {
+                    let msg = format!(
+                        "⚠ conflicts with overrides: {}. Press {key} again to install anyway, any other key cancels.",
+                        conflicts.join(", ")
+                    );
+                    self.confirm_conflicts = Some(key);
+                    self.push_log(msg);
+                    return;
+                }
+                None => {
+                    let msg = format!(
+                        "⚠ conflicts with overrides: {}. The override may keep the version from changing.",
+                        conflicts.join(", ")
+                    );
+                    self.push_log(msg);
+                }
+                Some(_) => {}
+            }
         }
         self.confirm_conflicts = None;
         let plan: Vec<(String, Version)> = pkgs
             .into_iter()
             .map(|(i, v)| (self.rows[i].name.clone(), v))
             .collect();
+        self.start_install(plan, ovr);
+    }
+
+    /// Checks the peer dependencies of `plan`, then installs or asks.
+    fn start_install(&mut self, plan: Vec<(String, Version)>, ovr: Vec<(Override, String)>) {
         if plan.is_empty() {
             self.queue_install(plan, ovr);
             return;
         }
         if self.peer_checking {
+            for (name, _) in &plan {
+                self.adding.remove(name);
+            }
             self.push_log("Still checking the peer dependencies of the previous install.");
             return;
         }
@@ -2060,17 +2466,16 @@ impl App {
             .filter(|r| r.kind != Kind::Override)
             .map(|r| r.name.clone())
             .collect();
-        let (dir, rc, agent, tx) = (
+        let (dir, fetcher, tx) = (
             self.dir.clone(),
-            self.rc.clone(),
-            self.agent.clone(),
+            self.fetcher.clone(),
             self.events_tx.clone(),
         );
         thread::spawn(move || {
             let lock = crate::tree::npm_lock_versions(&dir);
             let installed = |n: &str| resolved_version(&dir, lock.as_ref(), n);
             let installed_peers = |n: &str| crate::tree::installed_peers(&dir, n);
-            let fetch = |n: &str| registry::packument(&rc, &agent, n);
+            let fetch = |n: &str| fetcher(n);
             let report = peers::check(
                 &plan,
                 &peers::Project {
@@ -2131,6 +2536,7 @@ impl App {
         // The answer must not land in the filter or the pin type prompt.
         self.filter_mode = false;
         self.pin_prompt = false;
+        self.input = None;
         self.peer_prompt = Some(PeerPrompt {
             plan,
             ovr,
@@ -2144,6 +2550,15 @@ impl App {
         let mut items = Vec::new();
         for (name, target) in plan {
             let Some(r) = self.rows.iter_mut().find(|r| r.name == name) else {
+                if let Some(a) = self.adding.get(&name) {
+                    items.push(InstallItem {
+                        name: name.clone(),
+                        spec: format!("^{target}"),
+                        kind: a.kind,
+                        exact: false,
+                        old: None,
+                    });
+                }
                 continue;
             };
             if r.busy() {
@@ -2767,6 +3182,41 @@ fn install_worker(dir: PathBuf, pm: Pm, jobs: Receiver<Job>, tx: Sender<Event>) 
     }
 }
 
+/// `1.2.3`, also written `v1.2.3` or `=1.2.3`.
+fn parse_version(text: &str) -> Option<Version> {
+    Version::parse(text.trim().trim_start_matches(['v', '='])).ok()
+}
+
+/// npm package names: `name` or `@scope/name`, of URL-safe characters.
+fn valid_package_name(name: &str) -> bool {
+    let ok = |part: &str| {
+        !part.is_empty()
+            && !part.starts_with('.')
+            && part
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || "-._~".contains(c))
+    };
+    match name.strip_prefix('@') {
+        Some(scoped) => matches!(scoped.split_once('/'), Some((scope, pkg)) if ok(scope) && ok(pkg)),
+        None => ok(name) && name.len() <= 214,
+    }
+}
+
+fn no_such_version(name: &str, version: &Version, doc: &registry::Packument) -> String {
+    // The nearest published versions around the one asked for.
+    let below = doc.versions.keys().filter(|v| *v < version).next_back();
+    let above = doc.versions.keys().find(|v| *v > version);
+    let near: Vec<String> = below.into_iter().chain(above).map(Version::to_string).collect();
+    let mut msg = format!("✘ {name} has no published version {version}");
+    if !near.is_empty() {
+        msg.push_str(&format!(" (nearest: {})", near.join(", ")));
+    }
+    if let Some(l) = &doc.latest {
+        msg.push_str(&format!(", latest is {l}"));
+    }
+    msg
+}
+
 fn spec_in_manifest(root_deps: &[(String, String)], name: &str) -> Option<String> {
     root_deps
         .iter()
@@ -2798,15 +3248,25 @@ fn install_plan(pm: Pm, items: &[InstallItem]) -> InstallPlan {
             None => groups.push(((it.kind, it.exact), vec![arg])),
         }
     }
-    let editable = items.iter().all(|it| it.old.is_some() && it.kind != Kind::Override);
+    let editable = items.iter().all(|it| it.kind != Kind::Override);
     if groups.len() > 1 && editable {
         return InstallPlan::Manifest(
             items
                 .iter()
-                .map(|it| Change::Set {
-                    loc: vec![dep_field(it.kind).to_string(), it.name.clone()],
-                    old: it.old.clone().unwrap_or_default(),
-                    new: it.spec.clone(),
+                .map(|it| {
+                    let loc = vec![dep_field(it.kind).to_string(), it.name.clone()];
+                    match &it.old {
+                        Some(old) => Change::Set {
+                            loc,
+                            old: old.clone(),
+                            new: it.spec.clone(),
+                        },
+                        // Not in package.json yet: a package being added or restored.
+                        None => Change::Add {
+                            loc,
+                            new: it.spec.clone(),
+                        },
+                    }
                 })
                 .collect(),
         );
@@ -3455,19 +3915,25 @@ mod tests {
     }
 
     #[test]
-    fn a_package_missing_from_package_json_falls_back_to_commands() {
-        // E.g. restoring a package that was uninstalled: there's no entry to edit.
+    fn a_package_not_in_package_json_yet_is_added_to_it() {
+        // A package being added (or restored) together with a package of another kind.
         let plan = install_plan(
             Pm::Npm,
             &[
                 item("react", "^19.0.0", Kind::Prod, Some("^18.2.0")),
-                item("lodash", "4.17.21", Kind::Dev, None),
+                item("lodash", "^4.17.21", Kind::Dev, None),
             ],
         );
-        let InstallPlan::Commands(cmds) = plan else {
+        let InstallPlan::Manifest(changes) = plan else {
             panic!("{plan:?}");
         };
-        assert_eq!(cmds.len(), 2);
+        assert_eq!(
+            changes[1],
+            Change::Add {
+                loc: vec!["devDependencies".into(), "lodash".into()],
+                new: "^4.17.21".into()
+            }
+        );
     }
 
     #[test]
@@ -3496,6 +3962,267 @@ mod tests {
         install_with_manifest(&path, &changes, || Ok(())).unwrap();
         assert!(std::fs::read_to_string(&path).unwrap().contains("\"react\": \"^19.0.0\""));
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A fake registry: `a` has 1.0.0, 1.5.0 and 2.0.0; `lodash` has 4.17.20 and 4.17.21.
+    fn fake_registry() -> Fetcher {
+        use crate::registry::{Packument, VersionInfo};
+        let doc = |latest: &str, versions: &[&str]| Packument {
+            latest: Some(Version::parse(latest).unwrap()),
+            versions: versions
+                .iter()
+                .map(|v| (Version::parse(v).unwrap(), VersionInfo::default()))
+                .collect(),
+        };
+        let docs = HashMap::from([
+            ("a".to_string(), doc("2.0.0", &["1.0.0", "1.5.0", "2.0.0"])),
+            ("b".to_string(), doc("1.0.0", &["1.0.0"])),
+            ("lodash".to_string(), doc("4.17.21", &["4.17.20", "4.17.21"])),
+        ]);
+        Arc::new(move |n: &str| docs.get(n).cloned().ok_or_else(|| format!("{n} not found")))
+    }
+    fn offline_app() -> (App, Receiver<Job>) {
+        let (mut app, rx) = app_capturing_installs();
+        app.fetcher = fake_registry();
+        (app, rx)
+    }
+    fn type_text(app: &mut App, text: &str) {
+        for c in text.chars() {
+            app.on_key(key(c));
+        }
+    }
+    fn press(app: &mut App, code: KeyCode) {
+        app.on_key(KeyEvent::new(code, KeyModifiers::NONE));
+    }
+    /// Handles background events until an install is queued, or the log says `done`. With
+    /// `done` = "never", waits briefly to show that nothing happens.
+    fn settle(app: &mut App, rx: &Receiver<Job>, done: &str) -> Vec<Job> {
+        let wait = if done == "never" { 200 } else { 5000 };
+        let until = std::time::Instant::now() + std::time::Duration::from_millis(wait);
+        let mut jobs = Vec::new();
+        while std::time::Instant::now() < until {
+            app.drain_events();
+            jobs.extend(rx.try_iter());
+            if !jobs.is_empty() || (!done.is_empty() && app.log.iter().any(|l| l.contains(done))) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        jobs
+    }
+    fn specs(jobs: &[Job]) -> Vec<String> {
+        jobs.iter()
+            .flat_map(|j| &j.items)
+            .map(|i| format!("{}@{}", i.name, i.spec))
+            .collect()
+    }
+
+    #[test]
+    fn e_installs_the_version_the_user_types() {
+        let (mut app, rx) = offline_app();
+        assert!(matches!(app.cursor_item(), Some(Item::Row { name, .. }) if name == "a"));
+        app.on_key(key('e'));
+        assert!(matches!(&app.input, Some(Input { purpose: InputPurpose::Version { name }, .. }) if name == "a"));
+        type_text(&mut app, "1.5.0");
+        press(&mut app, KeyCode::Enter);
+        assert!(app.input.is_none());
+        let jobs = settle(&mut app, &rx, "");
+        assert_eq!(specs(&jobs), ["a@^1.5.0"], "keeps the ^ pin type");
+    }
+
+    #[test]
+    fn e_rejects_a_version_that_was_never_published() {
+        let (mut app, rx) = offline_app();
+        app.on_key(key('e'));
+        type_text(&mut app, "1.4.0");
+        press(&mut app, KeyCode::Enter);
+        let jobs = settle(&mut app, &rx, "no published version");
+        assert!(jobs.is_empty());
+        let msg = app.log.iter().find(|l| l.contains("no published version")).unwrap();
+        assert!(msg.contains("a has no published version 1.4.0 (nearest: 1.0.0, 1.5.0), latest is 2.0.0"), "{msg}");
+    }
+
+    #[test]
+    fn e_rejects_text_that_is_not_a_version() {
+        let (mut app, rx) = offline_app();
+        app.on_key(key('e'));
+        type_text(&mut app, "^1.5");
+        press(&mut app, KeyCode::Enter);
+        assert!(app.log.last().unwrap().contains("isn't a version like 1.2.3"));
+        assert!(settle(&mut app, &rx, "never").is_empty());
+    }
+
+    #[test]
+    fn esc_cancels_typing() {
+        let (mut app, rx) = offline_app();
+        app.on_key(key('e'));
+        type_text(&mut app, "1.5.0");
+        press(&mut app, KeyCode::Esc);
+        assert!(app.input.is_none());
+        assert!(settle(&mut app, &rx, "never").is_empty());
+        // Keys work as usual again.
+        app.on_key(key('?'));
+        assert!(app.show_info);
+    }
+
+    #[test]
+    fn plus_adds_a_package_with_the_chosen_version_and_type() {
+        let (mut app, rx) = offline_app();
+        app.on_key(key('+'));
+        type_text(&mut app, "lodash@4.17.20");
+        press(&mut app, KeyCode::Tab); // dependency → dev dependency
+        assert!(matches!(&app.input, Some(Input { purpose: InputPurpose::Add { add_as: AddAs::Dev }, .. })));
+        press(&mut app, KeyCode::Enter);
+        let jobs = settle(&mut app, &rx, "");
+        assert_eq!(specs(&jobs), ["lodash@^4.17.20"]);
+        assert_eq!(jobs[0].items[0].kind, Kind::Dev);
+        assert_eq!(jobs[0].items[0].old, None, "not in package.json yet");
+
+        // Once installed it is listed like the others.
+        app.on_install_finished(vec!["lodash".into()], Vec::new(), Ok(()));
+        let r = row(&app, "lodash");
+        assert_eq!(r.kind, Kind::Dev);
+        assert_eq!(r.current, Version::new(4, 17, 20));
+        assert!(r.outdated, "4.17.21 is out");
+        assert!(!app.installing());
+    }
+
+    #[test]
+    fn plus_without_a_version_adds_the_latest() {
+        let (mut app, rx) = offline_app();
+        app.on_key(key('+'));
+        type_text(&mut app, "lodash");
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(specs(&settle(&mut app, &rx, "")), ["lodash@^4.17.21"]);
+    }
+
+    fn add_error(app: &App) -> String {
+        app.input.as_ref().and_then(|i| i.error.clone()).unwrap_or_default()
+    }
+
+    #[test]
+    fn problems_are_shown_in_the_dialog_which_stays_open() {
+        let (mut app, rx) = offline_app();
+        app.on_key(key('+'));
+        type_text(&mut app, "a");
+        press(&mut app, KeyCode::Enter);
+        assert!(add_error(&app).contains("a is already a dependency"), "{}", add_error(&app));
+        // Fixing the text clears the message.
+        press(&mut app, KeyCode::Backspace);
+        assert_eq!(add_error(&app), "");
+
+        type_text(&mut app, "nope");
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.input.as_ref().unwrap().looking_up.as_deref(), Some("nope"));
+        // Keys other than esc wait for the registry.
+        app.on_key(key('x'));
+        assert_eq!(app.input.as_ref().unwrap().text, "nope");
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while add_error(&app).is_empty() && std::time::Instant::now() < until {
+            app.drain_events();
+        }
+        assert!(add_error(&app).contains("Could not look up nope"), "{}", add_error(&app));
+        assert!(app.input.as_ref().unwrap().looking_up.is_none());
+
+        app.input.as_mut().unwrap().text.clear();
+        type_text(&mut app, "lodash@4.0.0");
+        press(&mut app, KeyCode::Enter);
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while add_error(&app).is_empty() && std::time::Instant::now() < until {
+            app.drain_events();
+        }
+        assert!(add_error(&app).contains("lodash has no published version 4.0.0"), "{}", add_error(&app));
+
+        app.input.as_mut().unwrap().text.clear();
+        type_text(&mut app, "not a name");
+        press(&mut app, KeyCode::Enter);
+        assert!(add_error(&app).contains("isn't a package name"));
+        assert!(rx.try_iter().next().is_none());
+        assert!(!app.installing(), "nothing left half-added");
+    }
+
+    #[test]
+    fn closing_the_dialog_while_looking_up_drops_the_answer() {
+        let (mut app, rx) = offline_app();
+        app.on_key(key('+'));
+        type_text(&mut app, "lodash");
+        press(&mut app, KeyCode::Enter);
+        press(&mut app, KeyCode::Esc);
+        assert!(app.input.is_none());
+        assert!(settle(&mut app, &rx, "never").is_empty());
+        assert!(!app.installing());
+    }
+
+    #[test]
+    fn plus_adds_an_override() {
+        let (mut app, rx) = offline_app();
+        app.on_key(key('+'));
+        // Up from the first choice wraps to the last: override.
+        press(&mut app, KeyCode::Up);
+        assert!(matches!(&app.input, Some(Input { purpose: InputPurpose::Add { add_as: AddAs::Override }, .. })));
+        type_text(&mut app, "lodash@4.17.20");
+        press(&mut app, KeyCode::Enter);
+        let jobs = settle(&mut app, &rx, "");
+        assert_eq!(jobs.len(), 1);
+        assert!(jobs[0].items.is_empty(), "an override installs nothing by name");
+        assert_eq!(
+            jobs[0].edits,
+            [Change::Add {
+                loc: vec!["overrides".into(), "lodash".into()],
+                new: "^4.17.20".into()
+            }]
+        );
+        assert!(app.installing());
+    }
+
+    #[test]
+    fn npm_cannot_override_a_dependency_of_the_project() {
+        let (mut app, _rx) = offline_app();
+        app.on_key(key('+'));
+        press(&mut app, KeyCode::BackTab);
+        type_text(&mut app, "a");
+        press(&mut app, KeyCode::Enter);
+        assert!(add_error(&app).contains("npm needs its override to equal"), "{}", add_error(&app));
+    }
+
+    #[test]
+    fn the_add_dialog_is_drawn_in_the_middle_of_the_screen() {
+        let (mut app, _rx) = offline_app();
+        app.on_key(key('+'));
+        type_text(&mut app, "lodash");
+        press(&mut app, KeyCode::Tab);
+        let screen = render(&mut app, 100, 40);
+        let top = screen.iter().position(|l| l.contains(" Add a package ")).expect("drawn");
+        let bottom = top + 1 + screen[top + 1..].iter().position(|l| l.contains('╰')).unwrap();
+        assert!((top as i32 - (40 - 1 - bottom) as i32).abs() <= 1, "top {top}, bottom {bottom}");
+        let body = screen[top..=bottom].join("\n");
+        assert!(body.contains("Package  lodash█"));
+        assert!(body.contains("○ dependency"));
+        assert!(body.contains("● dev dependency"));
+        assert!(body.contains("○ dependency      dependencies"));
+        assert!(body.contains("○ override        overrides"));
+    }
+
+    #[test]
+    fn a_failed_add_leaves_no_row_behind() {
+        let (mut app, rx) = offline_app();
+        app.on_key(key('+'));
+        type_text(&mut app, "lodash");
+        press(&mut app, KeyCode::Enter);
+        settle(&mut app, &rx, "");
+        app.on_install_finished(vec!["lodash".into()], Vec::new(), Err("E404".into()));
+        assert!(!app.rows.iter().any(|r| r.name == "lodash"));
+        assert!(!app.installing());
+    }
+
+    #[test]
+    fn package_names() {
+        for ok in ["lodash", "@types/node", "left-pad", "a.b_c~d"] {
+            assert!(valid_package_name(ok), "{ok}");
+        }
+        for bad in ["", "has space", "@scope", "@/x", ".hidden", "a/b", "ä"] {
+            assert!(!valid_package_name(bad), "{bad}");
+        }
     }
 
     /// The screen as text, one string per row.

@@ -207,6 +207,106 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     if let Some(p) = &app.peer_prompt {
         draw_peer_prompt(f, p);
     }
+    if let Some(input) = &app.input
+        && let crate::app::InputPurpose::Add { add_as } = &input.purpose
+    {
+        draw_add_dialog(f, app, input, *add_as);
+    }
+}
+
+/// A box in the middle of the screen with `lines` and `title`, at most `max_width` wide.
+fn draw_dialog(f: &mut Frame, title: &str, lines: Vec<Line<'static>>, width: u16) {
+    let area = f.area();
+    let height = (lines.len() as u16 + 4).min(area.height);
+    let rect = Rect {
+        x: area.x + (area.width.saturating_sub(width)) / 2,
+        y: area.y + (area.height.saturating_sub(height)) / 2,
+        width,
+        height,
+    };
+    f.render_widget(Clear, rect);
+    f.render_widget(
+        Paragraph::new(lines).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
+                .border_style(Style::new().fg(Color::Cyan))
+                .title(Span::styled(
+                    format!(" {title} "),
+                    Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                ))
+                .padding(ratatui::widgets::Padding::uniform(1)),
+        ),
+        rect,
+    );
+}
+
+/// The dialog for adding a package (`+`): its name and what to add it as.
+fn draw_add_dialog(f: &mut Frame, app: &App, input: &crate::app::Input, add_as: crate::app::AddAs) {
+    use crate::app::AddAs;
+    let width = f.area().width.saturating_sub(4).min(72);
+    let inner = (width as usize).saturating_sub(4);
+    let dim = Style::new().fg(Color::DarkGray);
+    let label = |t: &str| Span::styled(format!("{t:<9}"), Style::new().add_modifier(Modifier::BOLD));
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    lines.push(Line::from(vec![
+        label("Package"),
+        Span::raw(input.text.clone()),
+        Span::styled("█", Style::new().fg(Color::Cyan)),
+    ]));
+    lines.push(Line::from(vec![
+        Span::raw(" ".repeat(9)),
+        Span::styled("name, or name@1.2.3 for a version (latest otherwise)", dim),
+    ]));
+    lines.push(Line::default());
+    let overrides_in = match app.pm {
+        crate::pm::Pm::Yarn => "resolutions",
+        crate::pm::Pm::Pnpm => "pnpm.overrides",
+        _ => "overrides",
+    };
+    for (i, a) in AddAs::ALL.iter().enumerate() {
+        let chosen = *a == add_as;
+        let note = match a {
+            AddAs::Dependency => "dependencies",
+            AddAs::Dev => "devDependencies",
+            AddAs::Override => overrides_in,
+        };
+        let style = if chosen {
+            Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+        } else {
+            Style::new()
+        };
+        lines.push(Line::from(vec![
+            if i == 0 { label("Add as") } else { Span::raw(" ".repeat(9)) },
+            Span::styled(if chosen { "● " } else { "○ " }, style),
+            Span::styled(format!("{:<16}", a.label()), style),
+            Span::styled(note.to_string(), dim),
+        ]));
+    }
+    lines.push(Line::default());
+    if let Some(name) = &input.looking_up {
+        lines.push(Line::from(Span::styled(format!("Looking up {name}…"), dim)));
+        lines.push(Line::default());
+    } else if let Some(e) = &input.error {
+        lines.extend(wrap(
+            Span::raw(""),
+            Span::raw(""),
+            vec![Span::styled(e.clone(), Style::new().fg(Color::Red))],
+            inner,
+        ));
+        lines.push(Line::default());
+    }
+    let key = |k: &str, t: &str| {
+        vec![
+            Span::styled(k.to_string(), Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+            Span::raw(format!(" {t}   ")),
+        ]
+    };
+    let mut keys = key("enter", "add");
+    keys.extend(key("tab ↑↓", "choose"));
+    keys.extend(key("esc", "cancel"));
+    lines.push(Line::from(keys));
+    draw_dialog(f, "Add a package", lines, width);
 }
 
 /// The question about other packages an install needs changed, in a box in the middle of the
@@ -400,6 +500,28 @@ fn wrap_hints(
 
 fn footer_lines(app: &App, width: u16) -> Vec<Line<'static>> {
     let hint = |t: &str| vec![t.to_string().dark_gray()];
+    if let Some(input) = &app.input {
+        let crate::app::InputPurpose::Version { name } = &input.purpose else {
+            return wrap_hints(
+                vec!["Add a package:".cyan().bold()],
+                vec![hint("see the dialog above"), hint("enter add"), hint("esc cancel")],
+                "   ",
+                width,
+            );
+        };
+        let mut hints = Vec::new();
+        if let Some(r) = app.rows.iter().find(|r| r.name == *name) {
+            hints.push(format!("now {}{}, latest {}", r.prefix, r.current, r.latest));
+        }
+        hints.push("enter install".to_string());
+        hints.push("esc cancel".to_string());
+        let prefix = vec![
+            format!("Version of {name}: ").cyan().bold(),
+            input.text.clone().into(),
+            "█".cyan(),
+        ];
+        return wrap_hints(prefix, hints.iter().map(|h| hint(h)).collect(), "   ", width);
+    }
     if app.peer_prompt.is_some() {
         return wrap_hints(
             vec!["Answer the dialog above:".cyan().bold()],

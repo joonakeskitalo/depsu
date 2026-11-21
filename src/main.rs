@@ -46,6 +46,8 @@ KEYS:
     x              remove the selected / highlighted overrides (press twice to confirm)
     s              scan with Snyk
     n              run npm audit / bun audit (by the project's package manager)
+    e              install a version you type for the highlighted package
+    +              add a package as a dependency, dev dependency or override
     R              fetch the latest versions again (ignoring the cache)
     ?              show / hide the details panel
     P              ask how to pin the selected packages (e exact, c ^, t ~, m >=)

@@ -76,6 +76,8 @@ depsu --cache .depsu-cache.json   # remember versions and scans between runs
 | `g` | Group by: none → release type → name prefix → dependency type |
 | `o` | Show / hide the override lines under each package |
 | `x` | Remove the selected or highlighted overrides, or the overrides of the highlighted package, flagged `✂` or not. Warns when installed packages use the overridden package (press twice to confirm) |
+| `e` | Install a version you type for the highlighted package, e.g. `1.5.0` (older or newer). The pin type stays; the version must exist in the registry. Peer dependencies are checked as for `i` |
+| `+` | Add a package in a dialog: type `name` (latest) or `name@1.2.3`, and pick with `Tab` / `↑` `↓` whether it is added as a dependency, a dev dependency or an override (`overrides`, `resolutions` or `pnpm.overrides`, by package manager). Saved as `^version`. The registry is checked before anything changes, and problems are shown in the dialog. Peer dependencies of new dependencies are checked as for `i` |
 | `P` | Choose how the selected or highlighted packages are pinned: exact (`e`), caret `^` (`c`), tilde `~` (`t`) or at least `>=` (`m`). Letters are used because `^` and `~` are dead keys on Nordic keyboards. The version stays, `package.json` is edited and the install runs |
 | `p` | Pin a vulnerable transitive dependency to the fixed version a scan suggests, as an override (press twice to confirm) |
 | `s` | Scan with Snyk |
