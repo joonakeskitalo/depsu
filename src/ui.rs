@@ -167,7 +167,20 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         Some(src) => format!("   n {}", src.label()),
         None => String::new(),
     };
-    let footer: Line = if app.filter_mode {
+    let footer: Line = if app.pin_prompt {
+        Line::from(vec![
+            " Pin type: ".cyan().bold(),
+            "e".bold(),
+            " exact   ".into(),
+            "c".bold(),
+            " caret ^ (minor)   ".into(),
+            "t".bold(),
+            " tilde ~ (patch)   ".into(),
+            "m".bold(),
+            " at least >=   ".into(),
+            "any other key cancels".dark_gray(),
+        ])
+    } else if app.filter_mode {
         Line::from(vec![
             " /".cyan().bold(),
             app.filter.clone().into(),

@@ -75,7 +75,7 @@ depsu --pm pnpm       # skip detection
 | `u` | Show / hide up-to-date packages |
 | `o` | Overrides: hidden → compact → full |
 | `x` | Remove the selected or highlighted overrides, flagged `✂` or not (press twice to confirm) |
-| `P` | Change how the selected or highlighted packages are pinned: `^` → `~` → exact → `^` (the version stays, `package.json` is edited and the install runs) |
+| `P` | Choose how the selected or highlighted packages are pinned: exact (`e`), caret `^` (`c`), tilde `~` (`t`) or at least `>=` (`m`). Letters are used because `^` and `~` are dead keys on Nordic keyboards. The version stays, `package.json` is edited and the install runs |
 | `p` | Pin a vulnerable transitive dependency to the fixed version a scan suggests, as an override (press twice to confirm) |
 | `s` | Scan with Snyk |
 | `n` | Run `npm audit` / `bun audit` (whichever the project uses) |

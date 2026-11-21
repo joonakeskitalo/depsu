@@ -44,7 +44,7 @@ KEYS:
     n              run npm audit / bun audit (by the project's package manager)
     f              install the version Snyk suggests
     F              install the version npm audit / bun audit suggests
-    P              change how the selected packages are pinned: ^, ~, exact
+    P              ask how to pin the selected packages (e exact, c ^, t ~, m >=)
     p              override a vulnerable dependency with the fixed version a scan
                    suggests (press twice to confirm)
     v              show / hide vulnerability findings

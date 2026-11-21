@@ -211,6 +211,8 @@ pub struct App {
     pub group_by: GroupBy,
     pub filter: String,
     pub filter_mode: bool,
+    /// Waiting for the user to choose the pin type for the packages `P` was pressed on.
+    pub pin_prompt: bool,
     pub log: Vec<String>,
     pub pending: usize,
     pub total: usize,
@@ -343,6 +345,7 @@ impl App {
             group_by: GroupBy::None,
             filter: String::new(),
             filter_mode: false,
+            pin_prompt: false,
             log: Vec::new(),
             pending: total,
             total,
@@ -855,6 +858,21 @@ impl App {
             self.on_filter_key(key);
             return;
         }
+        if self.pin_prompt {
+            self.pin_prompt = false;
+            let prefix = match key.code {
+                KeyCode::Char('c') => Some("^"),
+                KeyCode::Char('t') => Some("~"),
+                KeyCode::Char('e') => Some(""),
+                KeyCode::Char('m') => Some(">="),
+                _ => None,
+            };
+            match prefix {
+                Some(p) => self.set_range(p),
+                None => self.push_log("Pin type unchanged."),
+            }
+            return;
+        }
         if !matches!(key.code, KeyCode::Char('q') | KeyCode::Esc) {
             self.quit_warned = false;
         }
@@ -918,7 +936,7 @@ impl App {
             KeyCode::Char('i') | KeyCode::Enter => self.install_selected(),
             KeyCode::Char('x') => self.remove_selected(),
             KeyCode::Char('p') => self.pin_selected(),
-            KeyCode::Char('P') => self.cycle_range(),
+            KeyCode::Char('P') => self.ask_pin_type(),
             KeyCode::Char('s') => self.start_scan(Source::Snyk),
             KeyCode::Char('n') => self.start_scan(self.audit_source()),
             KeyCode::Char('f') => self.fix_selected(Source::Snyk),
@@ -1401,10 +1419,9 @@ fn override_base(overrides: &[Override], name: &str) -> Option<(&'static str, Ve
         .min_by(|a, b| a.1.cmp(&b.1))
 }
 impl App {
-    /// Changes how the checked packages (or the one under the cursor, every package of a group
-    /// on a header) are pinned, in `package.json`: ^ → ~ → exact → ^. The version stays the
-    /// same. Overridden packages change the prefix of their overrides.
-    fn cycle_range(&mut self) {
+    /// The packages `P` acts on: the checked ones, or the one under the cursor (every package
+    /// of a group on a header).
+    fn range_targets(&self) -> Vec<usize> {
         let mut idx: Vec<usize> = self
             .visible_rows()
             .into_iter()
@@ -1418,6 +1435,20 @@ impl App {
             }
         }
         idx.retain(|&i| !self.rows[i].busy());
+        idx
+    }
+    /// Asks which pin type to use for the packages `P` acts on.
+    fn ask_pin_type(&mut self) {
+        if self.range_targets().is_empty() {
+            self.push_log("Nothing to change: put the cursor on a package.");
+            return;
+        }
+        self.pin_prompt = true;
+    }
+    /// Changes how the packages are pinned, in `package.json`, keeping their version.
+    /// Overridden packages change the prefix of their overrides.
+    fn set_range(&mut self, to: &'static str) {
+        let idx = self.range_targets();
         let mut edits = Vec::new();
         let mut keys = Vec::new();
         let mut what = Vec::new();
@@ -1428,7 +1459,7 @@ impl App {
                     if self.override_busy(o) {
                         continue;
                     }
-                    if let Some(new) = cycled_spec(&o.value) {
+                    if let Some(new) = respecced(&o.value, to) {
                         keys.push(o.key());
                         what.push(format!("{} {} → {new}", r.name, o.value));
                         edits.push(Change::Set {
@@ -1455,7 +1486,7 @@ impl App {
             else {
                 continue;
             };
-            let Some(new) = cycled_spec(&old) else {
+            let Some(new) = respecced(&old, to) else {
                 continue;
             };
             if self.busy_overrides.contains(&key) {
@@ -1477,7 +1508,7 @@ impl App {
             edits.push(Change::Set { loc, old, new });
         }
         if edits.is_empty() {
-            self.push_log("Nothing to change: put the cursor on a package whose version is a plain version or range.");
+            self.push_log("Nothing to change: the packages already have that pin type, or their versions are not plain versions or ranges.");
             return;
         }
         for k in &keys {
@@ -1673,18 +1704,11 @@ fn override_label(key: &str) -> String {
     }
 }
 const DEP_FIELDS: [&str; 3] = ["dependencies", "devDependencies", "optionalDependencies"];
-/// The version prefix that follows `prefix` when cycling: ^ → ~ → exact → ^ (>= goes to ^).
-fn next_prefix(prefix: &str) -> &'static str {
-    match prefix {
-        "^" => "~",
-        "~" => "",
-        _ => "^",
-    }
-}
-/// `spec` with its range type changed to the next one, if it is a plain version or range.
-fn cycled_spec(spec: &str) -> Option<String> {
-    let (prefix, v) = parse_spec(spec)?;
-    Some(format!("{}{v}", next_prefix(prefix)))
+/// `spec` with the range type `prefix` (`^`, `~`, `>=` or none for exact), if it is a plain
+/// version or range that isn't of that type already.
+fn respecced(spec: &str, prefix: &str) -> Option<String> {
+    let (old, v) = parse_spec(spec)?;
+    (old != prefix).then(|| format!("{prefix}{v}"))
 }
 
 /// Identity of a list item that survives index changes.
@@ -1785,13 +1809,14 @@ mod tests {
         }
     }
     #[test]
-    fn range_type_cycles_and_keeps_the_version() {
-        assert_eq!(cycled_spec("^1.2.3").as_deref(), Some("~1.2.3"));
-        assert_eq!(cycled_spec("~1.2.3").as_deref(), Some("1.2.3"));
-        assert_eq!(cycled_spec("1.2.3").as_deref(), Some("^1.2.3"));
-        assert_eq!(cycled_spec(">=1.2.3").as_deref(), Some("^1.2.3"));
-        assert_eq!(cycled_spec("latest"), None);
-        assert_eq!(cycled_spec("workspace:*"), None);
+    fn pin_type_changes_keep_the_version() {
+        assert_eq!(respecced("^1.2.3", "~").as_deref(), Some("~1.2.3"));
+        assert_eq!(respecced("^1.2.3", "").as_deref(), Some("1.2.3"));
+        assert_eq!(respecced("1.2.3", "^").as_deref(), Some("^1.2.3"));
+        assert_eq!(respecced("~1.2.3", ">=").as_deref(), Some(">=1.2.3"));
+        assert_eq!(respecced("^1.2.3", "^"), None);
+        assert_eq!(respecced("latest", "^"), None);
+        assert_eq!(respecced("workspace:*", "^"), None);
     }
 
     #[test]
