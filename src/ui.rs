@@ -146,8 +146,8 @@ pub fn draw(f: &mut Frame, app: &mut App) {
 
     // Hints for actions that only exist when there is something to act on.
     let mut remove_hint = String::new();
-    if app.has_unneeded() {
-        remove_hint.push_str("   x remove ✂");
+    if app.has_overrides() {
+        remove_hint.push_str("   x remove override");
     }
     for source in [Source::Snyk, app.audit_source()] {
         if app.rows.iter().any(|r| r.fix_of(source).is_some()) {

@@ -191,6 +191,8 @@ pub struct App {
     unneeded: HashMap<String, Unneeded>,
     root_deps: Vec<(String, String)>,
     confirm_remove: bool,
+    /// Override keys with a removal in flight.
+    removing: HashSet<String>,
     /// False until the first key press: the cursor then stays at the top of the package list.
     cursor_moved: bool,
     tree_tx: Option<Sender<TreeMsg>>,
@@ -309,6 +311,7 @@ impl App {
             unneeded: HashMap::new(),
             root_deps,
             confirm_remove: false,
+            removing: HashSet::new(),
             cursor_moved: false,
             tree_tx,
             events_tx,
@@ -432,8 +435,10 @@ impl App {
         keys: Vec<String>,
         result: Result<(), String>,
     ) {
+        let mut removed = false;
         for k in &keys {
             self.busy_overrides.remove(k);
+            removed |= self.removing.remove(k);
         }
         let what: Vec<String> = names
             .iter()
@@ -443,6 +448,17 @@ impl App {
         match result {
             Ok(()) => {
                 self.push_log(format!("✔ done: {}", what.join(", ")));
+                if removed {
+                    for scan in [&mut self.snyk, &mut self.audit] {
+                        scan.stale |= scan.report.is_some();
+                    }
+                    self.push_log(format!(
+                        "⚠ Overrides were removed: run Snyk ({}) and {} ({}) again to check for new vulnerabilities.",
+                        scan_key(Source::Snyk),
+                        self.audit_source().label(),
+                        scan_key(self.audit_source())
+                    ));
+                }
                 // Updated packages are up to date now; they stay in the list as such.
                 for r in self.rows.iter_mut().filter(|r| names.contains(&r.name)) {
                     // The target is the latest version, or the one Snyk suggested.
@@ -668,8 +684,8 @@ impl App {
         self.overrides.iter().find(|o| o.key() == key)
     }
 
-    pub fn has_unneeded(&self) -> bool {
-        !self.unneeded.is_empty()
+    pub fn has_overrides(&self) -> bool {
+        !self.overrides.is_empty()
     }
 
     /// Why the override looks unnecessary, if it does.
@@ -677,9 +693,9 @@ impl App {
         self.unneeded.get(&o.key())
     }
 
-    /// An override line can be selected if it can be updated or removed.
-    fn override_actionable(&self, o: &Override) -> bool {
-        self.update_target(o).is_some() || self.unneeded(o).is_some()
+    /// Every override line can be selected, since any override can be removed.
+    fn override_actionable(&self, _o: &Override) -> bool {
+        true
     }
 
     pub fn override_selected(&self, o: &Override) -> bool {
@@ -1011,6 +1027,7 @@ impl App {
         let mut keys = Vec::new();
         for (o, new) in ovr {
             keys.push(o.key());
+            self.removing.insert(o.key());
             self.selected_overrides.remove(&o.key());
             self.busy_overrides.insert(o.key());
             edits.push(Change::Set {
@@ -1185,19 +1202,18 @@ impl App {
             .visible_overrides()
             .into_iter()
             .filter(|o| self.selected_overrides.contains(&o.key()))
-            .filter(|o| self.unneeded(o).is_some() && !self.override_busy(o))
+            .filter(|o| !self.override_busy(o))
             .cloned()
             .collect();
         if targets.is_empty()
             && let Some(item) = self.cursor_item().cloned()
             && let Some(o) = self.detail_override(&item)
-            && self.unneeded(o).is_some()
             && !self.override_busy(o)
         {
             targets.push(o.clone());
         }
         if targets.is_empty() {
-            self.push_log("Nothing to remove: put the cursor on an override marked ✂, or select some with space.");
+            self.push_log("Nothing to remove: put the cursor on an override, or select some with space.");
             return;
         }
 
@@ -1208,6 +1224,11 @@ impl App {
                 "✂ will remove from package.json: {}. Press x again to confirm, any other key cancels.",
                 names.join("; ")
             ));
+            if targets.iter().any(|o| self.unneeded(o).is_none()) {
+                self.push_log(
+                    "⚠ Not flagged as unneeded: removing it can change which versions get installed and reintroduce vulnerabilities.",
+                );
+            }
             return;
         }
         self.confirm_remove = false;
@@ -1216,6 +1237,7 @@ impl App {
         let mut keys = Vec::new();
         for o in &targets {
             keys.push(o.key());
+            self.removing.insert(o.key());
             self.selected_overrides.remove(&o.key());
             self.busy_overrides.insert(o.key());
             edits.push(Change::Remove {

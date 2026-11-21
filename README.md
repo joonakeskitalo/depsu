@@ -71,7 +71,7 @@ depsu --pm pnpm       # skip detection
 | `g` | Group by: none → release type → name prefix |
 | `u` | Show / hide up-to-date packages |
 | `o` | Overrides: hidden → compact → full |
-| `x` | Remove overrides marked `✂` (press twice to confirm) |
+| `x` | Remove the selected or highlighted overrides, flagged `✂` or not (press twice to confirm) |
 | `s` | Scan with Snyk |
 | `n` | Run `npm audit` / `bun audit` (whichever the project uses) |
 | `f` | Install the version Snyk suggests |
@@ -160,7 +160,9 @@ no longer changes anything: nothing depends on the package, every dependent alre
 same spec, or every dependent already requires at least the override's version. They are also
 listed in an "Unneeded overrides" section. Press `x` to remove the selected one (or the one under
 the cursor), and `x` again to confirm. The entry is deleted from `package.json` (empty containers
-go too) and the package manager's install runs.
+go too) and the package manager's install runs. Overrides not flagged `✂` can be removed too, with an
+extra warning, because that can change what gets installed. After any removal, depsu reminds you to
+run Snyk and the audit again.
 
 This is a heuristic, so verify before removing. It reads `node_modules`, so nothing is flagged
 without it, and a pin that guards against a newer release looks the same as one that only sets a

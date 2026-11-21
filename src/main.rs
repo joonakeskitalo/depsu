@@ -39,7 +39,7 @@ KEYS:
     g              group by: none, release type, name prefix
     u              show / hide up-to-date packages
     o              overrides: hidden, compact, full
-    x              remove overrides marked as unneeded (press twice to confirm)
+    x              remove the selected / highlighted overrides (press twice to confirm)
     s              scan with Snyk
     n              run npm audit / bun audit (by the project's package manager)
     f              install the version Snyk suggests
