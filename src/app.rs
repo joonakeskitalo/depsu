@@ -4490,6 +4490,60 @@ mod tests {
     }
 
     #[test]
+    fn the_report_lists_vulnerable_packages_first_in_their_own_table() {
+        let mut app = app_with_cache("1.0.0", |c| {
+            // a: two high findings from Snyk, one low from npm audit. b: one critical.
+            let mut low = vuln("a", "1.0.0", "A-LOW");
+            low.severity = Severity::Low;
+            low.source = Source::NpmAudit;
+            c.set_findings(
+                "snyk",
+                "a",
+                "1.0.0",
+                Findings {
+                    vulns: vec![vuln("a", "1.0.0", "A-1"), vuln("a", "1.0.0", "A-2")],
+                    fix: None,
+                },
+            );
+            c.set_findings("npm audit", "a", "1.0.0", Findings { vulns: vec![low], fix: None });
+            let mut crit = vuln("b", "1.0.0", "B-1");
+            crit.severity = Severity::Critical;
+            c.set_findings("snyk", "b", "1.0.0", Findings { vulns: vec![crit], fix: None });
+            c.set_findings("npm audit", "b", "1.0.0", Findings::default());
+        });
+        // A third package without findings.
+        install(&app.dir.clone(), "c", "1.0.0");
+        app.current.insert("c".into(), (Kind::Prod, "^", Version::new(1, 0, 0)));
+        app.on_fetched("c".into(), Version::new(1, 0, 0));
+
+        let md = crate::export::markdown(&app);
+        let vulnerable = md.find("## Packages with vulnerabilities").expect("own table");
+        let others = md.find("## Other packages").expect("the rest");
+        let snyk = md.find("## Snyk report").expect("findings after the packages");
+        assert!(vulnerable < others && others < snyk, "{md}");
+        let first = &md[vulnerable..others];
+        let rest = &md[others..snyk];
+        assert!(first.contains("| Vulnerabilities |"));
+        // Worst first: b (critical) before a (high).
+        let (b, a) = (first.find("| b |").unwrap(), first.find("| a |").unwrap());
+        assert!(b < a, "{first}");
+        assert!(first.contains("| 2 high, 1 low (snyk 2, npm audit 1) |"), "{first}");
+        assert!(first.contains("| 1 critical (snyk 1) |"), "{first}");
+        assert!(!first.contains("| c |"));
+        assert!(rest.contains("| c | dep | 1.0.0 | 1.0.0 | up to date |"), "{rest}");
+        assert!(!rest.contains("| a |") && !rest.contains("| b |"));
+    }
+
+    #[test]
+    fn a_report_without_findings_has_a_single_package_table() {
+        let app = app_with_cache("1.0.0", |_| {});
+        let md = crate::export::markdown(&app);
+        assert!(md.contains("## Packages\n"));
+        assert!(!md.contains("with vulnerabilities") && !md.contains("Other packages"));
+        assert!(md.contains("| a | dep |") && md.contains("| b | dep |"));
+    }
+
+    #[test]
     fn both_scanners_are_named_when_neither_has_scanned_the_version() {
         assert_eq!(
             crate::ui::unscanned_label(&[Source::Snyk, Source::NpmAudit]),

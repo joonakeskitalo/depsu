@@ -1,6 +1,6 @@
 //! Markdown export of the package versions and the vulnerability reports.
-use crate::app::{App, ScanStatus};
-use crate::vuln::{Source, Vuln};
+use crate::app::{App, Row, ScanStatus};
+use crate::vuln::{Severity, Source, Vuln};
 use std::io::Write;
 use std::process::{Command, Stdio};
 
@@ -15,6 +15,46 @@ fn today() -> Option<String> {
     (out.status.success() && !s.is_empty()).then_some(s)
 }
 
+fn status(r: &Row) -> &'static str {
+    if r.loading {
+        "checking"
+    } else if r.latest_failed {
+        "latest unknown"
+    } else if r.outdated {
+        "outdated"
+    } else {
+        "up to date"
+    }
+}
+
+/// E.g. `1 critical, 2 high (snyk 2, npm audit 1)`.
+fn vuln_counts(r: &Row) -> String {
+    let mut by_severity: Vec<(Severity, usize)> = Vec::new();
+    for v in &r.vulns {
+        match by_severity.iter_mut().find(|(s, _)| *s == v.severity) {
+            Some((_, n)) => *n += 1,
+            None => by_severity.push((v.severity, 1)),
+        }
+    }
+    by_severity.sort_by(|a, b| b.0.cmp(&a.0));
+    let severities: Vec<String> = by_severity
+        .iter()
+        .map(|(s, n)| format!("{n} {}", s.label()))
+        .collect();
+    let mut sources: Vec<(Source, usize)> = Vec::new();
+    for v in &r.vulns {
+        match sources.iter_mut().find(|(s, _)| *s == v.source) {
+            Some((_, n)) => *n += 1,
+            None => sources.push((v.source, 1)),
+        }
+    }
+    let sources: Vec<String> = sources
+        .iter()
+        .map(|(s, n)| format!("{} {n}", s.label()))
+        .collect();
+    format!("{} ({})", severities.join(", "), sources.join(", "))
+}
+
 pub fn markdown(app: &App) -> String {
     let mut out = format!("# {}: dependencies\n\n", app.project_name());
     if let Some(date) = today() {
@@ -25,34 +65,49 @@ pub fn markdown(app: &App) -> String {
         app.pm.name(),
         app.registry
     ));
-    out.push_str("| Package | Type | Current | Latest | Status |\n|---|---|---|---|---|\n");
-    for r in &app.rows {
-        let mut status = (if r.loading {
-            "checking"
-        } else if r.latest_failed {
-            "latest unknown"
-        } else if r.outdated {
-            "outdated"
-        } else {
-            "up to date"
-        })
-        .to_string();
-        let snyk = r.vulns.iter().filter(|v| v.source == Source::Snyk).count();
-        let audit = r.vulns.len() - snyk;
-        if snyk > 0 {
-            status.push_str(&format!(", snyk({snyk})"));
+    // Packages with findings come first, in a table of their own, worst first.
+    let (mut vulnerable, others): (Vec<&Row>, Vec<&Row>) =
+        app.rows.iter().partition(|r| !r.vulns.is_empty());
+    vulnerable.sort_by(|a, b| {
+        b.worst_severity()
+            .cmp(&a.worst_severity())
+            .then(b.vulns.len().cmp(&a.vulns.len()))
+            .then(a.name.cmp(&b.name))
+    });
+    if !vulnerable.is_empty() {
+        out.push_str("## Packages with vulnerabilities\n\n");
+        out.push_str(
+            "| Package | Type | Current | Latest | Status | Vulnerabilities |\n|---|---|---|---|---|---|\n",
+        );
+        for r in vulnerable {
+            out.push_str(&format!(
+                "| {} | {} | {} | {} | {} | {} |\n",
+                cell(&r.name),
+                r.kind.label(),
+                r.current,
+                r.latest,
+                status(r),
+                vuln_counts(r)
+            ));
         }
-        if audit > 0 {
-            status.push_str(&format!(", audit({audit})"));
+        out.push_str("\n## Other packages\n\n");
+    } else {
+        out.push_str("## Packages\n\n");
+    }
+    if others.is_empty() {
+        out.push_str("None.\n");
+    } else {
+        out.push_str("| Package | Type | Current | Latest | Status |\n|---|---|---|---|---|\n");
+        for r in others {
+            out.push_str(&format!(
+                "| {} | {} | {} | {} | {} |\n",
+                cell(&r.name),
+                r.kind.label(),
+                r.current,
+                r.latest,
+                status(r)
+            ));
         }
-        out.push_str(&format!(
-            "| {} | {} | {} | {} | {} |\n",
-            cell(&r.name),
-            r.kind.label(),
-            r.current,
-            r.latest,
-            status
-        ));
     }
     for (source, scan) in [(Source::Snyk, &app.snyk), (app.audit_source(), &app.audit)] {
         let ScanStatus::Done { .. } = scan.status else {
