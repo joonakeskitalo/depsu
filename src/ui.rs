@@ -174,8 +174,8 @@ fn header_lines(app: &App, width: u16) -> Vec<Line<'static>> {
     if app.group_by != GroupBy::None {
         info.push(format!("group: {}", app.group_by.label()));
     }
-    if app.vuln_view != crate::view::VulnView::All {
-        info.push(format!("vulns: {}", app.vuln_view.label()));
+    if !app.show_vulns {
+        info.push("vulns hidden".to_string());
     }
     if app.show_overrides != Overrides::Off {
         info.push(format!("overrides: {}", app.show_overrides.label()));

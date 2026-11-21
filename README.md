@@ -80,7 +80,7 @@ depsu --pm pnpm       # skip detection
 | `n` | Run `npm audit` / `bun audit` (whichever the project uses) |
 | `f` | Install the version Snyk suggests |
 | `F` | Install the version `npm audit` / `bun audit` suggests |
-| `v` | Vulnerability rows: all → snyk only → audit only → hidden |
+| `v` | Show / hide vulnerability findings |
 | `q` / `Esc` | Quit (press twice while an install is running) |
 
 `a`, `i` and `f` act only on the packages currently shown, so a filter narrows what they touch.

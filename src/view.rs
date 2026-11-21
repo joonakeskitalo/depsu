@@ -2,7 +2,6 @@
 
 use crate::app::Row;
 use crate::package::Kind;
-use crate::vuln::Source;
 use semver::Version;
 use std::collections::HashMap;
 
@@ -138,46 +137,7 @@ pub enum Item {
     },
 }
 
-/// Which vulnerability findings are listed under the packages.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum VulnView {
-    All,
-    SnykOnly,
-    AuditOnly,
-    Hidden,
-}
-impl VulnView {
-    pub fn next(self) -> Self {
-        match self {
-            VulnView::All => VulnView::SnykOnly,
-            VulnView::SnykOnly => VulnView::AuditOnly,
-            VulnView::AuditOnly => VulnView::Hidden,
-            VulnView::Hidden => VulnView::All,
-        }
-    }
-    pub fn allows(self, source: Source) -> bool {
-        match self {
-            VulnView::All => true,
-            VulnView::SnykOnly => source == Source::Snyk,
-            VulnView::AuditOnly => source.is_audit(),
-            VulnView::Hidden => false,
-        }
-    }
-    pub fn label(self) -> &'static str {
-        match self {
-            VulnView::All => "all",
-            VulnView::SnykOnly => "snyk only",
-            VulnView::AuditOnly => "audit only",
-            VulnView::Hidden => "hidden",
-        }
-    }
-}
-impl From<bool> for VulnView {
-    fn from(shown: bool) -> Self {
-        if shown { VulnView::All } else { VulnView::Hidden }
-    }
-}
-fn children(r: &Row, idx: usize, mode: Overrides, vulns: VulnView) -> Vec<Item> {
+fn children(r: &Row, idx: usize, mode: Overrides, vulns: bool) -> Vec<Item> {
     let cap = if mode == Overrides::Full {
         usize::MAX
     } else {
@@ -185,12 +145,11 @@ fn children(r: &Row, idx: usize, mode: Overrides, vulns: VulnView) -> Vec<Item> 
     };
     let mut kids: Vec<Child> = Vec::new();
     // Security findings first: they matter more than where overrides apply.
-    let shown: Vec<usize> = (0..r.vulns.len())
-        .filter(|&i| vulns.allows(r.vulns[i].source))
-        .collect();
-    kids.extend(shown.iter().take(cap).copied().map(Child::Vuln));
-    if shown.len() > cap {
-        kids.push(Child::MoreVulns(shown.len() - cap));
+    if vulns {
+        kids.extend((0..r.vulns.len().min(cap)).map(Child::Vuln));
+        if r.vulns.len() > cap {
+            kids.push(Child::MoreVulns(r.vulns.len() - cap));
+        }
     }
     if mode != Overrides::Off {
         if r.lists_own_overrides() {
@@ -251,9 +210,8 @@ pub fn build(
     filter: &str,
     ov: Overrides,
     uptodate: bool,
-    vulns: impl Into<VulnView>,
+    vulns: bool,
 ) -> Vec<Item> {
-    let vulns = vulns.into();
     let needle = filter.trim().to_lowercase();
     let mut visible: Vec<usize> = (0..rows.len())
         .filter(|&i| uptodate || rows[i].outdated)
