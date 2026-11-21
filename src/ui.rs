@@ -441,7 +441,11 @@ fn row_line(app: &App, r: &AppRow, indent: usize, name_w: usize, width: usize) -
         version,
         w = 14usize.saturating_sub(r.prefix.chars().count())
     )));
-    if r.outdated {
+    if r.loading {
+        spans.push(Span::styled("checking…", Style::new().fg(Color::DarkGray)));
+    } else if r.latest_failed {
+        spans.push(Span::styled("? latest unknown", Style::new().fg(Color::Red)));
+    } else if r.outdated {
         spans.push(Span::raw("→ "));
         spans.push(Span::styled(r.new_spec(), Style::new().fg(color)));
     } else {

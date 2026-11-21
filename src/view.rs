@@ -326,6 +326,8 @@ mod tests {
             audit_fix: None,
             changed_from: None,
             scan_outdated: false,
+            loading: false,
+            latest_failed: false,
         }
     }
 

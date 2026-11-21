@@ -115,6 +115,10 @@ pub struct Row {
     /// The version changed since the last vulnerability scan, so the findings (or their
     /// absence) no longer describe what is installed.
     pub scan_outdated: bool,
+    /// The latest version hasn't arrived from the registry yet.
+    pub loading: bool,
+    /// Looking up the latest version failed.
+    pub latest_failed: bool,
 }
 
 impl Row {
@@ -364,7 +368,7 @@ impl App {
         let worker_dir = dir.clone();
         thread::spawn(move || install_worker(worker_dir, pm, job_rx, tx));
 
-        App {
+        let mut app = App {
             pm,
             rows: Vec::new(),
             table: ListState::default(),
@@ -413,7 +417,42 @@ impl App {
             quit_warned: false,
             rx,
             jobs,
-        }
+        };
+        app.add_placeholder_rows();
+        app
+    }
+
+    /// Lists every dependency right away, before the registry has answered. The rows are
+    /// updated in place when the latest versions arrive.
+    fn add_placeholder_rows(&mut self) {
+        let mut rows: Vec<Row> = self
+            .current
+            .iter()
+            .filter(|(_, (kind, _, _))| *kind != Kind::Override)
+            .map(|(name, (kind, prefix, cur))| Row {
+                name: name.clone(),
+                kind: *kind,
+                prefix,
+                current: cur.clone(),
+                latest: cur.clone(),
+                outdated: false,
+                selected: false,
+                status: Status::Idle,
+                overrides: self.own_overrides(name),
+                compat: Compat::Ok,
+                tree_hits: Vec::new(),
+                vulns: Vec::new(),
+                snyk_fix: None,
+                audit_fix: None,
+                changed_from: None,
+                scan_outdated: false,
+                loading: true,
+                latest_failed: false,
+            })
+            .collect();
+        rows.sort_by(|a, b| (a.kind.label(), &a.name).cmp(&(b.kind.label(), &b.name)));
+        self.rows = rows;
+        self.rebuild_view();
     }
 
     pub fn loading(&self) -> bool {
@@ -449,7 +488,14 @@ impl App {
                     self.pending = self.pending.saturating_sub(1);
                     match result {
                         Ok(latest) => self.on_fetched(name, latest),
-                        Err(e) => self.push_log(format!("! {name}: {e}")),
+                        Err(e) => {
+                            if let Some(r) = self.rows.iter_mut().find(|r| r.name == name) {
+                                r.loading = false;
+                                r.latest_failed = true;
+                            }
+                            self.push_log(format!("! {name}: {e}"));
+                            self.rebuild_view();
+                        }
                     }
                 }
                 Event::Tree { name, hits } => self.on_tree(name, hits),
@@ -498,6 +544,29 @@ impl App {
         let Some((kind, prefix, cur)) = self.current.get(&name).cloned() else {
             return;
         };
+        // A row listed at startup is updated in place.
+        if kind != Kind::Override
+            && let Some(i) = self.rows.iter().position(|r| r.name == name)
+        {
+            let own = self.own_overrides(&name);
+            let (cur, prefix) = (self.rows[i].current.clone(), self.rows[i].prefix);
+            let outdated = latest > cur && latest.pre.is_empty();
+            let compat = if outdated {
+                overrides::check(&own, self.pm, &format!("{prefix}{latest}"), &latest)
+            } else {
+                Compat::Ok
+            };
+            let r = &mut self.rows[i];
+            r.latest = latest;
+            r.outdated = outdated;
+            r.compat = compat;
+            r.overrides = own;
+            r.loading = false;
+            r.latest_failed = false;
+            self.analyze(&name);
+            self.rebuild_view();
+            return;
+        }
         let own = self.own_overrides(&name);
         let outdated = if kind == Kind::Override {
             own.iter().any(|o| self.update_target(o).is_some())
@@ -521,6 +590,8 @@ impl App {
             audit_fix: None,
             changed_from: None,
             scan_outdated: false,
+            loading: false,
+            latest_failed: false,
         };
         // Packages that are already up to date are listed too, so their overrides are visible.
         let compat = if outdated && kind != Kind::Override {

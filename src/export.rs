@@ -27,7 +27,16 @@ pub fn markdown(app: &App) -> String {
     ));
     out.push_str("| Package | Type | Current | Latest | Status |\n|---|---|---|---|---|\n");
     for r in &app.rows {
-        let mut status = (if r.outdated { "outdated" } else { "up to date" }).to_string();
+        let mut status = (if r.loading {
+            "checking"
+        } else if r.latest_failed {
+            "latest unknown"
+        } else if r.outdated {
+            "outdated"
+        } else {
+            "up to date"
+        })
+        .to_string();
         let snyk = r.vulns.iter().filter(|v| v.source == Source::Snyk).count();
         let audit = r.vulns.len() - snyk;
         if snyk > 0 {
