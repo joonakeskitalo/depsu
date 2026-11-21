@@ -315,56 +315,120 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     }
 }
 
-/// The commit `c` proposes: its title to edit, what it contains, and which files.
+/// The lines of `field` as spans, with the cursor shown when `active`: the character under
+/// it reversed, or a block at the end of a line.
+fn field_lines(field: &crate::textfield::TextField, active: bool, style: Style) -> Vec<Vec<Span<'static>>> {
+    let (text, cursor) = (field.text(), field.cursor());
+    let mut out = Vec::new();
+    let mut start = 0;
+    for line in text.split('\n') {
+        let end = start + line.len();
+        let mut spans = Vec::new();
+        if active && (start..=end).contains(&cursor) {
+            let (before, rest) = line.split_at(cursor - start);
+            if !before.is_empty() {
+                spans.push(Span::styled(before.to_string(), style));
+            }
+            match rest.chars().next() {
+                Some(c) => {
+                    spans.push(Span::styled(c.to_string(), style.add_modifier(Modifier::REVERSED)));
+                    let after = &rest[c.len_utf8()..];
+                    if !after.is_empty() {
+                        spans.push(Span::styled(after.to_string(), style));
+                    }
+                }
+                None => spans.push(Span::styled("█", Style::new().fg(Color::Cyan))),
+            }
+        } else if !line.is_empty() {
+            spans.push(Span::styled(line.to_string(), style));
+        }
+        out.push(spans);
+        start = end + 1;
+    }
+    out
+}
+
+/// The commit `c` proposes: its title and body to edit, and which files.
 fn draw_commit_dialog(f: &mut Frame, p: &crate::app::CommitPrompt) {
+    use crate::app::CommitField;
     let width = f.area().width.saturating_sub(4).min(90);
     let inner = (width as usize).saturating_sub(4);
     let bold = Style::new().add_modifier(Modifier::BOLD);
     let dim = Style::new().fg(Color::DarkGray);
+    let cyan_bold = Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD);
+    let indent = || Span::raw("       ");
+    // The field that takes the keys has its label in cyan and shows the cursor.
+    let label = |t: &str, focused: bool| {
+        Span::styled(format!("{t:<7}"), if focused { cyan_bold } else { bold })
+    };
+    let title_focused = p.field == CommitField::Title && !p.busy;
+    let body_focused = p.field == CommitField::Body && !p.busy;
     let mut lines: Vec<Line<'static>> = Vec::new();
-    let mut title = vec![Span::styled(p.title.clone(), bold)];
-    if !p.busy {
-        title.push(Span::styled("█", Style::new().fg(Color::Cyan)));
-    }
-    lines.extend(wrap(Span::styled("Title  ", bold), Span::raw("       "), title, inner));
-    let n = p.title.trim().chars().count();
+
+    let title = field_lines(&p.title, title_focused, bold).into_iter().next().unwrap_or_default();
+    lines.extend(wrap(label("Title", title_focused), indent(), title, inner));
+    let n = p.title.text().trim().chars().count();
     lines.push(Line::from(vec![
-        Span::raw("       "),
+        indent(),
         Span::styled(
             format!("a conventional commit, edit as you like ({n} characters)"),
             if n > 72 { Style::new().fg(Color::Yellow) } else { dim },
         ),
     ]));
     lines.push(Line::default());
-    // The body as it will be committed with the title as it is now: what the title already
-    // says is left out, so nothing is shown twice.
-    let body = crate::commit::body_for(&p.plan, &p.title).unwrap_or_default();
-    let body: Vec<&str> = body.lines().collect();
-    let room = (f.area().height as usize).saturating_sub(20).max(3);
-    if body.is_empty() {
-        let why = if p.plan.body.is_empty() {
+
+    // The body, as it will be committed. Until it is edited it leaves out what the title says.
+    if p.body.text().is_empty() {
+        let why = if p.body_edited {
+            "(empty: the commit gets no body)"
+        } else if p.plan.body.is_empty() {
             "(none: no dependency changes found, only other edits to these files)"
         } else {
             "(none: the title says it all)"
         };
-        lines.push(Line::from(vec![Span::styled("Body   ", bold), Span::styled(why, dim)]));
-    }
-    for (i, l) in body.iter().take(room).enumerate() {
-        let label = if i == 0 { "Body   " } else { "       " };
-        lines.extend(wrap(
-            Span::styled(label, bold),
-            Span::raw("         "),
-            vec![Span::raw(l.to_string())],
-            inner,
-        ));
-    }
-    if body.len() > room {
-        lines.push(Line::from(Span::styled(format!("       … and {} more lines", body.len() - room), dim)));
+        let mut spans = vec![label("Body", body_focused)];
+        if body_focused {
+            spans.push(Span::styled("█ ", Style::new().fg(Color::Cyan)));
+        }
+        spans.push(Span::styled(why, dim));
+        lines.push(Line::from(spans));
+    } else {
+        let body = field_lines(&p.body, body_focused, Style::new());
+        // Long bodies show a window of lines around the cursor.
+        let room = (f.area().height as usize).saturating_sub(20).max(3);
+        let total = body.len();
+        let start = if total > room {
+            p.body.cursor_line().saturating_sub(room - 1).min(total - room)
+        } else {
+            0
+        };
+        let mut first = true;
+        let mut lead = |lines: &mut Vec<Line<'static>>, rest: Vec<Span<'static>>| {
+            let head = if first { label("Body", body_focused) } else { indent() };
+            first = false;
+            if rest.is_empty() {
+                lines.push(Line::from(head));
+            } else {
+                lines.extend(wrap(head, indent(), rest, inner));
+            }
+        };
+        if start > 0 {
+            lead(&mut lines, vec![Span::styled(format!("… {start} lines above"), dim)]);
+        }
+        for l in body.into_iter().skip(start).take(room) {
+            lead(&mut lines, l);
+        }
+        if start + room < total {
+            lead(
+                &mut lines,
+                vec![Span::styled(format!("… {} more lines", total - start - room), dim)],
+            );
+        }
     }
     lines.push(Line::default());
     lines.extend(wrap(
         Span::styled("Files  ", bold),
-        Span::raw("       "),
+        indent(),
         vec![
             Span::raw(p.plan.files.join(", ")),
             Span::styled(format!("   on {}", p.plan.branch), dim),
@@ -373,8 +437,8 @@ fn draw_commit_dialog(f: &mut Frame, p: &crate::app::CommitPrompt) {
     ));
     if !p.plan.other_staged.is_empty() {
         lines.extend(wrap(
-            Span::raw("       "),
-            Span::raw("       "),
+            indent(),
+            indent(),
             vec![Span::styled(
                 format!(
                     "Also staged, left out of this commit: {}",
@@ -399,7 +463,7 @@ fn draw_commit_dialog(f: &mut Frame, p: &crate::app::CommitPrompt) {
     }
     let key = |k: &str, t: &str| {
         vec![
-            Span::styled(k.to_string(), Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+            Span::styled(k.to_string(), cyan_bold),
             Span::raw(format!(" {t}   ")),
         ]
     };
@@ -407,7 +471,18 @@ fn draw_commit_dialog(f: &mut Frame, p: &crate::app::CommitPrompt) {
     if p.busy {
         lines.push(Line::from(Span::styled("Committing… (git hooks may take a while)", dim)));
     } else {
-        let mut keys = key("enter", "commit");
+        let mut keys = Vec::new();
+        match p.field {
+            CommitField::Title => {
+                keys.extend(key("enter", "commit"));
+                keys.extend(key("tab", "body"));
+            }
+            CommitField::Body => {
+                keys.extend(key("ctrl+s", "commit"));
+                keys.extend(key("enter", "new line"));
+                keys.extend(key("tab", "title"));
+            }
+        }
         keys.extend(key("esc", "cancel"));
         lines.push(Line::from(keys));
     }
@@ -995,13 +1070,22 @@ fn footer_lines(app: &App, width: u16) -> Vec<Line<'static>> {
         ];
         return wrap_hints(prefix, hints.iter().map(|h| hint(h)).collect(), "   ", width);
     }
-    if app.commit_prompt.is_some() {
-        return wrap_hints(
-            vec!["Commit:".cyan().bold()],
-            vec![hint("type to edit the title"), hint("enter commit"), hint("esc cancel")],
-            "   ",
-            width,
-        );
+    if let Some(p) = &app.commit_prompt {
+        let keys = match p.field {
+            crate::app::CommitField::Title => {
+                vec![hint("editing the title"), hint("enter commit"), hint("tab body")]
+            }
+            crate::app::CommitField::Body => vec![
+                hint("editing the body"),
+                hint("ctrl+s commit"),
+                hint("enter new line"),
+                hint("tab title"),
+            ],
+        };
+        let mut keys = keys;
+        keys.push(hint("← → ↑ ↓ home end move"));
+        keys.push(hint("esc cancel"));
+        return wrap_hints(vec!["Commit:".cyan().bold()], keys, "   ", width);
     }
     if let Some(p) = &app.blocked_prompt {
         let mut keys = Vec::new();

@@ -467,16 +467,15 @@ pub fn fixes_for<'a>(plan: &'a Plan, title: &str) -> Vec<&'a Fixed> {
     plan.fixes.iter().filter(|f| !title.contains(&f.id)).collect()
 }
 
-/// Commits the plan's files with `title`, and the plan's body unless the title already says
-/// it all. Returns the new commit's short hash.
-pub fn run(dir: &Path, plan: &Plan, title: &str) -> Result<String, String> {
+/// Commits the plan's files with `title` and `body` (none when `None`). Returns the new
+/// commit's short hash.
+pub fn run(dir: &Path, plan: &Plan, title: &str, body: Option<&str>) -> Result<String, String> {
     let mut add = vec!["add", "-A", "--"];
     add.extend(plan.files.iter().map(String::as_str));
     git(dir, &add)?;
-    let body = body_for(plan, title);
     let mut commit = vec!["commit", "-m", title];
-    if let Some(body) = &body {
-        commit.extend(["-m", body.as_str()]);
+    if let Some(body) = body {
+        commit.extend(["-m", body]);
     }
     // With paths, git commits only those files, whatever else is staged.
     commit.push("--");
@@ -767,7 +766,7 @@ mod tests {
         assert_eq!(plan.branch, "main");
         assert_eq!(plan.other_staged, ["notes.txt"]);
 
-        let hash = run(&dir, &plan, &plan.title).unwrap();
+        let hash = run(&dir, &plan, &plan.title, body_for(&plan, &plan.title).as_deref()).unwrap();
         assert!(!hash.is_empty());
         assert_eq!(sh(&root, &["log", "-1", "--format=%s"]), "chore: upgrade eslint 8.57.1 to 9.0.0");
         // The title says it all: no body repeating it.

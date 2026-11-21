@@ -13,6 +13,7 @@ mod peers;
 mod pm;
 mod registry;
 mod snyk;
+mod textfield;
 mod tree;
 mod ui;
 mod view;

@@ -251,14 +251,25 @@ struct Adding {
     latest: Version,
 }
 
-/// The commit `c` proposes, with its title as the user edits it.
+/// The commit `c` proposes, with its title and body as the user edits them.
 pub struct CommitPrompt {
     pub plan: crate::commit::Plan,
-    pub title: String,
+    pub title: crate::textfield::TextField,
+    pub body: crate::textfield::TextField,
+    /// The user changed the body: it no longer follows the title.
+    pub body_edited: bool,
+    /// The field the keys go to; Tab switches.
+    pub field: CommitField,
     /// Why the commit failed, e.g. a git hook's output.
     pub error: Option<String>,
     /// git is committing.
     pub busy: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CommitField {
+    Title,
+    Body,
 }
 
 /// What `d` is about to delete, waiting for the user to confirm.
@@ -2247,8 +2258,12 @@ impl App {
         self.filter_mode = false;
         self.pin_prompt = false;
         self.input = None;
+        let body = crate::commit::body_for(&plan, &plan.title).unwrap_or_default();
         self.commit_prompt = Some(CommitPrompt {
-            title: plan.title.clone(),
+            title: crate::textfield::TextField::new(plan.title.clone()),
+            body: crate::textfield::TextField::new(body),
+            body_edited: false,
+            field: CommitField::Title,
             plan,
             error: None,
             busy: false,
@@ -2263,37 +2278,108 @@ impl App {
         if p.busy {
             return;
         }
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         match key.code {
             KeyCode::Esc => {
                 self.commit_prompt = None;
                 self.push_log("Nothing committed.");
+                return;
             }
-            KeyCode::Enter => {
-                let title = p.title.trim().to_string();
-                if title.is_empty() {
-                    p.error = Some("The commit needs a title.".into());
-                    return;
-                }
-                p.busy = true;
-                p.error = None;
-                let (dir, plan, tx) = (self.dir.clone(), p.plan.clone(), self.events_tx.clone());
-                thread::spawn(move || {
-                    let _ = tx.send(Event::Committed(crate::commit::run(&dir, &plan, &title)));
-                });
+            // Enter commits from the title; in the body it starts a new line.
+            KeyCode::Char('s') if ctrl => return self.submit_commit(),
+            KeyCode::Enter if p.field == CommitField::Title => return self.submit_commit(),
+            KeyCode::Tab | KeyCode::BackTab => {
+                p.field = match p.field {
+                    CommitField::Title => CommitField::Body,
+                    CommitField::Body => CommitField::Title,
+                };
+                return;
             }
-            KeyCode::Backspace => {
-                p.title.pop();
-            }
-            KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => p.title.push(c),
             _ => {}
         }
+        let field = match p.field {
+            CommitField::Title => &mut p.title,
+            CommitField::Body => &mut p.body,
+        };
+        let changed = match key.code {
+            KeyCode::Enter => {
+                field.insert('\n');
+                true
+            }
+            KeyCode::Backspace => field.backspace(),
+            KeyCode::Delete => field.delete(),
+            KeyCode::Left => {
+                field.left();
+                false
+            }
+            KeyCode::Right => {
+                field.right();
+                false
+            }
+            KeyCode::Home => {
+                field.home();
+                false
+            }
+            KeyCode::End => {
+                field.end();
+                false
+            }
+            KeyCode::Up => {
+                field.up();
+                false
+            }
+            KeyCode::Down => {
+                field.down();
+                false
+            }
+            KeyCode::Char(c) if !ctrl => {
+                field.insert(c);
+                true
+            }
+            _ => false,
+        };
+        if !changed {
+            return;
+        }
+        p.error = None;
+        match p.field {
+            CommitField::Body => p.body_edited = true,
+            // A body the user hasn't touched keeps leaving out what the title says.
+            CommitField::Title if !p.body_edited => {
+                let body = crate::commit::body_for(&p.plan, p.title.text()).unwrap_or_default();
+                p.body.set(body);
+            }
+            CommitField::Title => {}
+        }
+    }
+
+    /// Commits with the title and body as they are in the dialog.
+    fn submit_commit(&mut self) {
+        let Some(p) = &mut self.commit_prompt else {
+            return;
+        };
+        let title = p.title.text().trim().to_string();
+        if title.is_empty() {
+            p.error = Some("The commit needs a title.".into());
+            p.field = CommitField::Title;
+            return;
+        }
+        let body = p.body.text().trim_end().to_string();
+        let body = (!body.trim().is_empty()).then_some(body);
+        p.busy = true;
+        p.error = None;
+        let (dir, plan, tx) = (self.dir.clone(), p.plan.clone(), self.events_tx.clone());
+        thread::spawn(move || {
+            let result = crate::commit::run(&dir, &plan, &title, body.as_deref());
+            let _ = tx.send(Event::Committed(result));
+        });
     }
 
     fn on_committed(&mut self, result: Result<String, String>) {
         match result {
             Ok(hash) => {
                 if let Some(p) = self.commit_prompt.take() {
-                    self.push_log(format!("✔ committed {hash}: {}", p.title.trim()));
+                    self.push_log(format!("✔ committed {hash}: {}", p.title.text().trim()));
                     // Committed fixes aren't listed again in the next commit.
                     self.session_fixes.retain(|f| !p.plan.fixes.contains(f));
                 }
@@ -5510,7 +5596,7 @@ mod tests {
         app.on_key(key('c'));
         wait_until(&mut app, |a| a.commit_prompt.is_some());
         let p = app.commit_prompt.as_ref().unwrap();
-        assert_eq!(p.title, "chore: upgrade a 1.0.0 to 2.0.0");
+        assert_eq!(p.title.text(), "chore: upgrade a 1.0.0 to 2.0.0");
         let screen = render(&mut app, 120, 40).join("\n");
         assert!(screen.contains(" Commit to git "), "{screen}");
         assert!(screen.contains("Title  chore: upgrade a 1.0.0 to 2.0.0█"), "{screen}");
@@ -5590,7 +5676,7 @@ mod tests {
         app.on_key(key('c'));
         wait_until(&mut app, |a| a.commit_prompt.is_some());
         let p = app.commit_prompt.as_ref().unwrap();
-        assert_eq!(p.title, "chore: upgrade a 1.0.0 to 1.0.1, override qs to ^6.0.4");
+        assert_eq!(p.title.text(), "chore: upgrade a 1.0.0 to 1.0.1, override qs to ^6.0.4");
         assert_eq!(
             p.plan.body,
             "- upgrade a 1.0.0 to 1.0.1\n- override qs to ^6.0.4\n\nFixes:\n- UPGRADE: Bad (high)\n- NESTED: Bad (high)"
@@ -5621,6 +5707,141 @@ mod tests {
         app.queue_install(vec![("a".into(), Version::new(1, 0, 0))], Vec::new());
         app.on_install_finished(vec!["a".into()], Vec::new(), Ok(()));
         assert!(app.session_fixes.is_empty());
+    }
+
+    /// A git repository in the app's project with `a` upgraded from 1.0.0 to 2.0.0 since the
+    /// last commit, and the commit dialog open.
+    fn commit_dialog_open() -> App {
+        let (mut app, _rx) = app_capturing_installs();
+        let dir = app.dir.clone();
+        let lock = |v: &str| {
+            format!(r#"{{"lockfileVersion":3,"packages":{{"node_modules/a":{{"version":"{v}"}}}}}}"#)
+        };
+        std::fs::write(dir.join("package.json"), r#"{"dependencies":{"a":"^1.0.0"}}"#).unwrap();
+        std::fs::write(dir.join("package-lock.json"), lock("1.0.0")).unwrap();
+        std::fs::write(dir.join(".gitignore"), "node_modules\ncache.json*\n").unwrap();
+        git(&dir, &["init", "-q", "-b", "main"]);
+        for (k, v) in [("user.name", "t"), ("user.email", "t@example.com"), ("commit.gpgsign", "false")] {
+            git(&dir, &["config", k, v]);
+        }
+        git(&dir, &["add", "-A"]);
+        git(&dir, &["commit", "-q", "-m", "init"]);
+        std::fs::write(dir.join("package.json"), r#"{"dependencies":{"a":"^2.0.0"}}"#).unwrap();
+        std::fs::write(dir.join("package-lock.json"), lock("2.0.0")).unwrap();
+        app.on_key(key('c'));
+        wait_until(&mut app, |a| a.commit_prompt.is_some());
+        app
+    }
+    fn prompt(app: &App) -> &CommitPrompt {
+        app.commit_prompt.as_ref().unwrap()
+    }
+    fn ctrl(c: char) -> KeyEvent {
+        KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL)
+    }
+
+    #[test]
+    fn tab_moves_between_the_title_and_the_body() {
+        let mut app = commit_dialog_open();
+        assert_eq!(prompt(&app).field, CommitField::Title);
+        press(&mut app, KeyCode::Tab);
+        assert_eq!(prompt(&app).field, CommitField::Body);
+        press(&mut app, KeyCode::Tab);
+        assert_eq!(prompt(&app).field, CommitField::Title);
+        press(&mut app, KeyCode::BackTab);
+        assert_eq!(prompt(&app).field, CommitField::Body);
+        // Typing goes to the field that has the keys.
+        type_text(&mut app, "x");
+        assert_eq!(prompt(&app).title.text(), "chore: upgrade a 1.0.0 to 2.0.0");
+        assert_eq!(prompt(&app).body.text(), "x");
+    }
+
+    #[test]
+    fn the_body_can_be_written_and_is_committed_as_written() {
+        let mut app = commit_dialog_open();
+        // The proposed title names the change, so the body starts empty.
+        assert_eq!(prompt(&app).body.text(), "");
+        press(&mut app, KeyCode::Tab);
+        type_text(&mut app, "Needed for the new flat config.");
+        press(&mut app, KeyCode::Enter); // a new line, not a commit
+        assert!(!prompt(&app).busy);
+        press(&mut app, KeyCode::Enter);
+        type_text(&mut app, "See #42.");
+        assert_eq!(prompt(&app).body.text(), "Needed for the new flat config.\n\nSee #42.");
+        assert!(prompt(&app).body_edited);
+
+        // Editing the title no longer touches the body.
+        press(&mut app, KeyCode::Tab);
+        for _ in 0.." 1.0.0 to 2.0.0".len() {
+            press(&mut app, KeyCode::Backspace);
+        }
+        assert_eq!(prompt(&app).body.text(), "Needed for the new flat config.\n\nSee #42.");
+
+        // Ctrl+S commits from either field.
+        app.on_key(ctrl('s'));
+        wait_until(&mut app, |a| a.commit_prompt.is_none());
+        let dir = app.dir.clone();
+        assert_eq!(git(&dir, &["log", "-1", "--format=%s"]), "chore: upgrade a");
+        assert_eq!(git(&dir, &["log", "-1", "--format=%b"]), "Needed for the new flat config.\n\nSee #42.");
+    }
+
+    #[test]
+    fn an_untouched_body_follows_the_title() {
+        let mut app = commit_dialog_open();
+        // Removing the versions from the title brings the list of changes into the body.
+        for _ in 0.." 1.0.0 to 2.0.0".len() {
+            press(&mut app, KeyCode::Backspace);
+        }
+        assert_eq!(prompt(&app).body.text(), "- upgrade a 1.0.0 to 2.0.0");
+        assert!(!prompt(&app).body_edited);
+        // Moving the cursor around the body isn't an edit.
+        press(&mut app, KeyCode::Tab);
+        press(&mut app, KeyCode::Home);
+        press(&mut app, KeyCode::Left);
+        press(&mut app, KeyCode::Tab);
+        type_text(&mut app, " 1.0.0 to 2.0.0");
+        assert_eq!(prompt(&app).body.text(), "", "the title says it all again");
+    }
+
+    #[test]
+    fn an_emptied_body_commits_without_one() {
+        let mut app = commit_dialog_open();
+        for _ in 0.." 1.0.0 to 2.0.0".len() {
+            press(&mut app, KeyCode::Backspace);
+        }
+        press(&mut app, KeyCode::Tab);
+        while !prompt(&app).body.text().is_empty() {
+            press(&mut app, KeyCode::Backspace);
+        }
+        let screen = render(&mut app, 120, 40).join("\n");
+        assert!(screen.contains("Body   █ (empty: the commit gets no body)"), "{screen}");
+        app.on_key(ctrl('s'));
+        wait_until(&mut app, |a| a.commit_prompt.is_none());
+        assert_eq!(git(&app.dir.clone(), &["log", "-1", "--format=%b"]), "");
+    }
+
+    #[test]
+    fn only_the_field_with_the_keys_shows_the_cursor() {
+        use ratatui::style::{Color, Modifier};
+        let mut app = commit_dialog_open();
+        press(&mut app, KeyCode::Tab);
+        type_text(&mut app, "first\nsecond");
+        // Back into the middle of the first line.
+        press(&mut app, KeyCode::Up);
+        press(&mut app, KeyCode::Home);
+        press(&mut app, KeyCode::Right);
+        let buf = buffer(&mut app, 120, 40);
+        let (bx, by) = find(&buf, "Body   ");
+        assert_eq!(buf[(bx, by)].fg, Color::Cyan, "the body's label is lit");
+        let (tx, ty) = find(&buf, "Title  ");
+        assert_ne!(buf[(tx, ty)].fg, Color::Cyan);
+        // The cursor is on the "i" of "first": reversed. The title has no block.
+        let (fx, fy) = find(&buf, "first");
+        assert!(buf[(fx + 1, fy)].modifier.contains(Modifier::REVERSED));
+        assert!(!buf[(fx, fy)].modifier.contains(Modifier::REVERSED));
+        let title_row: String = (0..120).map(|x| buf[(x, ty)].symbol().to_string()).collect();
+        assert!(!title_row.contains('█'), "{title_row}");
+        let screen = render(&mut app, 120, 40).join("\n");
+        assert!(screen.contains("ctrl+s commit   enter new line   tab title   esc cancel"), "{screen}");
     }
 
     #[test]
