@@ -73,7 +73,7 @@ depsu --pm pnpm       # skip detection
 | `/` | Filter by name. `Enter` keeps the filter, `Esc` clears it |
 | `g` | Group by: none → release type → name prefix → dependency type |
 | `o` | Overrides: hidden → compact → full |
-| `x` | Remove the selected or highlighted overrides, flagged `✂` or not (press twice to confirm) |
+| `x` | Remove the selected or highlighted overrides, or the overrides of the highlighted package, flagged `✂` or not. Warns when installed packages use the overridden package (press twice to confirm) |
 | `P` | Choose how the selected or highlighted packages are pinned: exact (`e`), caret `^` (`c`), tilde `~` (`t`) or at least `>=` (`m`). Letters are used because `^` and `~` are dead keys on Nordic keyboards. The version stays, `package.json` is edited and the install runs |
 | `p` | Pin a vulnerable transitive dependency to the fixed version a scan suggests, as an override (press twice to confirm) |
 | `s` | Scan with Snyk |

@@ -1182,7 +1182,9 @@ impl App {
             .visible_overrides()
             .into_iter()
             .any(|o| self.selected_overrides.contains(&o.key()) && !self.override_busy(o))
-            || self.cursor_override().is_some_and(|o| !self.override_busy(o));
+            || self.cursor_override().is_some_and(|o| !self.override_busy(o))
+            || matches!(self.cursor_item(), Some(Item::Row { idx, .. })
+                if self.rows[*idx].overrides.iter().any(|o| !self.override_busy(o)));
         if remove {
             item.push("x remove override".into());
         }
@@ -1889,8 +1891,20 @@ impl App {
         {
             targets.push(o.clone());
         }
+        // On a package: all overrides that target it.
+        if targets.is_empty()
+            && let Some(Item::Row { idx, .. }) = self.cursor_item().cloned()
+        {
+            targets.extend(
+                self.rows[idx]
+                    .overrides
+                    .iter()
+                    .filter(|o| !self.override_busy(o))
+                    .cloned(),
+            );
+        }
         if targets.is_empty() {
-            self.push_log("Nothing to remove: put the cursor on an override, or select some with space.");
+            self.push_log("Nothing to remove: put the cursor on an override or on a package that has one, or select overrides with space.");
             return;
         }
 
@@ -1901,6 +1915,24 @@ impl App {
                 "✂ will remove from package.json: {}. Press x again to confirm, any other key cancels.",
                 names.join("; ")
             ));
+            for o in &targets {
+                let users = self.dependents_of(&o.name);
+                if users.is_empty() {
+                    continue;
+                }
+                let mut names: Vec<&str> = users.iter().map(|d| d.name.as_str()).collect();
+                names.sort();
+                names.dedup();
+                let more = names.len().saturating_sub(5);
+                let mut list = names.iter().take(5).copied().collect::<Vec<_>>().join(", ");
+                if more > 0 {
+                    list.push_str(&format!(", +{more} more"));
+                }
+                self.push_log(format!(
+                    "⚠ {} is used by {list}: removing its override can change which version they get.",
+                    o.name
+                ));
+            }
             if targets.iter().any(|o| self.unneeded(o).is_none()) {
                 self.push_log(
                     "⚠ Not flagged as unneeded: changed it can change which versions get installed and reintroduce vulnerabilities.",
