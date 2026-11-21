@@ -97,6 +97,13 @@ impl Row {
         Release::of(&self.current, &self.latest)
     }
 
+    /// Whether the row's own overrides are listed apart from the row. The row of an overridden
+    /// package already shows its single plain override, so repeating it would be noise.
+    pub fn lists_own_overrides(&self) -> bool {
+        self.kind != Kind::Override
+            || self.overrides.len() > 1
+            || self.overrides.iter().any(|o| !o.global() || o.range.is_some())
+    }
     pub fn busy(&self) -> bool {
         matches!(self.status, Status::Queued | Status::Installing)
     }
@@ -185,6 +192,9 @@ pub struct App {
     overrides: Vec<Override>,
     /// Latest published version of each overridden package.
     override_latest: HashMap<String, Version>,
+    /// Registry settings and HTTP agent, to look up packages that show up after the start.
+    rc: Arc<Npmrc>,
+    agent: ureq::Agent,
     selected_overrides: HashSet<String>,
     busy_overrides: HashSet<String>,
     /// Overrides that look unnecessary, by key.
@@ -228,6 +238,11 @@ impl App {
         for o in &overrides {
             if parse_spec(&o.value).is_some() && !names.contains(&o.name) {
                 names.push_back(o.name.clone());
+                if !direct.contains(&o.name)
+                    && let Some((prefix, v)) = override_base(&overrides, &o.name)
+                {
+                    current.insert(o.name.clone(), (Kind::Override, prefix, v));
+                }
             }
         }
         let total = names.len();
@@ -307,6 +322,8 @@ impl App {
             direct,
             overrides,
             override_latest: HashMap::new(),
+            rc: rc.clone(),
+            agent: agent.clone(),
             selected_overrides: HashSet::new(),
             busy_overrides: HashSet::new(),
             unneeded: HashMap::new(),
@@ -393,8 +410,12 @@ impl App {
         let Some((kind, prefix, cur)) = self.current.get(&name).cloned() else {
             return;
         };
-        let outdated = latest > cur && latest.pre.is_empty();
         let own = self.own_overrides(&name);
+        let outdated = if kind == Kind::Override {
+            own.iter().any(|o| self.update_target(o).is_some())
+        } else {
+            latest > cur && latest.pre.is_empty()
+        };
         let row = |own: Vec<Override>, compat| Row {
             name: name.clone(),
             kind,
@@ -412,12 +433,14 @@ impl App {
             audit_fix: None,
         };
         // Packages that are already up to date are listed too, so their overrides are visible.
-        let compat = if outdated {
+        let compat = if outdated && kind != Kind::Override {
             overrides::check(&own, self.pm, &format!("{prefix}{latest}"), &latest)
         } else {
             Compat::Ok
         };
-        self.analyze(&name);
+        if kind != Kind::Override {
+            self.analyze(&name);
+        }
         let r = row(own, compat);
         self.insert_row(r);
     }
@@ -534,8 +557,11 @@ impl App {
         self.selected_overrides.retain(|k| existing.contains(k));
         // Old verdicts are stale until the new analysis arrives.
         self.unneeded.clear();
-
+        self.sync_override_rows();
         for i in 0..self.rows.len() {
+            if self.rows[i].kind == Kind::Override {
+                continue;
+            }
             let own = self.own_overrides(&self.rows[i].name);
             let r = &mut self.rows[i];
             r.compat = if r.outdated {
@@ -550,13 +576,59 @@ impl App {
             let _ = tx.send(TreeMsg::Reset);
             let _ = tx.send(TreeMsg::SetOverrides(self.overrides.clone()));
             let _ = tx.send(TreeMsg::FindUnneeded(self.root_deps.clone()));
-            for r in &self.rows {
+            for r in self.rows.iter().filter(|r| r.kind != Kind::Override) {
                 let _ = tx.send(TreeMsg::Analyze(r.name.clone()));
             }
         }
         self.rebuild_view();
     }
 
+    /// Keeps the rows of overridden packages that are not dependencies of the project in step
+    /// with `package.json`: drops rows whose overrides are gone, refreshes the others and
+    /// adds rows (looking the latest version up if needed) for new overrides.
+    fn sync_override_rows(&mut self) {
+        let mut names: Vec<String> = Vec::new();
+        for o in &self.overrides {
+            if !self.direct.contains(&o.name)
+                && !names.contains(&o.name)
+                && override_base(&self.overrides, &o.name).is_some()
+            {
+                names.push(o.name.clone());
+            }
+        }
+        self.rows
+            .retain(|r| r.kind != Kind::Override || names.contains(&r.name));
+        for name in names {
+            let Some((prefix, cur)) = override_base(&self.overrides, &name) else {
+                continue;
+            };
+            let own = self.own_overrides(&name);
+            if let Some(i) = self
+                .rows
+                .iter()
+                .position(|r| r.kind == Kind::Override && r.name == name)
+            {
+                let outdated = own.iter().any(|o| self.update_target(o).is_some());
+                let r = &mut self.rows[i];
+                r.current = cur;
+                r.prefix = prefix;
+                r.outdated = outdated;
+                r.overrides = own;
+            } else if let Some(latest) = self.override_latest.get(&name).cloned() {
+                self.current
+                    .insert(name.clone(), (Kind::Override, prefix, cur));
+                self.on_fetched(name, latest);
+            } else {
+                self.current
+                    .insert(name.clone(), (Kind::Override, prefix, cur));
+                let (rc, agent, tx) = (self.rc.clone(), self.agent.clone(), self.events_tx.clone());
+                thread::spawn(move || {
+                    let result = registry::latest_version(&rc, &agent, &name);
+                    let _ = tx.send(Event::Fetched { name, result });
+                });
+            }
+        }
+    }
     fn insert_row(&mut self, mut row: Row) {
         for (source, scan) in [
             (Source::Snyk, &self.snyk),
@@ -941,10 +1013,26 @@ impl App {
             }
             idx.retain(|&i| self.rows[i].actionable());
         }
+        // Rows of overridden packages are updated by editing their overrides.
+        let (over_rows, idx): (Vec<usize>, Vec<usize>) = idx
+            .into_iter()
+            .partition(|&i| self.rows[i].kind == Kind::Override);
+        for &i in &over_rows {
+            self.rows[i].selected = false;
+        }
+        for i in over_rows {
+            for o in &self.rows[i].overrides {
+                if !self.override_busy(o)
+                    && !ovr.iter().any(|(p, _)| p.key() == o.key())
+                    && let Some(u) = self.update_target(o)
+                {
+                    ovr.push((o.clone(), u.value));
+                }
+            }
+        }
         if idx.is_empty() && ovr.is_empty() {
             return;
         }
-
         let pkgs = idx
             .into_iter()
             .map(|i| (i, self.rows[i].latest.clone()))
@@ -1260,6 +1348,15 @@ impl App {
     }
 }
 
+/// The version an overridden package is at: the lowest of its overrides that name a literal
+/// version, with that override's prefix.
+fn override_base(overrides: &[Override], name: &str) -> Option<(&'static str, Version)> {
+    overrides
+        .iter()
+        .filter(|o| o.name == name)
+        .filter_map(|o| parse_spec(&o.value))
+        .min_by(|a, b| a.1.cmp(&b.1))
+}
 /// An override that pins a vulnerable transitive package to a fixed version.
 struct Pin {
     name: String,
@@ -1515,5 +1612,33 @@ fn run_pm(dir: &std::path::Path, pm: Pm, args: &[String]) -> Result<(), String> 
             ))
         }
         Err(e) => Err(format!("could not run {}: {e}", pm.name())),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    fn ovr(name: &str, value: &str, key: &str) -> Override {
+        Override {
+            name: name.into(),
+            range: None,
+            value: value.into(),
+            source: "overrides",
+            path: Vec::new(),
+            loc: vec!["overrides".into(), key.into()],
+        }
+    }
+    #[test]
+    fn override_base_is_the_lowest_literal_version() {
+        let all = [
+            ovr("foo", "^2.1.0", "a"),
+            ovr("foo", "$foo", "b"),
+            ovr("foo", "~1.4.0", "c"),
+            ovr("bar", "9.0.0", "d"),
+        ];
+        let (prefix, v) = override_base(&all, "foo").unwrap();
+        assert_eq!((prefix, v.to_string()), ("~", "1.4.0".to_string()));
+        assert!(override_base(&[ovr("x", "$y", "a")], "x").is_none());
+        assert!(override_base(&all, "missing").is_none());
     }
 }

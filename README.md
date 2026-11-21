@@ -156,6 +156,14 @@ the chain that leads to it.
 (keeping indentation, key order and the trailing newline) and runs the package manager's install.
 On npm, overrides on direct dependencies can't be updated separately, because of the rule above.
 
+**Overridden packages in the list.** A package that is overridden but isn't a dependency of the
+project gets a row of its own (kind `ovr`) under an "Overridden packages" heading at the bottom of
+the list, after the regular packages whatever the grouping. Its latest version is looked up like for any other
+package. The row shows the lowest version its overrides name and is marked outdated when any of
+them can move to a newer one. Checking the row and pressing `i` rewrites those overrides in
+`package.json` and runs the install, the same as for the override lines under a package. Overrides
+whose value isn't a plain version or range (`$foo`, URLs, aliases) get no row.
+
 **Pinning a fix.** When Snyk or the audit reports a vulnerable package below a direct dependency
 and lists a fixed version, `p` adds an override for it (`overrides`, `resolutions` or
 `pnpm.overrides`, depending on the package manager) set to `^<fixed version>`. It uses the lowest fix

@@ -9,6 +9,8 @@ pub enum Kind {
     Prod,
     Dev,
     Optional,
+    /// Not a dependency of the project: a package that is only listed because it is overridden.
+    Override,
 }
 
 impl Kind {
@@ -17,6 +19,7 @@ impl Kind {
             Kind::Prod => "dep",
             Kind::Dev => "dev",
             Kind::Optional => "opt",
+            Kind::Override => "ovr",
         }
     }
 }

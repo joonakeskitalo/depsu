@@ -63,7 +63,7 @@ impl Pm {
         let mut a: Vec<String> = vec![if self == Pm::Npm { "install" } else { "add" }.into()];
         a.extend(specs.iter().cloned());
         match kind {
-            Kind::Prod => {}
+            Kind::Prod | Kind::Override => {}
             Kind::Dev => a.push("-D".into()),
             Kind::Optional => a.push(if self == Pm::Bun { "--optional" } else { "-O" }.into()),
         }

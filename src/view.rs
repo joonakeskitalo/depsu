@@ -1,6 +1,7 @@
 //! Grouping and filtering of the outdated-package list into display items.
 
 use crate::app::Row;
+use crate::package::Kind;
 use semver::Version;
 use std::collections::HashMap;
 
@@ -143,7 +144,9 @@ fn children(r: &Row, idx: usize, mode: Overrides, vulns: bool) -> Vec<Item> {
         }
     }
     if mode != Overrides::Off {
-        kids.extend((0..r.overrides.len()).map(Child::Own));
+        if r.lists_own_overrides() {
+            kids.extend((0..r.overrides.len()).map(Child::Own));
+        }
         kids.extend((0..r.tree_hits.len().min(cap)).map(Child::Tree));
         if r.tree_hits.len() > cap {
             kids.push(Child::More(r.tree_hits.len() - cap));
@@ -169,6 +172,8 @@ fn children(r: &Row, idx: usize, mode: Overrides, vulns: bool) -> Vec<Item> {
 
 const OTHER: &str = "(other)";
 pub const UP_TO_DATE: &str = "Up to date";
+/// Label of the section listing overridden packages that aren't dependencies.
+pub const OVERRIDDEN: &str = "Overridden packages";
 /// Label of the section listing overrides that look unnecessary.
 pub const UNNEEDED: &str = "Unneeded overrides";
 
@@ -204,6 +209,10 @@ pub fn build(
         .filter(|&i| needle.is_empty() || rows[i].name.to_lowercase().contains(&needle))
         .collect();
     visible.sort_by_key(|&i| !rows[i].outdated); // stable: outdated first
+    // Overridden packages that aren't dependencies go in a section of their own at the end.
+    let (over, visible): (Vec<usize>, Vec<usize>) = visible
+        .into_iter()
+        .partition(|&i| rows[i].kind == Kind::Override);
     // A package row followed by its nested override lines.
     let item = |i: usize| {
         let mut v = vec![Item::Row {
@@ -214,9 +223,26 @@ pub fn build(
         v
     };
 
-    if mode == GroupBy::None {
-        return visible.into_iter().flat_map(item).collect();
+    let mut out = if mode == GroupBy::None {
+        visible.into_iter().flat_map(item).collect()
+    } else {
+        grouped(rows, mode, visible, &item)
+    };
+    if !over.is_empty() {
+        out.push(Item::Header {
+            label: OVERRIDDEN.to_string(),
+            members: over.clone(),
+        });
+        out.extend(over.into_iter().flat_map(item));
     }
+    out
+}
+fn grouped(
+    rows: &[Row],
+    mode: GroupBy,
+    visible: Vec<usize>,
+    item: &dyn Fn(usize) -> Vec<Item>,
+) -> Vec<Item> {
 
     // (sort key, label) -> members
     let mut groups: Vec<((u8, String), Vec<usize>)> = Vec::new();
@@ -255,7 +281,7 @@ pub fn build(
             label,
             members: members.clone(),
         });
-        out.extend(members.into_iter().flat_map(item));
+        out.extend(members.into_iter().flat_map(|i| item(i)));
     }
     out
 }
@@ -314,6 +340,21 @@ mod tests {
         assert_eq!(Release::of(&v("1.2.3"), &v("2.0.0")), Release::Major);
         assert_eq!(Release::of(&v("1.2.3"), &v("1.3.0")), Release::Minor);
         assert_eq!(Release::of(&v("1.2.3"), &v("1.2.4")), Release::Patch);
+    }
+
+    #[test]
+    fn overridden_packages_form_a_last_section() {
+        let mut rows = sample();
+        let mut o = row("zlib-x", "1.0.0", "1.1.0");
+        o.kind = Kind::Override;
+        rows.insert(0, o);
+        for mode in [GroupBy::None, GroupBy::Release] {
+            let items = build(&rows, mode, "", Overrides::Off, true, true);
+            let l = labels(&items);
+            let at = l.iter().position(|x| x == &format!("# {OVERRIDDEN}")).unwrap();
+            assert_eq!(l[at + 1..], ["zlib-x"], "{mode:?}");
+            assert!(l[..at].iter().all(|x| x != "zlib-x"));
+        }
     }
 
     #[test]

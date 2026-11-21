@@ -1,6 +1,7 @@
 use crate::app::{App, Row as AppRow, ScanStatus, Status, fix_key, scan_key};
 use crate::audit;
 use crate::overrides::{self, Compat, Override};
+use crate::package::Kind;
 use crate::pm::Pm;
 use crate::tree::{self, Hit};
 use crate::view::{Child, GroupBy, Item, Overrides, Release, UNNEEDED};
@@ -300,7 +301,7 @@ fn compat_symbol(c: Compat) -> &'static str {
 fn override_marker(r: &AppRow) -> (Vec<Span<'static>>, usize) {
     let mut spans = Vec::new();
     let mut width = 0;
-    if !r.overrides.is_empty() {
+    if !r.overrides.is_empty() && r.lists_own_overrides() {
         spans.push(Span::styled(
             compat_symbol(r.compat),
             Style::new().fg(compat_color(r.compat)),
@@ -573,6 +574,15 @@ fn orphan_lines(app: &App, key: &str, width: usize) -> Vec<Line<'static>> {
 
 /// Compatibility of the update of `r` with its own override `o`, and a short explanation.
 fn own_override_note(app: &App, r: &AppRow, o: &Override) -> (Compat, String) {
+    // Overridden packages aren't dependencies, so there is no dependency spec to clash with.
+    if r.kind == Kind::Override {
+        let note = if o.path.is_empty() {
+            String::new()
+        } else {
+            "only applies below another package".to_string()
+        };
+        return (Compat::Ok, note);
+    }
     let c = overrides::check(std::slice::from_ref(o), app.pm, &r.new_spec(), &r.latest);
     // Up-to-date packages have no pending update to be compatible with.
     let note = if !o.path.is_empty() {
@@ -606,7 +616,7 @@ fn summary_lines(app: &App, width: usize) -> Vec<Line<'static>> {
     };
     let r = &app.rows[*idx];
     let mut spans: Vec<Span<'static>> = Vec::new();
-    for o in &r.overrides {
+    for o in r.overrides.iter().filter(|_| r.lists_own_overrides()) {
         let (c, note) = own_override_note(app, r, o);
         let mut text = format!("{} {}", compat_symbol(c), o.describe());
         if let Some(u) = app.update_target(o) {
