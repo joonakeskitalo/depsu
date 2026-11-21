@@ -33,7 +33,7 @@ fn draw_log(f: &mut Frame, app: &mut App) {
             hint("q quit"),
         ],
         "   ",
-        f.area().width,
+        inner_width(f),
     );
     let header_lines = header_lines(app, f.area().width);
     let [header, log_rule, body, keys_rule, help] = Layout::vertical([
@@ -44,6 +44,7 @@ fn draw_log(f: &mut Frame, app: &mut App) {
         Constraint::Length(footer.len() as u16),
     ])
     .areas(f.area());
+    let (body, help) = (pad(body), pad(help));
     let h = (body.height as usize).max(1);
     app.log_page = h;
     app.log_scroll = app.log_scroll.min(app.log.len().saturating_sub(h));
@@ -66,6 +67,21 @@ fn draw_log(f: &mut Frame, app: &mut App) {
     );
     f.render_widget(Paragraph::new(footer), help);
 }
+/// Columns the section content is indented relative to the section titles.
+const PAD: u16 = 2;
+fn pad(r: ratatui::layout::Rect) -> ratatui::layout::Rect {
+    let d = PAD.min(r.width);
+    ratatui::layout::Rect {
+        x: r.x + d,
+        width: r.width - d,
+        ..r
+    }
+}
+/// Width left for content once the indentation is taken off.
+fn inner_width(f: &Frame) -> u16 {
+    f.area().width.saturating_sub(PAD)
+}
+
 /// A two-line section heading: a horizontal rule, and below it the title of what follows.
 fn heading(f: &mut Frame, area: ratatui::layout::Rect, title: impl Into<String>) {
     let [line, text] = Layout::vertical([Constraint::Length(1), Constraint::Length(1)]).areas(area);
@@ -88,9 +104,9 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     if app.log_focus {
         return draw_log(f, app);
     }
-    let footer = footer_lines(app, f.area().width);
+    let footer = footer_lines(app, inner_width(f));
     let header_lines = header_lines(app, f.area().width);
-    let used_by_lines = used_by_lines(app, f.area().width);
+    let used_by_lines = used_by_lines(app, inner_width(f));
     // While the nested override lists are hidden, a text summary takes their place.
     let summary_h = if app.show_overrides == Overrides::Off {
         SUMMARY_LINES
@@ -112,6 +128,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     ])
     .areas(f.area());
 
+    let (body, used_by, summary, log, help) = (pad(body), pad(used_by), pad(summary), pad(log), pad(help));
     f.render_widget(Paragraph::new(header_lines), header);
     heading(f, list_rule, "packages");
 
