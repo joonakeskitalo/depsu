@@ -108,6 +108,9 @@ pub struct Row {
     /// The version this package had when the session started, if an install in this session
     /// changed it. Kept in memory only, so the change can be reverted.
     pub changed_from: Option<Version>,
+    /// The version changed since the last vulnerability scan, so the findings (or their
+    /// absence) no longer describe what is installed.
+    pub scan_outdated: bool,
 }
 
 impl Row {
@@ -501,6 +504,7 @@ impl App {
             snyk_fix: None,
             audit_fix: None,
             changed_from: None,
+            scan_outdated: false,
         };
         // Packages that are already up to date are listed too, so their overrides are visible.
         let compat = if outdated && kind != Kind::Override {
@@ -609,6 +613,7 @@ impl App {
                         scan_key(self.audit_source())
                     ));
                 }
+                let scan_ran = self.snyk.report.is_some() || self.audit.report.is_some();
                 // Updated packages are up to date now; they stay in the list as such.
                 for r in self.rows.iter_mut().filter(|r| names.contains(&r.name)) {
                     // The target is the latest version, or the one Snyk suggested.
@@ -618,6 +623,7 @@ impl App {
                         .unwrap_or_else(|| r.latest.clone());
                     r.outdated = r.latest > target && r.latest.pre.is_empty();
                     if target != r.current {
+                        r.scan_outdated |= scan_ran;
                         let from = r.changed_from.take().unwrap_or_else(|| r.current.clone());
                         r.changed_from = (from != target).then_some(from);
                     }
@@ -1745,6 +1751,7 @@ pub fn fix_key(source: Source) -> char {
 /// Copies the findings and the suggested fix for `row` out of `report`, replacing what the
 /// same kind of scanner found before. Findings of the other scanner are kept.
 fn apply_report(source: Source, report: &Report, row: &mut Row) {
+    row.scan_outdated = false;
     row.vulns
         .retain(|v| v.source.is_audit() != source.is_audit());
     row.vulns.extend(

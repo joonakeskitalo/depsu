@@ -143,6 +143,7 @@ them under each package.
 | `?` | The override can't be interpreted (URL, alias, odd range) |
 | `↳` | An override applies somewhere in the package's installed dependency tree (yellow if it forces a version outside what the parent declares) |
 | `✱` | A scan found vulnerabilities (coloured by worst severity) |
+| `↻` | The version changed since the last scan, so its findings are out of date: scan again |
 
 **Compatibility.** npm requires an override on a direct dependency to have the exact same spec as
 the dependency (or be `$name`), otherwise it fails with `EOVERRIDE`. yarn, pnpm and bun let the

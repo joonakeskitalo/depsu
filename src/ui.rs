@@ -478,6 +478,11 @@ fn override_marker(r: &AppRow) -> (Vec<Span<'static>>, usize) {
         ));
         width += 1;
     }
+    // ↻: the version changed since the last scan, so a rescan is due.
+    if r.scan_outdated {
+        spans.push(Span::styled("↻", Style::new().fg(Color::Yellow)));
+        width += 1;
+    }
     (spans, width)
 }
 
