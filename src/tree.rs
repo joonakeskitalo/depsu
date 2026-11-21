@@ -263,6 +263,65 @@ impl Analyzer {
     }
 }
 
+/// An installed package that declares a dependency on another one.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Dependent {
+    pub name: String,
+    pub version: Option<Version>,
+    /// The range it declares for the dependency.
+    pub range: String,
+}
+impl Analyzer {
+    pub fn has_overrides(&self) -> bool {
+        !self.overrides.is_empty()
+    }
+    /// For every package name, the installed packages (below the project's own dependencies)
+    /// that depend on it. The project itself is not included.
+    pub fn dependents(&mut self, root_deps: &[(String, String)]) -> HashMap<String, Vec<Dependent>> {
+        let dir = self.dir.clone();
+        let mut out: HashMap<String, Vec<Dependent>> = HashMap::new();
+        let mut visited = HashSet::new();
+        let mut budget = MAX_PROJECT_EDGES;
+        for (dep, _) in root_deps {
+            if let Some(c) = self.resolve(&dir, dep)
+                && visited.insert(c.clone())
+            {
+                self.dependents_walk(&c, dep, 0, &mut visited, &mut budget, &mut out);
+            }
+        }
+        out
+    }
+    fn dependents_walk(
+        &mut self,
+        dir: &Path,
+        name: &str,
+        depth: usize,
+        visited: &mut HashSet<PathBuf>,
+        budget: &mut usize,
+        out: &mut HashMap<String, Vec<Dependent>>,
+    ) {
+        if depth > MAX_DEPTH {
+            return;
+        }
+        let pkg = self.pkg(dir);
+        for (dep, range) in &pkg.deps {
+            if *budget == 0 {
+                return;
+            }
+            *budget -= 1;
+            out.entry(dep.clone()).or_default().push(Dependent {
+                name: name.to_string(),
+                version: pkg.version.clone(),
+                range: range.clone(),
+            });
+            if let Some(c) = self.resolve(dir, dep)
+                && visited.insert(c.clone())
+            {
+                self.dependents_walk(&c, dep, depth + 1, visited, budget, out);
+            }
+        }
+    }
+}
 /// An installed copy of a package that an advisory applies to.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Located {
@@ -655,6 +714,31 @@ mod tests {
         let m = json!({"overrides": {"c": "1.0.0"}});
         let mut a = Analyzer::new(dir.clone(), collect(&m, Pm::Npm));
         assert_eq!(a.analyze("a").len(), 1);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn finds_installed_packages_that_depend_on_a_package() {
+        let dir = tmp("dependents");
+        write(
+            &dir,
+            "node_modules/a",
+            r#"{"version":"1.0.0","dependencies":{"b":"^2"}}"#,
+        );
+        write(
+            &dir,
+            "node_modules/b",
+            r#"{"version":"2.1.0","dependencies":{"c":"1"}}"#,
+        );
+        write(&dir, "node_modules/c", r#"{"version":"1.0.0"}"#);
+        let mut an = Analyzer::new(dir.clone(), Vec::new());
+        let roots = vec![("a".to_string(), "^1".to_string()), ("c".to_string(), "1".to_string())];
+        let d = an.dependents(&roots);
+        assert_eq!(d["b"].len(), 1);
+        assert_eq!(d["b"][0].name, "a");
+        assert_eq!(d["b"][0].range, "^2");
+        assert_eq!(d["c"][0].name, "b");
+        assert!(!d.contains_key("a"), "the project's own dependency on a doesn't count");
         std::fs::remove_dir_all(dir).unwrap();
     }
 

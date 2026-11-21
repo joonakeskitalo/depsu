@@ -81,9 +81,10 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     } else {
         0
     };
-    let [header, body, summary, log, help] = Layout::vertical([
+    let [header, body, used_by, summary, log, help] = Layout::vertical([
         Constraint::Length(header_lines.len() as u16),
         Constraint::Min(3),
+        Constraint::Length(1),
         Constraint::Length(summary_h),
         Constraint::Length(log_h),
         Constraint::Length(footer.len() as u16),
@@ -107,7 +108,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         .iter()
         .map(|item| match item {
             Item::Header { label, members } => ListItem::new(header_line(app, label, members)),
-            Item::Row { idx, .. } => ListItem::new(row_line(&app.rows[*idx], indent, name_w)),
+            Item::Row { idx, .. } => ListItem::new(row_line(app, &app.rows[*idx], indent, name_w, body.width as usize)),
             Item::Removed { name } => ListItem::new(removed_line(app, name)),
             Item::Override { key } => {
                 ListItem::new(Text::from(orphan_lines(app, key, body.width as usize)))
@@ -128,6 +129,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         .block(Block::default().borders(Borders::TOP))
         .highlight_style(Style::new().add_modifier(Modifier::REVERSED));
     f.render_stateful_widget(list, body, &mut app.table);
+    f.render_widget(used_by_line(app, used_by.width as usize), used_by);
     if summary_h > 0 {
         f.render_widget(
             Paragraph::new(summary_lines(app, summary.width as usize)),
@@ -364,7 +366,7 @@ fn header_line(app: &App, label: &str, members: &[usize]) -> Line<'static> {
         .style(Style::new().fg(color).add_modifier(Modifier::BOLD))
 }
 
-fn row_line(r: &AppRow, indent: usize, name_w: usize) -> Line<'static> {
+fn row_line(app: &App, r: &AppRow, indent: usize, name_w: usize, width: usize) -> Line<'static> {
     let mark = match r.status {
         Status::Queued => "…",
         Status::Installing => "⟳",
@@ -428,6 +430,20 @@ fn row_line(r: &AppRow, indent: usize, name_w: usize) -> Line<'static> {
             format!("   {verb} from {from} to {} in this session", r.current),
             Style::new().fg(Color::Cyan),
         ));
+    }
+    let users = app.dependents_of(&r.name);
+    if !users.is_empty() {
+        let used: usize = spans.iter().map(|s| s.width()).sum();
+        let mut names: Vec<&str> = users.iter().map(|d| d.name.as_str()).collect();
+        names.sort();
+        names.dedup();
+        let with_names = format!("   used by {}", names.join(", "));
+        let text = if used + with_names.chars().count() < width {
+            with_names
+        } else {
+            format!("   used by {}", names.len())
+        };
+        spans.push(Span::styled(text, Style::new().fg(Color::Cyan)));
     }
     let line = Line::from(spans);
     if r.busy() || !r.outdated {
@@ -845,6 +861,41 @@ fn summary_lines(app: &App, width: usize) -> Vec<Line<'static>> {
         }
     }
     lines
+}
+
+/// For the package under the cursor: the installed packages that depend on it.
+fn used_by_line(app: &App, width: usize) -> Line<'static> {
+    let Some(Item::Row { idx, .. }) = app.cursor_item() else {
+        return Line::default();
+    };
+    let name = &app.rows[*idx].name;
+    let deps = app.dependents_of(name);
+    if deps.is_empty() {
+        return Line::default();
+    }
+    let mut parts: Vec<String> = Vec::new();
+    for d in deps {
+        let version = d.version.as_ref().map(|v| format!("@{v}")).unwrap_or_default();
+        parts.push(format!("{}{version} ({})", d.name, d.range));
+    }
+    parts.sort();
+    let mut text = format!(" used by {} installed package(s): ", parts.len());
+    let mut shown = 0;
+    for (i, p) in parts.iter().enumerate() {
+        let more = parts.len() - i - 1;
+        let tail = if more > 0 { format!(", +{more} more") } else { String::new() };
+        let sep = if i > 0 { ", " } else { "" };
+        if text.chars().count() + sep.len() + p.chars().count() + tail.chars().count() > width
+            && shown > 0
+        {
+            text.push_str(&format!(", +{} more", parts.len() - i));
+            return Line::from(text).style(Style::new().fg(Color::Cyan));
+        }
+        text.push_str(sep);
+        text.push_str(p);
+        shown += 1;
+    }
+    Line::from(text).style(Style::new().fg(Color::Cyan))
 }
 
 fn hit_text(h: &Hit) -> String {

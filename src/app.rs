@@ -8,7 +8,7 @@ use crate::package::{self, Dep, Kind, parse_spec};
 use crate::pm::Pm;
 use crate::registry;
 use crate::snyk;
-use crate::tree::{Analyzer, Hit};
+use crate::tree::{Analyzer, Dependent, Hit};
 use crate::view::{self, Child, GroupBy, Item, Overrides, REMOVED, Release, UNNEEDED};
 use crate::vuln::{Report, Severity, Source, Vuln};
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -32,6 +32,8 @@ pub enum Event {
     },
     /// Overrides that look unnecessary, by key. Empty when it can't be determined.
     Unneeded(Vec<(String, Unneeded)>),
+    /// Installed packages that depend on each package, by name.
+    Dependents(HashMap<String, Vec<Dependent>>),
     Scan {
         source: Source,
         result: Result<Report, String>,
@@ -52,6 +54,8 @@ enum TreeMsg {
     SetOverrides(Vec<Override>),
     /// Check which overrides no longer matter, given the project's own (name, range) deps.
     FindUnneeded(Vec<(String, String)>),
+    /// Find which installed packages depend on which, given the project's own deps.
+    FindDependents(Vec<(String, String)>),
     /// `node_modules` changed: forget everything read from disk so far.
     Reset,
 }
@@ -250,6 +254,8 @@ pub struct App {
     /// Packages being reinstalled from the removed section.
     restoring: HashSet<String>,
     pub removed: Vec<RemovedPkg>,
+    /// Installed packages that depend on each package.
+    pub dependents: HashMap<String, Vec<Dependent>>,
     /// Packages queued for uninstall, whose rows go away when the job succeeds.
     uninstalling: HashSet<String>,
     confirm_pin: bool,
@@ -315,9 +321,7 @@ impl App {
         }
 
         // Dependency tree analysis is only needed when the project defines overrides.
-        let tree_tx = if overrides.is_empty() {
-            None
-        } else {
+        let tree_tx = {
             let (msg_tx, msg_rx) = mpsc::channel::<TreeMsg>();
             let (dir, ev_tx, ovr) = (dir.clone(), tx.clone(), overrides.clone());
             thread::spawn(move || {
@@ -332,7 +336,16 @@ impl App {
                                 break;
                             }
                         }
+                        TreeMsg::FindDependents(roots) => {
+                            let found = analyzer.dependents(&roots);
+                            if ev_tx.send(Event::Dependents(found)).is_err() {
+                                break;
+                            }
+                        }
                         TreeMsg::Analyze(name) => {
+                            if !analyzer.has_overrides() {
+                                continue;
+                            }
                             let hits = analyzer.analyze(&name);
                             if ev_tx.send(Event::Tree { name, hits }).is_err() {
                                 break;
@@ -342,6 +355,7 @@ impl App {
                 }
             });
             let _ = msg_tx.send(TreeMsg::FindUnneeded(root_deps.clone()));
+            let _ = msg_tx.send(TreeMsg::FindDependents(root_deps.clone()));
             Some(msg_tx)
         };
 
@@ -387,6 +401,7 @@ impl App {
             confirm_uninstall: false,
             restoring: HashSet::new(),
             removed: Vec::new(),
+            dependents: HashMap::new(),
             uninstalling: HashSet::new(),
             confirm_pin: false,
             changed: HashSet::new(),
@@ -438,6 +453,7 @@ impl App {
                     }
                 }
                 Event::Tree { name, hits } => self.on_tree(name, hits),
+                Event::Dependents(map) => self.dependents = map,
                 Event::Scan { source, result } => self.on_scan(source, result),
                 Event::Unneeded(found) => {
                     self.unneeded = found.into_iter().collect();
@@ -722,6 +738,7 @@ impl App {
             let _ = tx.send(TreeMsg::Reset);
             let _ = tx.send(TreeMsg::SetOverrides(self.overrides.clone()));
             let _ = tx.send(TreeMsg::FindUnneeded(self.root_deps.clone()));
+            let _ = tx.send(TreeMsg::FindDependents(self.root_deps.clone()));
             for r in self.rows.iter().filter(|r| r.kind != Kind::Override) {
                 let _ = tx.send(TreeMsg::Analyze(r.name.clone()));
             }
@@ -864,6 +881,17 @@ impl App {
         });
         self.view
             .extend(names.into_iter().map(|name| Item::Removed { name }));
+    }
+
+    /// Installed packages that depend on `name`, one entry per name and version.
+    pub fn dependents_of(&self, name: &str) -> Vec<&Dependent> {
+        let mut out: Vec<&Dependent> = Vec::new();
+        for d in self.dependents.get(name).into_iter().flatten() {
+            if !out.iter().any(|o| o.name == d.name && o.version == d.version) {
+                out.push(d);
+            }
+        }
+        out
     }
 
     pub fn removed_pkg(&self, name: &str) -> Option<&RemovedPkg> {
