@@ -905,7 +905,6 @@ fn detail_lines(
             if let Some(cve) = v.cve.first() {
                 t.push_str(&format!("  · {cve}"));
             }
-            t.push_str(&format!("  · {}", v.fix_summary()));
             (t, String::new(), severity_color(v.severity))
         }
     };
@@ -929,6 +928,9 @@ fn detail_lines(
         format!("{rest}{tail}"),
         Style::new().fg(color),
     ));
+    if let Child::Vuln(i) = child {
+        spans.extend(fix_spans(app, r, &r.vulns[i]));
+    }
     if let Some(reason) = unneeded {
         spans.push(Span::styled(
             format!("  ✂ may be removed: {reason}"),
@@ -950,6 +952,33 @@ fn detail_lines(
         spans,
         width,
     )
+}
+
+/// What fixes a finding. Fixes a key can apply stand out in green with the key to press;
+/// fixes depsu can't apply, or no fix at all, stay grey.
+fn fix_spans(app: &App, r: &AppRow, v: &crate::vuln::Vuln) -> Vec<Span<'static>> {
+    let fixable = Style::new().fg(Color::Green).add_modifier(Modifier::BOLD);
+    if let Some(to) = app.vuln_install_fix(r, v) {
+        return vec![
+            Span::raw("  "),
+            Span::styled(format!("⬆ fix: i installs {} {}{to}", r.name, r.prefix), fixable),
+            Span::styled(format!("  ({})", v.fix_summary()), Style::new().fg(Color::DarkGray)),
+        ];
+    }
+    if let Some(to) = app.vuln_pin_fix(v) {
+        return vec![
+            Span::raw("  "),
+            Span::styled(format!("⬆ fix: p overrides {} to ^{to}", v.package), fixable),
+            Span::styled(
+                format!("  (upgrading {} doesn't bring it in)", r.name),
+                Style::new().fg(Color::DarkGray),
+            ),
+        ];
+    }
+    vec![Span::styled(
+        format!("  · {}", v.fix_summary()),
+        Style::new().fg(Color::DarkGray),
+    )]
 }
 
 /// Word-wraps `spans` to `width` columns. The first line starts with `first`, the following

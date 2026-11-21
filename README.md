@@ -205,6 +205,10 @@ counts against your organisation's test quota**, so it never runs automatically.
   dependency's point of view: the version of the direct dependency that fixes the finding
   (`fixed by upgrading express to 4.22.0 (brings qs 6.14.3)`), or, when upgrading it doesn't help,
   the fixed releases of the nested package that are newer than the installed one.
+- A finding whose fix depsu can apply ends in green with the key that applies it:
+  `⬆ fix: i installs express ^4.22.0` (upgrading the direct dependency fixes it) or
+  `⬆ fix: p overrides qs to ^6.14.1` (only an override of the nested package does). Move onto the
+  finding and press that key. Findings without a fix depsu can apply keep their note in grey.
 - Findings are kept per project and per resolved package version, in memory and in the
   `--cache` file. The resolved version is the one `package-lock.json` pins, or else the one in
   `node_modules`, since that is what Snyk and `npm audit` look at; the range in `package.json`

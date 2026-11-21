@@ -1656,10 +1656,17 @@ impl App {
         if matches!(self.cursor_vuln_fix(), Some(Ok(_))) {
             item.push("i install fix".into());
         }
+        if let Some((_, v)) = self.cursor_vuln()
+            && self.vuln_pin_fix(v).is_some()
+        {
+            item.push("p pin fix as override".into());
+        }
         if !self.acting_rows(|r| !r.busy()).is_empty() {
             item.push("P pin type".into());
         }
-        if !self.acting_rows(|r| !r.busy() && !r.vulns.is_empty()).is_empty() {
+        if self.cursor_vuln().is_none()
+            && !self.acting_rows(|r| !r.busy() && !r.vulns.is_empty()).is_empty()
+        {
             item.push("p pin fix as override".into());
         }
         if let Some(Item::Row { idx, .. }) = self.cursor_item()
@@ -2193,6 +2200,46 @@ impl App {
     /// the cursor: a package, every package of a group, or an override.
     /// The package and version that fix the vulnerability under the cursor, if it is on one.
     /// `Err` explains why there is nothing to install.
+    /// The version of the direct dependency `i` installs to fix `v`, if there is one.
+    pub fn vuln_install_fix(&self, r: &Row, v: &Vuln) -> Option<Version> {
+        v.upgrade_to
+            .as_ref()
+            .and_then(|t| Version::parse(t).ok())
+            .or_else(|| r.fix_of(v.source).cloned())
+    }
+
+    /// The version `p` would force the vulnerable package to with an override, when the
+    /// finding is in a transitive dependency and a fixed version is known.
+    pub fn vuln_pin_fix(&self, v: &Vuln) -> Option<Version> {
+        let fix = pin_target(v)?;
+        if self.direct.contains(&v.package) {
+            return None;
+        }
+        // Already overridden to the fix or higher: nothing left to do.
+        let pinned = self
+            .overrides
+            .iter()
+            .find(|o| o.name == v.package && o.global() && o.range.is_none())
+            .and_then(|o| overrides::min_version(&o.value));
+        match pinned {
+            Some(p) if p >= fix => None,
+            _ => Some(fix),
+        }
+    }
+
+    /// The finding under the cursor, with the index of its row.
+    fn cursor_vuln(&self) -> Option<(usize, &Vuln)> {
+        let Some(Item::Detail {
+            idx,
+            child: Child::Vuln(i),
+            ..
+        }) = self.cursor_item()
+        else {
+            return None;
+        };
+        Some((*idx, self.rows[*idx].vulns.get(*i)?))
+    }
+
     fn cursor_vuln_fix(&self) -> Option<Result<(usize, Version), String>> {
         let Some(Item::Detail {
             idx,
@@ -2207,13 +2254,12 @@ impl App {
         if r.busy() {
             return Some(Err(format!("{} is being installed.", r.name)));
         }
-        let target = v
-            .upgrade_to
-            .as_ref()
-            .and_then(|t| Version::parse(t).ok())
-            .or_else(|| r.fix_of(v.source).cloned());
-        Some(match target {
+        Some(match self.vuln_install_fix(r, v) {
             Some(t) => Ok((*idx, t)),
+            None if self.vuln_pin_fix(v).is_some() => Err(format!(
+                "Upgrading {} doesn't fix {}: press p to override {} to the fixed version.",
+                r.name, v.id, v.package
+            )),
             None => Err(format!("No fix to install for {}: {}.", v.id, v.fix_summary())),
         })
     }
@@ -2968,29 +3014,22 @@ impl App {
     /// The version of a vulnerable package to pin: the lowest fix in the installed major
     /// release (or the lowest newer one), and the highest of those over all its findings.
     fn pin_plan(&mut self, idx: &[usize]) -> Vec<Pin> {
+        let vulns: Vec<Vuln> = idx
+            .iter()
+            .flat_map(|&i| self.rows[i].vulns.iter().cloned())
+            .collect();
+        self.pin_plan_for(&vulns)
+    }
+
+    fn pin_plan_for(&mut self, vulns: &[Vuln]) -> Vec<Pin> {
         let mut want: Vec<(String, Version)> = Vec::new();
-        for &i in idx {
-            for v in &self.rows[i].vulns {
-                if v.path.is_empty() || v.package == v.direct {
-                    continue;
-                }
-                let fixes: Vec<Version> = v
-                    .newer_fixes()
-                    .into_iter()
-                    .filter_map(|f| Version::parse(f).ok())
-                    .collect();
-                let major = Version::parse(&v.version).ok().map(|i| i.major);
-                let Some(fix) = fixes
-                    .iter()
-                    .find(|f| Some(f.major) == major)
-                    .or(fixes.first())
-                else {
-                    continue;
-                };
-                match want.iter_mut().find(|(n, _)| *n == v.package) {
-                    Some((_, cur)) => *cur = (*cur).clone().max(fix.clone()),
-                    None => want.push((v.package.clone(), fix.clone())),
-                }
+        for v in vulns {
+            let Some(fix) = pin_target(v) else {
+                continue;
+            };
+            match want.iter_mut().find(|(n, _)| *n == v.package) {
+                Some((_, cur)) => *cur = (*cur).clone().max(fix),
+                None => want.push((v.package.clone(), fix)),
             }
         }
         let mut plan = Vec::new();
@@ -3054,6 +3093,15 @@ impl App {
     /// of the one under the cursor) to the version the scanners say fixes them. Asks for a
     /// second press first.
     fn pin_selected(&mut self) {
+        // On a finding with nothing checked: pin that finding's package.
+        if !self.rows.iter().any(|r| r.selected)
+            && let Some((i, v)) = self.cursor_vuln()
+            && !self.rows[i].busy()
+        {
+            let v = v.clone();
+            let plan = self.pin_plan_for(std::slice::from_ref(&v));
+            return self.confirm_and_pin(plan);
+        }
         let mut idx: Vec<usize> = self
             .visible_rows()
             .into_iter()
@@ -3068,6 +3116,10 @@ impl App {
             idx.retain(|&i| !self.rows[i].busy());
         }
         let plan = self.pin_plan(&idx);
+        self.confirm_and_pin(plan);
+    }
+
+    fn confirm_and_pin(&mut self, plan: Vec<Pin>) {
         if plan.is_empty() {
             self.push_log("Nothing to pin: put the cursor on a package with a vulnerable dependency that a scan found a fixed version for.");
             return;
@@ -3127,6 +3179,25 @@ impl App {
         });
     }
 }
+/// The version of a vulnerable transitive package to pin it to: the lowest fix in its
+/// installed major release, or else the lowest newer fix.
+fn pin_target(v: &Vuln) -> Option<Version> {
+    if v.path.is_empty() || v.package == v.direct {
+        return None;
+    }
+    let fixes: Vec<Version> = v
+        .newer_fixes()
+        .into_iter()
+        .filter_map(|f| Version::parse(f).ok())
+        .collect();
+    let major = Version::parse(&v.version).ok().map(|i| i.major);
+    fixes
+        .iter()
+        .find(|f| Some(f.major) == major)
+        .or(fixes.first())
+        .cloned()
+}
+
 /// Human-readable name of an override from its key (the last path element).
 fn override_label(key: &str) -> String {
     let mut parts = key.split('\u{1f}');
@@ -4295,6 +4366,127 @@ mod tests {
         app.apply_scan(Source::NpmAudit, Report::default(), false);
         assert!(row(&app, "a").unscanned.is_empty());
         assert!(!render(&mut app, 140, 30).join("\n").contains("↻"));
+    }
+
+    /// `a` with three findings: one fixed by upgrading `a`, one only by overriding the nested
+    /// `qs`, and one without any fix.
+    fn app_with_three_findings() -> App {
+        let mut upgrade = vuln("a", "1.0.0", "UPGRADE");
+        upgrade.upgrade_to = Some("1.0.1".into());
+        let mut nested = vuln("a", "1.0.0", "NESTED");
+        nested.package = "qs".into();
+        nested.version = "6.0.0".into();
+        nested.path = vec!["mid".into(), "qs".into()];
+        nested.upgrade_to = None;
+        nested.fixed_in = vec!["5.9.0".into(), "6.0.4".into()];
+        let mut none = vuln("a", "1.0.0", "NOFIX");
+        none.package = "x".into();
+        none.path = vec!["x".into()];
+        none.upgrade_to = None;
+        none.fixed_in = Vec::new();
+        app_with_cache("1.0.0", |c| {
+            c.set_findings(
+                "snyk",
+                "a",
+                "1.0.0",
+                Findings {
+                    vulns: vec![upgrade, nested, none],
+                    fix: None,
+                },
+            );
+            c.set_findings("snyk", "b", "1.0.0", Findings::default());
+        })
+    }
+    /// Puts the cursor on the finding `id`.
+    fn cursor_on_finding(app: &mut App, id: &str) {
+        let pos = app
+            .view
+            .iter()
+            .position(|it| {
+                matches!(it, Item::Detail { idx, child: Child::Vuln(i), .. }
+                    if app.rows[*idx].vulns[*i].id == id)
+            })
+            .expect("finding listed");
+        app.table.select(Some(pos));
+    }
+    /// The screen line containing `needle`, and the colour of the cell where `mark` starts.
+    fn line_and_colour(
+        app: &mut App,
+        needle: &str,
+        mark: &str,
+    ) -> (String, Option<ratatui::style::Color>) {
+        let (w, h) = (220u16, 30u16);
+        let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(w, h)).unwrap();
+        term.draw(|f| crate::ui::draw(f, app)).unwrap();
+        let buf = term.backend().buffer().clone();
+        for y in 0..h {
+            let line: String = (0..w).map(|x| buf[(x, y)].symbol().to_string()).collect();
+            if line.contains(needle) {
+                // The cell where `mark` starts (wide characters take two cells).
+                let at = (0..w).find(|&x| {
+                    (x..w)
+                        .map(|c| buf[(c, y)].symbol().to_string())
+                        .collect::<String>()
+                        .starts_with(mark)
+                });
+                return (line, at.map(|x| buf[(x, y)].fg));
+            }
+        }
+        panic!("{needle:?} not on screen");
+    }
+
+    #[test]
+    fn findings_with_a_fix_a_key_can_apply_are_highlighted() {
+        let mut app = app_with_three_findings();
+        let (line, colour) = line_and_colour(&mut app, "UPGRADE", "⬆ fix");
+        assert!(line.contains("⬆ fix: i installs a ^1.0.1"), "{line}");
+        assert_eq!(colour, Some(ratatui::style::Color::Green));
+
+        let (line, colour) = line_and_colour(&mut app, "NESTED", "⬆ fix");
+        assert!(line.contains("⬆ fix: p overrides qs to ^6.0.4"), "{line}");
+        assert!(line.contains("(upgrading a doesn't bring it in)"), "{line}");
+        assert_eq!(colour, Some(ratatui::style::Color::Green));
+
+        let (line, colour) = line_and_colour(&mut app, "NOFIX", "no fix");
+        assert!(line.contains("no fix available"), "{line}");
+        assert!(!line.contains("fix: i") && !line.contains("fix: p"), "{line}");
+        assert_eq!(colour, Some(ratatui::style::Color::DarkGray));
+    }
+
+    #[test]
+    fn the_keys_do_what_the_highlight_says() {
+        let mut app = app_with_three_findings();
+        let (tx, rx) = mpsc::channel();
+        app.jobs = tx;
+
+        // p on the nested finding pins qs (asking first).
+        cursor_on_finding(&mut app, "NESTED");
+        assert!(app.hints().0.contains(&"p pin fix as override".to_string()));
+        assert!(!app.hints().0.contains(&"i install fix".to_string()));
+        app.on_key(key('p'));
+        assert!(
+            app.log.iter().any(|l| l.contains("will set in package.json overrides: qs → ^6.0.4")),
+            "{:?}",
+            app.log
+        );
+        app.on_key(key('p'));
+        let job = rx.try_recv().expect("override queued");
+        assert_eq!(
+            job.edits,
+            [Change::Add {
+                loc: vec!["overrides".into(), "qs".into()],
+                new: "^6.0.4".into()
+            }]
+        );
+
+        // i on it explains that p is the way.
+        app.on_key(key('i'));
+        assert!(app.log.last().unwrap().contains("press p to override qs"), "{:?}", app.log.last());
+
+        // On the finding without a fix, neither key is offered.
+        cursor_on_finding(&mut app, "NOFIX");
+        let hints = app.hints().0;
+        assert!(!hints.iter().any(|h| h.contains("install fix") || h.contains("pin fix")), "{hints:?}");
     }
 
     #[test]
