@@ -1092,6 +1092,10 @@ impl App {
     /// Whether the cursor may rest on `view[i]`.
     fn selectable(&self, i: usize) -> bool {
         match self.view.get(i) {
+            Some(Item::Detail {
+                child: Child::Vuln(_),
+                ..
+            }) => true,
             Some(item @ (Item::Detail { .. } | Item::Override { .. })) => self
                 .detail_override(item)
                 .is_some_and(|o| self.override_actionable(o)),
@@ -1192,14 +1196,8 @@ impl App {
         if remove {
             item.push("x remove override".into());
         }
-        for source in [Source::Snyk, self.audit_source()] {
-            if !self.acting_rows(|r| !r.busy() && r.fix_of(source).is_some()).is_empty() {
-                item.push(format!(
-                    "{} {} fix",
-                    fix_key(source),
-                    if source.is_audit() { "audit" } else { "snyk" }
-                ));
-            }
+        if matches!(self.cursor_vuln_fix(), Some(Ok(_))) {
+            item.push("i install fix".into());
         }
         if !self.acting_rows(|r| !r.busy()).is_empty() {
             item.push("P pin type".into());
@@ -1266,7 +1264,7 @@ impl App {
         }
         if !matches!(
             key.code,
-            KeyCode::Char('i') | KeyCode::Char('f') | KeyCode::Char('F') | KeyCode::Enter
+            KeyCode::Char('i') | KeyCode::Enter
         ) {
             self.confirm_conflicts = None;
         }
@@ -1326,8 +1324,6 @@ impl App {
             KeyCode::Char('P') => self.ask_pin_type(),
             KeyCode::Char('s') => self.start_scan(Source::Snyk),
             KeyCode::Char('n') => self.start_scan(self.audit_source()),
-            KeyCode::Char('f') => self.fix_selected(Source::Snyk),
-            KeyCode::Char('F') => self.fix_selected(self.audit_source()),
             KeyCode::Char('?') => self.show_info = !self.show_info,
             KeyCode::Char('r') => self.revert_selected(),
             KeyCode::Char('d') => self.uninstall_selected(),
@@ -1463,7 +1459,44 @@ impl App {
 
     /// Queues the checked packages and overrides. If nothing is checked, queues the item under
     /// the cursor: a package, every package of a group, or an override.
+    /// The package and version that fix the vulnerability under the cursor, if it is on one.
+    /// `Err` explains why there is nothing to install.
+    fn cursor_vuln_fix(&self) -> Option<Result<(usize, Version), String>> {
+        let Some(Item::Detail {
+            idx,
+            child: Child::Vuln(i),
+            ..
+        }) = self.cursor_item()
+        else {
+            return None;
+        };
+        let r = &self.rows[*idx];
+        let v = r.vulns.get(*i)?;
+        if r.busy() {
+            return Some(Err(format!("{} is being installed.", r.name)));
+        }
+        let target = v
+            .upgrade_to
+            .as_ref()
+            .and_then(|t| Version::parse(t).ok())
+            .or_else(|| r.fix_of(v.source).cloned());
+        Some(match target {
+            Some(t) => Ok((*idx, t)),
+            None => Err(format!("No fix to install for {}: {}.", v.id, v.fix_summary())),
+        })
+    }
+
     fn install_selected(&mut self) {
+        // On a vulnerability: install the version that fixes it.
+        if let Some(fix) = self.cursor_vuln_fix()
+            && !self.rows.iter().any(|r| r.selected && r.actionable())
+        {
+            match fix {
+                Ok((i, target)) => self.dispatch('i', vec![(i, target)], Vec::new()),
+                Err(msg) => self.push_log(msg),
+            }
+            return;
+        }
         let mut idx: Vec<usize> = self
             .visible_rows()
             .into_iter()
@@ -1625,42 +1658,6 @@ impl App {
             ..Default::default()
         });
     }
-    /// Installs the version `source` suggests for the checked packages, or for the one under
-    /// the cursor (every package of a group when on a group header).
-    fn fix_selected(&mut self, source: Source) {
-        let has_fix = |a: &App, i: usize| a.rows[i].fix_of(source).is_some() && !a.rows[i].busy();
-        let mut idx: Vec<usize> = self
-            .visible_rows()
-            .into_iter()
-            .filter(|&i| self.rows[i].selected && has_fix(self, i))
-            .collect();
-        if idx.is_empty() {
-            match self.cursor_item().cloned() {
-                Some(Item::Row { idx: i, .. }) => idx.push(i),
-                Some(Item::Header { members, .. }) => idx.extend(members),
-                _ => {}
-            }
-            idx.retain(|&i| has_fix(self, i));
-        }
-        if idx.is_empty() {
-            let (scan_key, name) = (scan_key(source), source.label());
-            let msg = if self.scan(source).report.is_none() {
-                format!("No {name} data yet. Press {scan_key} to scan.")
-            } else {
-                format!(
-                    "No {name} fix for the selection: put the cursor on a package marked ✱ that has one."
-                )
-            };
-            self.push_log(msg);
-            return;
-        }
-        let pkgs = idx
-            .into_iter()
-            .filter_map(|i| Some((i, self.rows[i].fix_of(source)?.clone())))
-            .collect();
-        self.dispatch(fix_key(source), pkgs, Vec::new());
-    }
-
     /// Queues the installs of `pkgs` (row index, version to install) and the override updates.
     /// `key` is the key the user pressed, which must be pressed again to go ahead when an
     /// update clashes with an override.
@@ -1824,9 +1821,8 @@ impl App {
                     self.push_log(format!("✔ {name}: no known vulnerabilities"));
                 } else {
                     self.push_log(format!(
-                        "✔ {name}: {} vulnerabilities ({severe} high or critical), fixes suggested for {fixes} package(s). Press {} to apply.",
-                        report.vulns.len(),
-                        fix_key(source)
+                        "✔ {name}: {} vulnerabilities ({severe} high or critical), fixes suggested for {fixes} package(s). Move onto a finding and press i to install its fix.",
+                        report.vulns.len()
                     ));
                 }
                 if !hidden.is_empty() {
@@ -1850,10 +1846,6 @@ pub fn scan_key(source: Source) -> char {
 }
 
 /// The key that installs the version `source` suggests.
-pub fn fix_key(source: Source) -> char {
-    if source.is_audit() { 'F' } else { 'f' }
-}
-
 /// Copies the findings and the suggested fix for `row` out of `report`, replacing what the
 /// same kind of scanner found before. Findings of the other scanner are kept.
 fn apply_report(source: Source, report: &Report, row: &mut Row) {

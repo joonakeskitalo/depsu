@@ -69,7 +69,7 @@ depsu --pm pnpm       # skip detection
 | `↑` `↓` / `j` `k`, `Home` `End` | Move |
 | `space` | Select a package, a whole group (on its header) or an override line |
 | `a` | Select all / none of the shown packages |
-| `i` / `Enter` | Install the selected packages, or the highlighted one |
+| `i` / `Enter` | Install the selected packages, or the highlighted one. On a vulnerability finding, install the version that fixes it |
 | `/` | Filter by name. `Enter` keeps the filter, `Esc` clears it |
 | `g` | Group by: none → release type → name prefix → dependency type |
 | `o` | Overrides: hidden → compact → full |
@@ -78,13 +78,11 @@ depsu --pm pnpm       # skip detection
 | `p` | Pin a vulnerable transitive dependency to the fixed version a scan suggests, as an override (press twice to confirm) |
 | `s` | Scan with Snyk |
 | `n` | Run `npm audit` / `bun audit` (whichever the project uses) |
-| `f` | Install the version Snyk suggests |
-| `F` | Install the version `npm audit` / `bun audit` suggests |
 | `v` | Show / hide vulnerability findings |
 | `?` | Show / hide the details panel for the highlighted package: installed packages that use it and its override summary |
 | `q` / `Esc` | Quit (press twice while an install is running) |
 
-`a`, `i` and `f` act only on the packages currently shown, so a filter narrows what they touch.
+`a` and `i` act only on the packages currently shown, so a filter narrows what they touch.
 
 ## How it works
 
@@ -204,7 +202,8 @@ counts against your organisation's test quota**, so it never runs automatically.
   (`fixed by upgrading express to 4.22.0 (brings qs 6.14.3)`), or, when upgrading it doesn't help,
   the fixed releases of the nested package that are newer than the installed one.
 - `snyk fix: <version>` on a row is Snyk's suggested version for that dependency. It fixes
-  everything fixable and can be lower than the latest release. Press `f` to install it.
+  everything fixable and can be lower than the latest release. Move onto a finding and press `i` to
+  install the version that fixes it.
 - After an install, the findings of updated packages are dropped and the top bar says the results
   are outdated. Press `s` to rescan.
 
@@ -228,7 +227,7 @@ Suggested fixes:
 
 - **npm:** uses `fixAvailable` from the report. If the direct dependency's own entry says
   upgrading it fixes it, that is what each finding under it shows (`fixed by upgrading express to
-  4.22.3`, with `(breaking)` for a semver-major upgrade). `F` installs it, keeping your range
+  4.22.3`, with `(breaking)` for a semver-major upgrade). `i` on the finding installs it, keeping your range
   prefix. When npm can fix something only by updating the lockfile, the finding says so
   (`run npm audit fix`), since no `package.json` version is involved.
 - **bun:** uses the plan from `bun audit fix --dry-run --json`, which changes nothing. A direct
