@@ -98,6 +98,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     }
     let footer = footer_lines(app, f.area().width);
     let header_lines = header_lines(app, f.area().width);
+    let used_by_lines = used_by_lines(app, f.area().width);
     // While the nested override lists are hidden, a text summary takes their place.
     let summary_h = if app.show_overrides == Overrides::Off {
         SUMMARY_LINES
@@ -110,7 +111,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         Constraint::Length(2),
         Constraint::Min(3),
         Constraint::Length(2),
-        Constraint::Length(1),
+        Constraint::Length(used_by_lines.len().max(1) as u16),
         Constraint::Length(summary_h),
         Constraint::Length(2),
         Constraint::Length(log_h),
@@ -163,7 +164,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         _ => "selected".to_string(),
     };
     heading(f, info_rule, info_title);
-    f.render_widget(used_by_line(app, used_by.width as usize), used_by);
+    f.render_widget(Paragraph::new(used_by_lines), used_by);
     if summary_h > 0 {
         f.render_widget(
             Paragraph::new(summary_lines(app, summary.width as usize)),
@@ -911,14 +912,13 @@ fn summary_lines(app: &App, width: usize) -> Vec<Line<'static>> {
 }
 
 /// For the package under the cursor: the installed packages that depend on it.
-fn used_by_line(app: &App, width: usize) -> Line<'static> {
+fn used_by_lines(app: &App, width: u16) -> Vec<Line<'static>> {
     let Some(Item::Row { idx, .. }) = app.cursor_item() else {
-        return Line::default();
+        return Vec::new();
     };
-    let name = &app.rows[*idx].name;
-    let deps = app.dependents_of(name);
+    let deps = app.dependents_of(&app.rows[*idx].name);
     if deps.is_empty() {
-        return Line::default();
+        return Vec::new();
     }
     let mut parts: Vec<String> = Vec::new();
     for d in deps {
@@ -931,24 +931,24 @@ fn used_by_line(app: &App, width: usize) -> Line<'static> {
         parts.push(format!("{}{version} ({}){via}", d.name, d.range));
     }
     parts.sort();
-    let mut text = format!(" used by {} installed package(s): ", parts.len());
-    let mut shown = 0;
-    for (i, p) in parts.iter().enumerate() {
-        let more = parts.len() - i - 1;
-        let tail = if more > 0 { format!(", +{more} more") } else { String::new() };
-        let sep = if i > 0 { ", " } else { "" };
-        if text.chars().count() + sep.len() + p.chars().count() + tail.chars().count() > width
-            && shown > 0
-        {
-            text.push_str(&format!(", +{} more", parts.len() - i));
-            return Line::from(text).style(Style::new().fg(Color::Cyan));
+    let cyan = Style::new().fg(Color::Cyan);
+    let label = format!("used by {} installed package(s): ", parts.len());
+    let mut atoms: Vec<Vec<Span<'static>>> = parts
+        .into_iter()
+        .map(|p| vec![Span::styled(p, cyan)])
+        .collect();
+    atoms[0].insert(0, Span::styled(label, cyan));
+    let mut lines = wrap_hints(Vec::new(), atoms, ", ", width);
+    if lines.len() > MAX_USED_BY_LINES {
+        lines.truncate(MAX_USED_BY_LINES);
+        if let Some(last) = lines.last_mut() {
+            last.spans.push(Span::styled(" …", Style::new().fg(Color::DarkGray)));
         }
-        text.push_str(sep);
-        text.push_str(p);
-        shown += 1;
     }
-    Line::from(text).style(Style::new().fg(Color::Cyan))
+    lines
 }
+/// Most lines the list of dependents takes in the selected section.
+const MAX_USED_BY_LINES: usize = 4;
 
 fn hit_text(h: &Hit) -> String {
     let mut t = format!("{} → {}", h.over.name, h.over.value);
