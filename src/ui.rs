@@ -212,11 +212,87 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     if let Some(p) = &app.peer_fix {
         draw_peer_fix(f, p);
     }
+    if let Some(p) = &app.delete_prompt {
+        draw_delete_prompt(f, app, p);
+    }
     if let Some(input) = &app.input
         && let crate::app::InputPurpose::Add { add_as } = &input.purpose
     {
         draw_add_dialog(f, app, input, *add_as);
     }
+}
+
+/// What `d` is about to delete, to confirm.
+fn draw_delete_prompt(f: &mut Frame, app: &App, p: &crate::app::DeletePrompt) {
+    let width = f.area().width.saturating_sub(4).min(80);
+    let inner = (width as usize).saturating_sub(4);
+    let bold = Style::new().add_modifier(Modifier::BOLD);
+    let red = Style::new().fg(Color::Red);
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    // Long lists are cut so the dialog fits the screen.
+    let room = (f.area().height as usize).saturating_sub(16).max(3);
+    let list = |title: String, items: Vec<String>, lines: &mut Vec<Line<'static>>| {
+        if items.is_empty() {
+            return;
+        }
+        lines.push(Line::from(Span::styled(title, bold)));
+        let more = items.len().saturating_sub(room);
+        for it in items.into_iter().take(room) {
+            lines.extend(wrap(
+                Span::styled("  ✂ ", red),
+                Span::raw("    "),
+                vec![Span::raw(it)],
+                inner,
+            ));
+        }
+        if more > 0 {
+            lines.push(Line::from(Span::styled(
+                format!("    … and {more} more"),
+                Style::new().fg(Color::DarkGray),
+            )));
+        }
+        lines.push(Line::default());
+    };
+    let packages: Vec<String> = p
+        .packages
+        .iter()
+        .map(|n| match app.rows.iter().find(|r| r.name == *n) {
+            Some(r) => format!("{n} {}{}  ({})", r.prefix, r.current, r.kind.label()),
+            None => n.clone(),
+        })
+        .collect();
+    let s = |n: usize| if n == 1 { "" } else { "s" };
+    list(
+        format!("Uninstall {} package{}:", packages.len(), s(packages.len())),
+        packages,
+        &mut lines,
+    );
+    let overrides: Vec<String> = p.overrides.iter().map(|o| o.describe()).collect();
+    list(
+        format!("Remove {} override{} from package.json:", overrides.len(), s(overrides.len())),
+        overrides,
+        &mut lines,
+    );
+    for w in &p.warnings {
+        lines.extend(wrap(
+            Span::styled("⚠ ", Style::new().fg(Color::Yellow)),
+            Span::raw("  "),
+            vec![Span::styled(w.clone(), Style::new().fg(Color::Yellow))],
+            inner,
+        ));
+    }
+    if !p.warnings.is_empty() {
+        lines.push(Line::default());
+    }
+    lines.push(Line::from(vec![
+        Span::styled("y", Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+        Span::raw(" / "),
+        Span::styled("enter", Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+        Span::raw(" delete   "),
+        Span::styled("any other key cancels", Style::new().fg(Color::DarkGray)),
+    ]));
+    let n = p.packages.len() + p.overrides.len();
+    draw_dialog(f, &format!("Delete {n} item{}", s(n)), lines, width);
 }
 
 /// The ways to fix a package's unmet peers (`f`), to pick from.
@@ -594,6 +670,14 @@ fn footer_lines(app: &App, width: u16) -> Vec<Line<'static>> {
         ];
         return wrap_hints(prefix, hints.iter().map(|h| hint(h)).collect(), "   ", width);
     }
+    if app.delete_prompt.is_some() {
+        return wrap_hints(
+            vec!["Answer the dialog above:".cyan().bold()],
+            vec![hint("y or enter delete"), hint("any other key cancels")],
+            "   ",
+            width,
+        );
+    }
     if app.peer_fix.is_some() {
         return wrap_hints(
             vec!["Answer the dialog above:".cyan().bold()],
@@ -728,8 +812,8 @@ fn row_line(app: &App, r: &AppRow, indent: usize, name_w: usize, width: usize) -
         Status::Queued => "…",
         Status::Installing => "⟳",
         Status::Failed => "✘",
-        Status::Idle if !r.outdated => "·",
         Status::Idle if r.selected => "●",
+        Status::Idle if !r.outdated => "·",
         Status::Idle => "○",
     };
     let color = match r.release() {

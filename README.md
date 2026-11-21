@@ -69,12 +69,13 @@ depsu --cache .depsu-cache.json   # remember versions and scans between runs
 | Key | Action |
 |---|---|
 | `↑` `↓` / `j` `k`, `Home` `End` | Move |
-| `space` | Select a package, a whole group (on its header) or an override line |
+| `space` | Select a package (up to date or not), a whole group (on its header) or an override line |
 | `a` | Select all / none of the shown packages |
 | `i` / `Enter` | Install the selected packages, or the highlighted one. On a vulnerability finding, install the version that fixes it. If the update needs other installed packages to change (peer dependencies), depsu lists them and asks: `y` update them too, `n` install only what you picked, any other key cancels. Packages that would need different install flags (dependency vs dev dependency, exact vs range) are written into `package.json` together and installed with one `install`, so the package manager resolves them at once; if that fails, `package.json` is put back |
 | `/` | Filter by name. `Enter` keeps the filter, `Esc` clears it |
 | `g` | Group by: none → release type → name prefix → dependency type |
 | `o` | Show / hide the override lines under each package |
+| `d` | Delete the checked packages and overrides in one go, or the package or override under the cursor. A dialog lists what will be uninstalled and removed from `package.json`, warns about installed packages that use them, and asks `y` / `enter` to go ahead. Deleted packages can be restored with `r` |
 | `x` | Remove the selected or highlighted overrides, or the overrides of the highlighted package, flagged `✂` or not. Warns when installed packages use the overridden package (press twice to confirm) |
 | `e` | Install a version you type for the highlighted package, e.g. `1.5.0` (older or newer). The pin type stays; the version must exist in the registry. Peer dependencies are checked as for `i` |
 | `f` | Fix the unmet peers of the highlighted package (marked `⚠ unmet peer`): depsu looks up which versions would fit and offers them in a dialog — update the peers to versions in the range the package asks for, or change the package (up or down) to a version that accepts what is installed. The chosen fix installs with the usual peer check |

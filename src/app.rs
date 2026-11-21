@@ -218,6 +218,16 @@ struct Adding {
     latest: Version,
 }
 
+/// What `d` is about to delete, waiting for the user to confirm.
+pub struct DeletePrompt {
+    /// Packages to uninstall.
+    pub packages: Vec<String>,
+    /// Overrides to remove from `package.json`.
+    pub overrides: Vec<Override>,
+    /// What may break, e.g. other installed packages that use a package being removed.
+    pub warnings: Vec<String>,
+}
+
 /// The ways to fix a package's unmet peers, waiting for the user to pick one.
 pub struct PeerFix {
     pub name: String,
@@ -323,9 +333,9 @@ impl Row {
         self.outdated && !self.busy()
     }
 
-    /// Can be checked with `space`: there is a newer version or a security fix to install.
+    /// Can be checked with `space`, to install or delete it.
     pub fn can_select(&self) -> bool {
-        !self.busy() && (self.outdated || self.snyk_fix.is_some() || self.audit_fix.is_some())
+        !self.busy()
     }
 
     /// The version a vulnerability scanner suggests installing.
@@ -416,6 +426,8 @@ pub struct App {
     pub peer_prompt: Option<PeerPrompt>,
     /// The fixes for a package's unmet peers (`f`), waiting for a choice.
     pub peer_fix: Option<PeerFix>,
+    /// What `d` is about to delete.
+    pub delete_prompt: Option<DeletePrompt>,
     /// The peer dependencies of an install are being checked.
     peer_checking: bool,
     /// Text the user is typing: a version (`e`) or a package to add (`+`).
@@ -456,7 +468,6 @@ pub struct App {
     unneeded: HashMap<String, Unneeded>,
     root_deps: Vec<(String, String)>,
     confirm_remove: bool,
-    confirm_uninstall: bool,
     /// Packages being reinstalled from the removed section.
     restoring: HashSet<String>,
     pub removed: Vec<RemovedPkg>,
@@ -582,6 +593,7 @@ impl App {
             pin_prompt: false,
             peer_prompt: None,
             peer_fix: None,
+            delete_prompt: None,
             peer_checking: false,
             input: None,
             adding: HashMap::new(),
@@ -613,7 +625,6 @@ impl App {
             unneeded: HashMap::new(),
             root_deps,
             confirm_remove: false,
-            confirm_uninstall: false,
             restoring: HashSet::new(),
             removed: Vec::new(),
             dependents: HashMap::new(),
@@ -1748,8 +1759,14 @@ impl App {
                 item.push("f fix unmet peers".into());
             }
         }
-        if !self.acting_rows(|r| !r.busy() && r.kind != Kind::Override).is_empty() {
+        let (packages, overrides, checked) = self.delete_targets();
+        let n = packages.len() + overrides.len();
+        if checked && n > 0 {
+            item.push(format!("d delete {n} checked"));
+        } else if !packages.is_empty() {
             item.push("d uninstall".into());
+        } else if !overrides.is_empty() {
+            item.push("d remove override".into());
         }
         if !self.acting_rows(|r| !r.busy() && r.changed_from.is_some()).is_empty() {
             item.push("r revert".into());
@@ -1781,6 +1798,13 @@ impl App {
         }
         if self.filter_mode {
             self.on_filter_key(key);
+            return;
+        }
+        if let Some(p) = self.delete_prompt.take() {
+            match key.code {
+                KeyCode::Char('y') | KeyCode::Enter => self.confirm_delete(p),
+                _ => self.push_log("Nothing deleted."),
+            }
             return;
         }
         if let Some(mut p) = self.peer_fix.take() {
@@ -1860,9 +1884,6 @@ impl App {
         if key.code != KeyCode::Char('x') {
             self.confirm_remove = false;
         }
-        if key.code != KeyCode::Char('d') {
-            self.confirm_uninstall = false;
-        }
         if key.code != KeyCode::Char('p') {
             self.confirm_pin = false;
         }
@@ -1923,7 +1944,7 @@ impl App {
                     add_as: AddAs::Dependency,
                 }))
             }
-            KeyCode::Char('d') => self.uninstall_selected(),
+            KeyCode::Char('d') => self.delete_selected(),
             KeyCode::Char('y') => {
                 let md = crate::export::markdown(self);
                 match crate::export::copy(&md) {
@@ -2514,41 +2535,141 @@ impl App {
     }
 
     /// Uninstalls the checked packages, or the one under the cursor. Asks to press `d` again.
-    fn uninstall_selected(&mut self) {
-        let can = |a: &App, i: usize| a.rows[i].kind != Kind::Override && !a.rows[i].busy();
-        let mut idx: Vec<usize> = self
-            .visible_rows()
-            .into_iter()
-            .filter(|&i| self.rows[i].selected && can(self, i))
-            .collect();
-        if idx.is_empty() {
-            if let Some(Item::Row { idx: i, .. }) = self.cursor_item().cloned() {
-                idx.push(i);
+    /// What `d` deletes: the checked packages and overrides (a checked row of an overridden
+    /// package that isn't a dependency stands for its overrides), or else the item under the
+    /// cursor.
+    pub fn delete_targets(&self) -> (Vec<String>, Vec<Override>, bool) {
+        let mut packages = Vec::new();
+        let mut overrides: Vec<Override> = Vec::new();
+        let add_override = |list: &mut Vec<Override>, o: &Override| {
+            if !self.override_busy(o) && !list.iter().any(|x| x.key() == o.key()) {
+                list.push(o.clone());
             }
-            idx.retain(|&i| can(self, i));
+        };
+        for i in self.visible_rows() {
+            let r = &self.rows[i];
+            if !r.selected || r.busy() {
+                continue;
+            }
+            if r.kind == Kind::Override {
+                for o in &r.overrides {
+                    add_override(&mut overrides, o);
+                }
+            } else {
+                packages.push(r.name.clone());
+            }
         }
-        if idx.is_empty() {
-            self.push_log("Nothing to uninstall: put the cursor on a package, or select some with space.");
+        for o in self.visible_overrides() {
+            if self.selected_overrides.contains(&o.key()) {
+                add_override(&mut overrides, o);
+            }
+        }
+        let checked = !packages.is_empty() || !overrides.is_empty();
+        if !checked {
+            match self.cursor_item() {
+                Some(Item::Row { idx, .. }) => {
+                    let r = &self.rows[*idx];
+                    if r.busy() {
+                    } else if r.kind == Kind::Override {
+                        for o in &r.overrides {
+                            add_override(&mut overrides, o);
+                        }
+                    } else {
+                        packages.push(r.name.clone());
+                    }
+                }
+                Some(item) => {
+                    if let Some(o) = self.detail_override(item) {
+                        add_override(&mut overrides, o);
+                    }
+                }
+                None => {}
+            }
+        }
+        (packages, overrides, checked)
+    }
+
+    /// Asks before deleting the checked packages and overrides (or the item under the cursor).
+    fn delete_selected(&mut self) {
+        let (packages, overrides, _) = self.delete_targets();
+        if packages.is_empty() && overrides.is_empty() {
+            self.push_log(
+                "Nothing to delete: put the cursor on a package or an override, or check some with space.",
+            );
             return;
         }
-        let names: Vec<String> = idx.iter().map(|&i| self.rows[i].name.clone()).collect();
-        if !self.confirm_uninstall {
-            self.confirm_uninstall = true;
-            self.push_log(format!(
-                "✂ will uninstall: {}. Press d again to confirm, any other key cancels.",
-                names.join(", ")
-            ));
-            return;
+        let users = |name: &str, leaving: &[String]| -> Vec<String> {
+            let mut names: Vec<String> = self
+                .dependents_of(name)
+                .iter()
+                .map(|d| d.name.clone())
+                .filter(|n| !leaving.contains(n))
+                .collect();
+            names.sort();
+            names.dedup();
+            names
+        };
+        let mut warnings = Vec::new();
+        for name in &packages {
+            let users = users(name, &packages);
+            if !users.is_empty() {
+                warnings.push(format!(
+                    "{name} is used by {}: they may stop working without it",
+                    users.join(", ")
+                ));
+            }
         }
-        self.confirm_uninstall = false;
-        for &i in &idx {
-            self.rows[i].selected = false;
-            self.rows[i].status = Status::Queued;
+        for o in &overrides {
+            let users = users(&o.name, &packages);
+            if !users.is_empty() {
+                warnings.push(format!(
+                    "{} is used by {}: without the override they may get another version",
+                    o.name,
+                    users.join(", ")
+                ));
+            }
         }
-        self.uninstalling.extend(names.iter().cloned());
-        self.push_log(format!("… queued uninstall of {}", names.join(", ")));
+        if !overrides.is_empty() {
+            warnings.push(
+                "Removing overrides can bring back vulnerable versions: scan again afterwards".into(),
+            );
+        }
+        self.delete_prompt = Some(DeletePrompt {
+            packages,
+            overrides,
+            warnings,
+        });
+    }
+
+    fn confirm_delete(&mut self, p: DeletePrompt) {
+        for r in self.rows.iter_mut().filter(|r| p.packages.contains(&r.name)) {
+            r.selected = false;
+            r.status = Status::Queued;
+        }
+        let mut edits = Vec::new();
+        let mut keys = Vec::new();
+        for o in &p.overrides {
+            keys.push(o.key());
+            self.changed.insert(o.key());
+            self.selected_overrides.remove(&o.key());
+            self.busy_overrides.insert(o.key());
+            edits.push(Change::Remove {
+                loc: o.loc.clone(),
+                old: o.value.clone(),
+            });
+        }
+        // Checked rows of overridden packages stood for their overrides.
+        for r in self.rows.iter_mut().filter(|r| r.kind == Kind::Override) {
+            r.selected = false;
+        }
+        self.uninstalling.extend(p.packages.iter().cloned());
+        let mut what: Vec<String> = p.packages.clone();
+        what.extend(keys.iter().map(|k| override_label(k)));
+        self.push_log(format!("… queued deleting {}", what.join(", ")));
         let _ = self.jobs.send(Job {
-            uninstall: names,
+            uninstall: p.packages,
+            edits,
+            keys,
             ..Default::default()
         });
     }
@@ -4875,6 +4996,108 @@ mod tests {
         app.on_key(key('f'));
         assert_eq!(app.log.last().unwrap(), "b has no unmet peers.");
         assert!(!app.hints().0.iter().any(|h| h.contains("unmet")));
+    }
+
+    /// `a` and `b` (both up to date), `a` with an override listed under it, and `b` used by `a`.
+    fn app_to_delete_from() -> (App, Receiver<Job>) {
+        let (mut app, rx) = app_capturing_installs();
+        let i = app.rows.iter().position(|r| r.name == "a").unwrap();
+        app.rows[i].overrides = vec![ovr("a", "1.0.0", "a")];
+        app.show_overrides = Overrides::Full;
+        app.dependents.insert(
+            "b".into(),
+            vec![crate::tree::Dependent {
+                name: "a".into(),
+                version: Some(Version::new(1, 0, 0)),
+                range: "^1.0.0".into(),
+                direct: "a".into(),
+            }],
+        );
+        app.rebuild_view();
+        (app, rx)
+    }
+    fn cursor_to(app: &mut App, pred: impl Fn(&Item) -> bool) {
+        let pos = app.view.iter().position(pred).expect("listed");
+        app.table.select(Some(pos));
+    }
+
+    #[test]
+    fn up_to_date_packages_can_be_checked() {
+        let (mut app, _rx) = app_to_delete_from();
+        assert!(!row(&app, "b").outdated);
+        cursor_to(&mut app, |it| matches!(it, Item::Row { name, .. } if name == "b"));
+        app.on_key(key(' '));
+        assert!(row(&app, "b").selected);
+        app.on_key(key('a'));
+        assert!(row(&app, "a").selected && row(&app, "b").selected);
+    }
+
+    #[test]
+    fn d_deletes_checked_packages_and_overrides_together_after_asking() {
+        let (mut app, rx) = app_to_delete_from();
+        cursor_to(&mut app, |it| matches!(it, Item::Row { name, .. } if name == "b"));
+        app.on_key(key(' '));
+        cursor_to(&mut app, |it| matches!(it, Item::Detail { child: Child::Own(0), .. }));
+        app.on_key(key(' '));
+        assert!(app.hints().0.contains(&"d delete 2 checked".to_string()), "{:?}", app.hints().0);
+
+        app.on_key(key('d'));
+        let p = app.delete_prompt.as_ref().expect("asks first");
+        assert_eq!(p.packages, ["b"]);
+        assert_eq!(p.overrides.len(), 1);
+        assert!(p.warnings[0].contains("b is used by a"), "{:?}", p.warnings);
+        assert!(rx.try_recv().is_err(), "nothing happens before the answer");
+        let screen = render(&mut app, 120, 40).join("\n");
+        assert!(screen.contains(" Delete 2 items "), "{screen}");
+        assert!(screen.contains("Uninstall 1 package:"), "{screen}");
+        assert!(screen.contains("✂ b ^1.0.0  (dep)"), "{screen}");
+        assert!(screen.contains("Remove 1 override from package.json:"), "{screen}");
+        assert!(screen.contains("⚠ b is used by a"), "{screen}");
+
+        app.on_key(key('y'));
+        assert!(app.delete_prompt.is_none());
+        let job = rx.try_recv().expect("queued");
+        assert_eq!(job.uninstall, ["b"]);
+        assert_eq!(
+            job.edits,
+            [Change::Remove {
+                loc: vec!["overrides".into(), "a".into()],
+                old: "1.0.0".into()
+            }]
+        );
+        assert_eq!(row(&app, "b").status, Status::Queued);
+        assert!(!row(&app, "b").selected && app.selected_overrides.is_empty());
+    }
+
+    #[test]
+    fn any_other_key_keeps_everything() {
+        let (mut app, rx) = app_to_delete_from();
+        app.on_key(key('a'));
+        app.on_key(key('d'));
+        assert_eq!(app.delete_prompt.as_ref().unwrap().packages, ["a", "b"]);
+        app.on_key(key('n'));
+        assert!(app.delete_prompt.is_none());
+        assert!(rx.try_recv().is_err());
+        assert_eq!(app.log.last().unwrap(), "Nothing deleted.");
+        assert!(row(&app, "a").selected, "the selection stays");
+    }
+
+    #[test]
+    fn with_nothing_checked_d_deletes_the_item_under_the_cursor() {
+        let (mut app, _rx) = app_to_delete_from();
+        cursor_to(&mut app, |it| matches!(it, Item::Row { name, .. } if name == "a"));
+        assert!(app.hints().0.contains(&"d uninstall".to_string()));
+        app.on_key(key('d'));
+        let p = app.delete_prompt.take().unwrap();
+        assert_eq!(p.packages, ["a"]);
+        assert!(p.overrides.is_empty());
+
+        cursor_to(&mut app, |it| matches!(it, Item::Detail { child: Child::Own(0), .. }));
+        assert!(app.hints().0.contains(&"d remove override".to_string()));
+        app.on_key(key('d'));
+        let p = app.delete_prompt.unwrap();
+        assert!(p.packages.is_empty());
+        assert_eq!(p.overrides[0].name, "a");
     }
 
     #[test]

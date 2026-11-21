@@ -43,6 +43,7 @@ KEYS:
     /              filter by name (enter keeps it, esc clears it)
     g              group by: none, release type, name prefix, dependency type
     o              show / hide the override lines under each package
+    d              delete the checked packages and overrides (asks first)
     x              remove the selected / highlighted overrides (press twice to confirm)
     s              scan with Snyk
     n              run npm audit / bun audit (by the project's package manager)
