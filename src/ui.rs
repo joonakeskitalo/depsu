@@ -36,28 +36,27 @@ fn draw_log(f: &mut Frame, app: &mut App) {
         inner_width(f),
     );
     let header_lines = header_lines(app, f.area().width);
-    let [header, log_rule, body, keys_rule, help] = Layout::vertical([
+    let [header, log_area, keys_rule, help] = Layout::vertical([
         Constraint::Length(header_lines.len() as u16),
-        Constraint::Length(2),
-        Constraint::Min(3),
+        Constraint::Min(5),
         Constraint::Length(1),
         Constraint::Length(footer.len() as u16),
     ])
     .areas(f.area());
-    let (body, help) = (pad(body), pad(help));
-    let h = (body.height as usize).max(1);
-    app.log_page = h;
-    app.log_scroll = app.log_scroll.min(app.log.len().saturating_sub(h));
-    let end = app.log.len() - app.log_scroll;
-    let start = end.saturating_sub(h);
-    let lines: Vec<Line> = app.log[start..end].iter().map(|l| log_line(l)).collect();
+    let help = pad(help);
     let title = if app.log_scroll > 0 {
         format!("log (↑{} older)", app.log_scroll)
     } else {
         "log".to_string()
     };
     f.render_widget(Paragraph::new(header_lines), header);
-    heading(f, log_rule, title);
+    let body = panel(f, log_area, title, true);
+    let h = (body.height as usize).max(1);
+    app.log_page = h;
+    app.log_scroll = app.log_scroll.min(app.log.len().saturating_sub(h));
+    let end = app.log.len() - app.log_scroll;
+    let start = end.saturating_sub(h);
+    let lines: Vec<Line> = app.log[start..end].iter().map(|l| log_line(l)).collect();
     f.render_widget(Paragraph::new(lines), body);
     f.render_widget(
         Block::default()
@@ -99,12 +98,87 @@ fn heading(f: &mut Frame, area: ratatui::layout::Rect, title: impl Into<String>)
         text,
     );
 }
+/// Where the keys go: that part of the screen gets a bright border.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Focus {
+    /// The package list.
+    List,
+    /// A prompt typed in the footer: the filter, a version, the pin type.
+    Footer,
+    /// A dialog in the middle of the screen.
+    Dialog,
+    /// The expanded log.
+    Log,
+}
+
+pub fn focus(app: &App) -> Focus {
+    let add_dialog = matches!(
+        &app.input,
+        Some(i) if matches!(i.purpose, crate::app::InputPurpose::Add { .. })
+    );
+    if app.peer_prompt.is_some()
+        || app.peer_fix.is_some()
+        || app.delete_prompt.is_some()
+        || app.blocked_prompt.is_some()
+        || app.commit_prompt.is_some()
+        || add_dialog
+    {
+        Focus::Dialog
+    } else if app.log_focus {
+        Focus::Log
+    } else if app.filter_mode || app.pin_prompt || app.input.is_some() {
+        Focus::Footer
+    } else {
+        Focus::List
+    }
+}
+
+/// A part of the screen in a box with `title`: bright when it has the keys, grey otherwise.
+/// Returns the area inside, with a column of padding on each side.
+fn panel(f: &mut Frame, area: Rect, title: impl Into<String>, active: bool) -> Rect {
+    let (border, title_style) = if active {
+        (
+            Style::new().fg(Color::Cyan),
+            Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+        )
+    } else {
+        (
+            Style::new().fg(Color::DarkGray),
+            Style::new().fg(Color::DarkGray).add_modifier(Modifier::BOLD),
+        )
+    };
+    let title = title.into();
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(if active { BorderType::Rounded } else { BorderType::Plain })
+        .border_style(border)
+        .title(if title.is_empty() {
+            Line::default()
+        } else {
+            Line::from(Span::styled(format!(" {title} "), title_style))
+        })
+        .padding(ratatui::widgets::Padding::horizontal(1));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    inner
+}
+
+/// Width inside a panel: the borders and padding take two columns each side.
+fn panel_width(f: &Frame) -> u16 {
+    f.area().width.saturating_sub(4)
+}
+
 pub fn draw(f: &mut Frame, app: &mut App) {
     let log_h = (app.log.len() as u16).clamp(1, 5);
     if app.log_focus {
         return draw_log(f, app);
     }
-    let footer = footer_lines(app, inner_width(f));
+    let focus = focus(app);
+    let footer_boxed = focus == Focus::Footer;
+    let footer = footer_lines(
+        app,
+        if footer_boxed { panel_width(f) } else { inner_width(f) },
+    );
     let header_lines = header_lines(app, f.area().width);
     let used_by_lines = if app.show_info {
         let mut lines = used_by_lines(app, inner_width(f));
@@ -118,24 +192,25 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     } else {
         0
     };
-    let [header, list_rule, body, info_rule, used_by, summary, log_rule, log, keys_rule, help] =
+    // The package list and a footer prompt are boxed; the border and the title take the rows
+    // the heading took.
+    let footer_h = footer.len() as u16 + if footer_boxed { 2 } else { 1 };
+    let [header, list_area, info_rule, used_by, summary, log_rule, log, keys_area] =
         Layout::vertical([
-        Constraint::Length(header_lines.len() as u16),
-        Constraint::Length(2),
-        Constraint::Min(3),
-        Constraint::Length(if app.show_info { 2 } else { 0 }),
-        Constraint::Length(if app.show_info { used_by_lines.len().max(1) as u16 } else { 0 }),
-        Constraint::Length(summary_h),
-        Constraint::Length(2),
-        Constraint::Length(log_h),
-        Constraint::Length(1),
-        Constraint::Length(footer.len() as u16),
-    ])
-    .areas(f.area());
+            Constraint::Length(header_lines.len() as u16),
+            Constraint::Min(5),
+            Constraint::Length(if app.show_info { 2 } else { 0 }),
+            Constraint::Length(if app.show_info { used_by_lines.len().max(1) as u16 } else { 0 }),
+            Constraint::Length(summary_h),
+            Constraint::Length(2),
+            Constraint::Length(log_h),
+            Constraint::Length(footer_h),
+        ])
+        .areas(f.area());
 
-    let (body, used_by, summary, log, help) = (pad(body), pad(used_by), pad(summary), pad(log), pad(help));
+    let (used_by, summary, log) = (pad(used_by), pad(summary), pad(log));
     f.render_widget(Paragraph::new(header_lines), header);
-    heading(f, list_rule, "packages");
+    let body = panel(f, list_area, "packages", focus == Focus::List);
 
     let grouped = app.group_by != GroupBy::None;
     let indent = if grouped { 2 } else { 0 };
@@ -199,14 +274,25 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         .collect();
     heading(f, log_rule, "log");
     f.render_widget(Paragraph::new(lines), log);
-    f.render_widget(
-        Block::default()
-            .borders(Borders::TOP)
-            .border_style(Style::new().fg(Color::DarkGray)),
-        keys_rule,
-    );
-
-    f.render_widget(Paragraph::new(footer), help);
+    if footer_boxed {
+        let inner = panel(f, keys_area, "", true);
+        f.render_widget(Paragraph::new(footer), inner);
+    } else {
+        let [rule, help] =
+            Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).areas(keys_area);
+        f.render_widget(
+            Block::default()
+                .borders(Borders::TOP)
+                .border_style(Style::new().fg(Color::DarkGray)),
+            rule,
+        );
+        f.render_widget(Paragraph::new(footer), pad(help));
+    }
+    // A dialog has the keys: what's behind it is dimmed, so only the dialog stands out.
+    if focus == Focus::Dialog {
+        let area = f.area();
+        f.buffer_mut().set_style(area, Style::new().add_modifier(Modifier::DIM));
+    }
     if let Some(p) = &app.peer_prompt {
         draw_peer_prompt(f, p);
     }

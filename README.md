@@ -90,6 +90,8 @@ depsu --cache .depsu-cache.json   # remember versions and scans between runs
 | `?` | Show / hide the details panel for the highlighted package: installed packages that use it, its peer dependencies with the versions installed, and its override summary. A package with an installed peer outside the range it declares is flagged in the list with `⚠ unmet peer: react ^18.0.0 (has 19.0.0)` |
 | `q` / `Esc` | Quit (press twice while an install is running) |
 
+The part of the screen that takes the keys has a cyan border: the package list, a prompt typed in the footer (filter, version, pin type), the expanded log, or a dialog. While a dialog is open, everything behind it is dimmed.
+
 `a` and `i` act only on the packages currently shown, so a filter narrows what they touch.
 
 ## How it works

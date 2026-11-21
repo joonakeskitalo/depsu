@@ -4943,7 +4943,7 @@ mod tests {
             .expect("the dialog is closed");
         // Centred vertically (to a row) and horizontally.
         assert!((top as i32 - (40 - 1 - bottom) as i32).abs() <= 1, "top {top}, bottom {bottom}");
-        let left = screen[top].find('╭').unwrap();
+        let left = screen[top].chars().position(|c| c == '╭').unwrap();
         let right = 100 - 1 - screen[top].chars().position(|c| c == '╮').unwrap();
         assert!((left as i32 - right as i32).abs() <= 1, "left {left}, right {right}");
         let body = screen[top..=bottom].join("\n");
@@ -5655,6 +5655,87 @@ mod tests {
         assert_eq!(git(&dir, &["log", "-1", "--format=%s"]), "init", "nothing was committed");
         press(&mut app, KeyCode::Esc);
         assert!(app.commit_prompt.is_none());
+    }
+
+    fn buffer(app: &mut App, w: u16, h: u16) -> ratatui::buffer::Buffer {
+        let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(w, h)).unwrap();
+        term.draw(|f| crate::ui::draw(f, app)).unwrap();
+        term.backend().buffer().clone()
+    }
+    /// The cell where the screen text `needle` starts: (column, row).
+    fn find(buf: &ratatui::buffer::Buffer, needle: &str) -> (u16, u16) {
+        let (w, h) = (buf.area.width, buf.area.height);
+        for y in 0..h {
+            for x in 0..w {
+                let rest: String = (x..w).map(|c| buf[(c, y)].symbol().to_string()).collect();
+                if rest.starts_with(needle) {
+                    return (x, y);
+                }
+            }
+        }
+        panic!("{needle:?} not on screen");
+    }
+
+    #[test]
+    fn the_package_list_has_a_bright_border_while_it_has_the_keys() {
+        use ratatui::style::{Color, Modifier};
+        let (mut app, _rx) = app_capturing_installs();
+        assert_eq!(crate::ui::focus(&app), crate::ui::Focus::List);
+        let buf = buffer(&mut app, 100, 30);
+        let (x, y) = find(&buf, " packages ");
+        assert_eq!(buf[(x, y)].fg, Color::Cyan);
+        // The box's corner, left of the title.
+        let corner = (0..x).find(|&c| buf[(c, y)].symbol() == "╭").expect("rounded corner");
+        assert_eq!(buf[(corner, y)].fg, Color::Cyan);
+        assert!(!buf[(corner, y)].modifier.contains(Modifier::DIM));
+    }
+
+    #[test]
+    fn a_footer_prompt_takes_the_bright_border_from_the_list() {
+        use ratatui::style::Color;
+        let (mut app, _rx) = app_capturing_installs();
+        app.on_key(key('/'));
+        assert_eq!(crate::ui::focus(&app), crate::ui::Focus::Footer);
+        let buf = buffer(&mut app, 100, 30);
+        let (x, y) = find(&buf, " packages ");
+        assert_eq!(buf[(x, y)].fg, Color::DarkGray, "the list is inactive");
+        assert!((0..x).any(|c| buf[(c, y)].symbol() == "┌"), "a plain corner");
+        // The footer is boxed in cyan around the prompt.
+        let (_, py) = find(&buf, "/█");
+        let top = (0..py).rev().find(|&r| buf[(0, r)].symbol() == "╭").expect("box above the prompt");
+        assert_eq!(buf[(0, top)].fg, Color::Cyan);
+        assert_eq!(buf[(0, py)].symbol(), "│");
+    }
+
+    #[test]
+    fn behind_an_open_dialog_everything_is_dimmed() {
+        use ratatui::style::{Color, Modifier};
+        let (mut app, _rx) = app_to_delete_from();
+        app.on_key(key('d'));
+        assert_eq!(crate::ui::focus(&app), crate::ui::Focus::Dialog);
+        let buf = buffer(&mut app, 120, 40);
+        let (x, y) = find(&buf, " packages ");
+        assert!(buf[(x, y)].modifier.contains(Modifier::DIM), "the list is dimmed");
+        assert_eq!(buf[(x, y)].fg, Color::DarkGray);
+        let (dx, dy) = find(&buf, " Delete ");
+        assert!(!buf[(dx, dy)].modifier.contains(Modifier::DIM), "the dialog is not");
+        assert_eq!(buf[(dx, dy)].fg, Color::Cyan);
+        let (tx, ty) = find(&buf, "Uninstall 1 package:");
+        assert!(!buf[(tx, ty)].modifier.contains(Modifier::DIM));
+    }
+
+    #[test]
+    fn the_expanded_log_has_the_bright_border() {
+        use ratatui::style::Color;
+        let (mut app, _rx) = app_capturing_installs();
+        app.push_log("hello");
+        app.on_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert_eq!(crate::ui::focus(&app), crate::ui::Focus::Log);
+        let buf = buffer(&mut app, 100, 30);
+        let (x, y) = find(&buf, " log ");
+        assert_eq!(buf[(x, y)].fg, Color::Cyan);
+        let (hx, hy) = find(&buf, "hello");
+        assert!((0..hx).any(|c| buf[(c, hy)].symbol() == "│"), "inside the box");
     }
 
     #[test]
