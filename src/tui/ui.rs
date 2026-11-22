@@ -6,6 +6,7 @@ use crate::deps::tree::{self, Hit};
 use crate::tui::view::{Child, GroupBy, Item, Overrides, Release, UNNEEDED};
 use crate::security::vuln::{Severity, Source};
 use ratatui::Frame;
+use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style, Stylize};
 use ratatui::text::{Line, Span, Text};
@@ -22,20 +23,21 @@ fn log_line(l: &str) -> Line<'static> {
 }
 /// The expanded, scrollable log that replaces the package list.
 fn draw_log(f: &mut Frame, app: &mut App) {
-    let hint = |t: &str| vec![t.to_string().dark_gray()];
-    let footer = wrap_hints(
+    let hint = |t: &str, key: Option<KeyCode>| (vec![t.to_string().dark_gray()], key.map(plain));
+    let (footer, footer_hits) = wrap_atoms(
         Vec::new(),
         vec![
-            hint("↑/↓ scroll"),
-            hint(", . page"),
-            hint("Home/End oldest/newest"),
-            hint("tab or esc back to list"),
-            hint("q quit"),
+            hint("↑/↓ scroll", None),
+            hint(", . page", None),
+            hint("Home/End oldest/newest", None),
+            hint("tab or esc back to list", Some(KeyCode::Tab)),
+            hint("q quit", Some(KeyCode::Char('q'))),
         ],
         "   ",
         inner_width(f),
     );
-    let header_lines = header_lines(app, f.area().width);
+    // The header's keys would scroll the log, so only the footer reacts to the mouse.
+    let (header_lines, _) = header_lines(app, f.area().width);
     let [header, log_area, keys_rule, help] = Layout::vertical([
         Constraint::Length(header_lines.len() as u16),
         Constraint::Min(5),
@@ -44,6 +46,7 @@ fn draw_log(f: &mut Frame, app: &mut App) {
     ])
     .areas(f.area());
     let help = pad(help);
+    add_targets(help, footer_hits, &mut app.targets.keys);
     let title = if app.log_scroll > 0 {
         format!("log (↑{} older)", app.log_scroll)
     } else {
@@ -171,16 +174,17 @@ fn panel_width(f: &Frame) -> u16 {
 
 pub fn draw(f: &mut Frame, app: &mut App) {
     let log_h = (app.log.len() as u16).clamp(1, 5);
+    app.targets = Default::default();
     if app.log_focus {
         return draw_log(f, app);
     }
     let focus = focus(app);
     let footer_boxed = focus == Focus::Footer;
-    let footer = footer_lines(
+    let (footer, footer_hits) = footer_lines(
         app,
         if footer_boxed { panel_width(f) } else { inner_width(f) },
     );
-    let header_lines = header_lines(app, f.area().width);
+    let (header_lines, header_hits) = header_lines(app, f.area().width);
     let used_by_lines = if app.show_info {
         let mut lines = used_by_lines(app, inner_width(f));
         lines.extend(peer_lines(app, inner_width(f)));
@@ -211,6 +215,20 @@ pub fn draw(f: &mut Frame, app: &mut App) {
 
     let (used_by, summary, log) = (pad(used_by), pad(summary), pad(log));
     f.render_widget(Paragraph::new(header_lines), header);
+    // Part of the screen outside the list reacts to the mouse only while the list has the keys:
+    // the keys a click stands for would go to a prompt otherwise.
+    let clickable = focus == Focus::List;
+    if clickable {
+        add_targets(header, header_hits, &mut app.targets.keys);
+        let full = f.area().width;
+        if app.show_info {
+            let r = Rect { width: full, ..info_rule };
+            app.targets.keys.push((r, vec![plain(KeyCode::Char('?'))]));
+        }
+        // The log: a click opens it.
+        let r = Rect { x: log_rule.x, y: log_rule.y, width: full, height: log_rule.height + log.height };
+        app.targets.keys.push((r, vec![plain(KeyCode::Tab)]));
+    }
     let body = panel(f, list_area, "packages", focus == Focus::List);
 
     let grouped = app.group_by != GroupBy::None;
@@ -245,10 +263,21 @@ pub fn draw(f: &mut Frame, app: &mut App) {
             ))),
         })
         .collect();
+    let heights: Vec<u16> = items.iter().map(|i| i.height() as u16).collect();
     let list = List::new(items)
         .highlight_style(Style::new().add_modifier(Modifier::REVERSED));
     app.list_page = body.height as usize;
     f.render_stateful_widget(list, body, &mut app.table);
+    // Which item each row of the list shows, for the mouse.
+    app.targets.list = body;
+    let mut top = 0u16;
+    for (i, h) in heights.iter().enumerate().skip(app.table.offset()) {
+        if top >= body.height {
+            break;
+        }
+        app.targets.items.push((top, *h, i));
+        top += h;
+    }
     let info_title = match app.cursor_item() {
         Some(Item::Row { idx, .. }) => format!("selected: {}", app.rows[*idx].name),
         Some(Item::Removed { name }) => format!("selected: {name}"),
@@ -277,6 +306,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     f.render_widget(Paragraph::new(lines), log);
     if footer_boxed {
         let inner = panel(f, keys_area, "", true);
+        add_targets(inner, footer_hits, &mut app.targets.keys);
         f.render_widget(Paragraph::new(footer), inner);
     } else {
         let [rule, help] =
@@ -287,6 +317,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
                 .border_style(Style::new().fg(Color::DarkGray)),
             rule,
         );
+        add_targets(pad(help), footer_hits, &mut app.targets.keys);
         f.render_widget(Paragraph::new(footer), pad(help));
     }
     // A dialog has the keys: what's behind it is dimmed, so only the dialog stands out.
@@ -298,7 +329,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         draw_peer_prompt(f, p);
     }
     if let Some(p) = &app.peer_fix {
-        draw_peer_fix(f, p);
+        draw_peer_fix(f, p, &mut app.targets.keys);
     }
     if let Some(p) = &app.delete_prompt {
         draw_delete_prompt(f, app, p);
@@ -315,7 +346,8 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     if let Some(input) = &app.input
         && let crate::tui::app::InputPurpose::Add { add_as } = &input.purpose
     {
-        draw_add_dialog(f, app, input, *add_as);
+        let clicks = draw_add_dialog(f, app, input, *add_as);
+        app.targets.keys.extend(clicks);
     }
 }
 
@@ -776,7 +808,7 @@ fn draw_delete_prompt(f: &mut Frame, app: &App, p: &crate::tui::app::DeletePromp
 }
 
 /// The ways to fix a package's unmet peers (`f`), to pick from.
-fn draw_peer_fix(f: &mut Frame, p: &crate::tui::app::PeerFix) {
+fn draw_peer_fix(f: &mut Frame, p: &crate::tui::app::PeerFix, clicks: &mut Vec<(Rect, Vec<KeyEvent>)>) {
     let width = f.area().width.saturating_sub(4).min(80);
     let inner = (width as usize).saturating_sub(4);
     let dim = Style::new().fg(Color::DarkGray);
@@ -796,7 +828,10 @@ fn draw_peer_fix(f: &mut Frame, p: &crate::tui::app::PeerFix) {
         ));
     }
     lines.push(Line::default());
+    // Lines each option takes, to make them clickable.
+    let mut option_lines = Vec::new();
     for (i, o) in p.options.iter().enumerate() {
+        let first = lines.len();
         let chosen = i == p.choice;
         let style = if chosen {
             Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD | Modifier::REVERSED)
@@ -809,6 +844,7 @@ fn draw_peer_fix(f: &mut Frame, p: &crate::tui::app::PeerFix) {
             vec![Span::styled(format!("{} {}", i + 1, o.label), style)],
             inner,
         ));
+        option_lines.push((first, lines.len() - first));
     }
     for n in &p.notes {
         lines.extend(wrap(
@@ -839,16 +875,28 @@ fn draw_peer_fix(f: &mut Frame, p: &crate::tui::app::PeerFix) {
     keys.extend(key("↑↓", "choose"));
     keys.extend(key("esc", "cancel"));
     lines.push(Line::from(keys));
-    draw_dialog(f, &format!("Fix the peers of {}", p.name), lines, width);
+    let (rect, cut) = draw_dialog(f, &format!("Fix the peers of {}", p.name), lines, width);
+    if !cut {
+        for (i, (first, n)) in option_lines.into_iter().enumerate().take(9) {
+            let r = Rect {
+                x: rect.x + 2,
+                y: rect.y + 2 + first as u16,
+                width: rect.width.saturating_sub(4),
+                height: n as u16,
+            };
+            clicks.push((r, vec![plain(KeyCode::Char((b'1' + i as u8) as char))]));
+        }
+    }
 }
 
 /// A box in the middle of the screen with `lines` and `title`, at most `max_width` wide.
-fn draw_dialog(f: &mut Frame, title: &str, mut lines: Vec<Line<'static>>, width: u16) {
+fn draw_dialog(f: &mut Frame, title: &str, mut lines: Vec<Line<'static>>, width: u16) -> (Rect, bool) {
     let area = f.area();
     // Taller than the screen: cut the middle, keeping the last line, which says which keys
     // to press.
     let room = (area.height as usize).saturating_sub(4);
-    if lines.len() > room && room >= 2 {
+    let cut = lines.len() > room && room >= 2;
+    if cut {
         let last = lines.pop().unwrap_or_default();
         lines.truncate(room - 2);
         lines.push(Line::from(Span::styled("…", Style::new().fg(Color::DarkGray))));
@@ -876,10 +924,16 @@ fn draw_dialog(f: &mut Frame, title: &str, mut lines: Vec<Line<'static>>, width:
         ),
         rect,
     );
+    (rect, cut)
 }
 
 /// The dialog for adding a package (`+`): its name and what to add it as.
-fn draw_add_dialog(f: &mut Frame, app: &App, input: &crate::tui::app::Input, add_as: crate::tui::app::AddAs) {
+fn draw_add_dialog(
+    f: &mut Frame,
+    app: &App,
+    input: &crate::tui::app::Input,
+    add_as: crate::tui::app::AddAs,
+) -> Vec<(Rect, Vec<KeyEvent>)> {
     use crate::tui::app::AddAs;
     let width = f.area().width.saturating_sub(4).min(72);
     let inner = (width as usize).saturating_sub(4);
@@ -943,7 +997,24 @@ fn draw_add_dialog(f: &mut Frame, app: &App, input: &crate::tui::app::Input, add
     keys.extend(key("tab ↑↓", "choose"));
     keys.extend(key("esc", "cancel"));
     lines.push(Line::from(keys));
-    draw_dialog(f, "Add a package", lines, width);
+    let (rect, cut) = draw_dialog(f, "Add a package", lines, width);
+    let mut clicks = Vec::new();
+    if !cut {
+        // The three choices follow the name, a line of help and a blank line. Each is reached
+        // by moving down from the chosen one.
+        let at = AddAs::ALL.iter().position(|a| *a == add_as).unwrap_or(0);
+        for i in 0..AddAs::ALL.len() {
+            let r = Rect {
+                x: rect.x + 2,
+                y: rect.y + 2 + 3 + i as u16,
+                width: rect.width.saturating_sub(4),
+                height: 1,
+            };
+            let down = (i + AddAs::ALL.len() - at) % AddAs::ALL.len();
+            clicks.push((r, vec![plain(KeyCode::Down); down]));
+        }
+    }
+    clicks
 }
 
 /// The question about other packages an install needs changed, in a box in the middle of the
@@ -1037,7 +1108,8 @@ fn draw_peer_prompt(f: &mut Frame, p: &crate::tui::app::PeerPrompt) {
     );
 }
 
-fn header_lines(app: &App, width: u16) -> Vec<Line<'static>> {
+/// The header, and what a click on each of its parts does.
+fn header_lines(app: &App, width: u16) -> (Vec<Line<'static>>, Vec<Placed>) {
     let outdated_total = app.rows.iter().filter(|r| r.outdated).count();
     let mut state = if app.loading() {
         format!("checking {}/{}…", app.total - app.pending, app.total)
@@ -1051,40 +1123,44 @@ fn header_lines(app: &App, width: u16) -> Vec<Line<'static>> {
     if outdated_total > 0 && app.shown_up_to_date() > 0 {
         state.push_str(&format!(" · {} up to date", app.shown_up_to_date()));
     }
-    let mut info: Vec<String> = vec![
-        app.project_name(),
-        app.pm.name().to_string(),
-        app.registry.clone(),
-        state,
+    // Each part and the key a click on it presses.
+    let mut info: Vec<(String, Option<char>)> = vec![
+        (app.project_name(), None),
+        (app.pm.name().to_string(), None),
+        (app.registry.clone(), None),
+        (state, None),
     ];
     if app.group_by != GroupBy::None {
-        info.push(format!("group: {}", app.group_by.label()));
+        info.push((format!("group: {}", app.group_by.label()), Some('g')));
     }
     if !app.show_vulns {
-        info.push("vulns hidden".to_string());
+        info.push(("vulns hidden".to_string(), Some('v')));
     }
     if app.show_overrides != Overrides::Off {
-        info.push(format!("overrides: {}", app.show_overrides.label()));
+        info.push((format!("overrides: {}", app.show_overrides.label()), Some('o')));
     }
     if !app.show_uptodate {
-        info.push("up-to-date hidden".to_string());
+        info.push(("up-to-date hidden".to_string(), None));
     }
     let audit_source = app.audit_source();
     for (source, scan) in [(Source::Snyk, &app.snyk), (audit_source, &app.audit)] {
         let label = source.label();
         match scan.status {
             ScanStatus::NotRun => {}
-            ScanStatus::Running => info.push(format!("{label}: scanning…")),
-            ScanStatus::Failed => info.push(format!("{label}: failed (see log)")),
-            ScanStatus::Done { total: 0, .. } => info.push(format!("{label}: clean")),
-            ScanStatus::Done { total, severe } => info.push(format!(
-                "{label}: {total} vulnerabilities ({severe} high+)"
+            ScanStatus::Running => info.push((format!("{label}: scanning…"), None)),
+            ScanStatus::Failed => {
+                info.push((format!("{label}: failed (see log)"), Some(scan_key(source))))
+            }
+            ScanStatus::Done { total: 0, .. } => info.push((format!("{label}: clean"), None)),
+            ScanStatus::Done { total, severe } => info.push((
+                format!("{label}: {total} vulnerabilities ({severe} high+)"),
+                Some('v'),
             )),
         }
         if scan.stale {
-            info.push(format!(
-                "{label} results outdated, press {}",
-                scan_key(source)
+            info.push((
+                format!("{label} results outdated, press {}", scan_key(source)),
+                Some(scan_key(source)),
             ));
         }
     }
@@ -1092,12 +1168,44 @@ fn header_lines(app: &App, width: u16) -> Vec<Line<'static>> {
         .black()
         .on_cyan()
         .bold();
-    let mut atoms: Vec<Vec<Span<'static>>> = info.into_iter().map(|i| vec![Span::raw(i)]).collect();
-    atoms[0].insert(0, Span::raw(" "));
-    atoms[0].insert(0, badge);
-    wrap_hints(Vec::new(), atoms, " · ", width)
+    let mut atoms: Vec<Atom> = info
+        .into_iter()
+        .map(|(i, key)| (vec![Span::raw(i)], key.map(|c| plain(KeyCode::Char(c)))))
+        .collect();
+    atoms[0].0.insert(0, Span::raw(" "));
+    atoms[0].0.insert(0, badge);
+    wrap_atoms(Vec::new(), atoms, " · ", width)
 }
 
+/// A hint or label on screen that a click turns into key presses: where it starts (line and
+/// column, relative to the area the lines are drawn in), its width and the keys.
+pub struct Placed {
+    line: usize,
+    x: u16,
+    w: u16,
+    keys: Vec<KeyEvent>,
+}
+/// A group of spans laid out as a unit, with the key a click on it stands for.
+type Atom = (Vec<Span<'static>>, Option<KeyEvent>);
+fn plain(code: KeyCode) -> KeyEvent {
+    KeyEvent::new(code, KeyModifiers::NONE)
+}
+/// The key a hint such as `i install` or `esc cancel` names, if it names one.
+fn hint_key(atom: &[Span]) -> Option<KeyEvent> {
+    let text: String = atom.iter().map(|s| s.content.as_ref()).collect();
+    let word = text.split_whitespace().next()?;
+    match word {
+        "enter" => Some(plain(KeyCode::Enter)),
+        // "any other key cancels" is answered by a key that is none of the options.
+        "esc" | "any" => Some(plain(KeyCode::Esc)),
+        "tab" => Some(plain(KeyCode::Tab)),
+        "ctrl+s" => Some(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL)),
+        w if w.chars().count() == 1 && w != "," && w != "." => {
+            w.chars().next().map(|c| plain(KeyCode::Char(c)))
+        }
+        _ => None,
+    }
+}
 /// Lays out hint items (each a group of spans) over as many lines as the width needs.
 fn wrap_hints(
     prefix: Vec<Span<'static>>,
@@ -1105,12 +1213,41 @@ fn wrap_hints(
     sep: &str,
     width: u16,
 ) -> Vec<Line<'static>> {
+    wrap_atoms(prefix, atoms.into_iter().map(|a| (a, None)).collect(), sep, width).0
+}
+/// `wrap_hints` for hints that start with the key they stand for: also says where a click
+/// on each of them lands.
+fn wrap_keys(
+    prefix: Vec<Span<'static>>,
+    atoms: Vec<Vec<Span<'static>>>,
+    sep: &str,
+    width: u16,
+) -> (Vec<Line<'static>>, Vec<Placed>) {
+    let atoms = atoms
+        .into_iter()
+        .map(|a| {
+            let key = hint_key(&a);
+            (a, key)
+        })
+        .collect();
+    wrap_atoms(prefix, atoms, sep, width)
+}
+fn wrap_atoms(
+    prefix: Vec<Span<'static>>,
+    atoms: Vec<Atom>,
+    sep: &str,
+    width: u16,
+) -> (Vec<Line<'static>>, Vec<Placed>) {
     let width = width as usize;
     let mut lines = Vec::new();
+    let mut placed = Vec::new();
     let mut cur = vec![Span::raw(" ")];
     let mut cur_w = 1;
     let mut first = true;
-    let mut push = |atom: Vec<Span<'static>>, sep: &str, lines: &mut Vec<Line<'static>>| {
+    let mut push = |(atom, key): Atom,
+                    sep: &str,
+                    lines: &mut Vec<Line<'static>>,
+                    placed: &mut Vec<Placed>| {
         let w: usize = atom.iter().map(|s| s.width()).sum();
         if !first && cur_w + sep.chars().count() + w > width && cur_w > 1 {
             lines.push(Line::from(std::mem::replace(&mut cur, vec![Span::raw(" ")])));
@@ -1121,24 +1258,43 @@ fn wrap_hints(
             cur.push(Span::raw(sep.to_string()));
             cur_w += sep.chars().count();
         }
+        if let Some(key) = key {
+            placed.push(Placed {
+                line: lines.len(),
+                x: cur_w as u16,
+                w: w as u16,
+                keys: vec![key],
+            });
+        }
         cur_w += w;
         cur.extend(atom);
         first = false;
     };
     if !prefix.is_empty() {
-        push(prefix, "", &mut lines);
+        push((prefix, None), "", &mut lines, &mut placed);
     }
     for atom in atoms {
-        push(atom, sep, &mut lines);
+        push(atom, sep, &mut lines, &mut placed);
     }
     lines.push(Line::from(cur));
-    lines
+    (lines, placed)
 }
-
-fn footer_lines(app: &App, width: u16) -> Vec<Line<'static>> {
+/// Adds the clicks of hints laid out in `area` to `out`.
+fn add_targets(area: Rect, placed: Vec<Placed>, out: &mut Vec<(Rect, Vec<KeyEvent>)>) {
+    for p in placed {
+        let y = area.y + p.line as u16;
+        let x = area.x + p.x;
+        if y >= area.y + area.height || x >= area.x + area.width {
+            continue;
+        }
+        let w = p.w.min(area.x + area.width - x);
+        out.push((Rect { x, y, width: w, height: 1 }, p.keys));
+    }
+}
+fn footer_lines(app: &App, width: u16) -> (Vec<Line<'static>>, Vec<Placed>) {
     let hint = |t: &str| vec![t.to_string().dark_gray()];
     if app.input.is_some() {
-        return wrap_hints(
+        return wrap_keys(
             vec!["Add a package:".cyan().bold()],
             vec![hint("see the dialog above"), hint("enter add"), hint("esc cancel")],
             "   ",
@@ -1146,7 +1302,7 @@ fn footer_lines(app: &App, width: u16) -> Vec<Line<'static>> {
         );
     }
     if app.version_edit.is_some() {
-        return wrap_hints(
+        return wrap_keys(
             vec!["Edit the version:".cyan().bold()],
             vec![hint("← → home end move"), hint("enter install"), hint("esc cancel")],
             "   ",
@@ -1168,7 +1324,7 @@ fn footer_lines(app: &App, width: u16) -> Vec<Line<'static>> {
         let mut keys = keys;
         keys.push(hint("← → ↑ ↓ home end move"));
         keys.push(hint("esc cancel"));
-        return wrap_hints(vec!["Commit:".cyan().bold()], keys, "   ", width);
+        return wrap_keys(vec!["Commit:".cyan().bold()], keys, "   ", width);
     }
     if let Some(p) = &app.blocked_prompt {
         let mut keys = Vec::new();
@@ -1179,10 +1335,10 @@ fn footer_lines(app: &App, width: u16) -> Vec<Line<'static>> {
             keys.push(hint("n install the others only"));
         }
         keys.push(hint("any other key cancels"));
-        return wrap_hints(vec!["Answer the dialog above:".cyan().bold()], keys, "   ", width);
+        return wrap_keys(vec!["Answer the dialog above:".cyan().bold()], keys, "   ", width);
     }
     if app.delete_prompt.is_some() {
-        return wrap_hints(
+        return wrap_keys(
             vec!["Answer the dialog above:".cyan().bold()],
             vec![hint("y or enter delete"), hint("any other key cancels")],
             "   ",
@@ -1190,7 +1346,7 @@ fn footer_lines(app: &App, width: u16) -> Vec<Line<'static>> {
         );
     }
     if app.peer_fix.is_some() {
-        return wrap_hints(
+        return wrap_keys(
             vec!["Answer the dialog above:".cyan().bold()],
             vec![hint("↑↓ choose"), hint("enter or 1-9 fix"), hint("any other key cancels")],
             "   ",
@@ -1198,7 +1354,7 @@ fn footer_lines(app: &App, width: u16) -> Vec<Line<'static>> {
         );
     }
     if app.peer_prompt.is_some() {
-        return wrap_hints(
+        return wrap_keys(
             vec!["Answer the dialog above:".cyan().bold()],
             vec![hint("y"), hint("n"), hint("any other key cancels")],
             "   ",
@@ -1207,7 +1363,7 @@ fn footer_lines(app: &App, width: u16) -> Vec<Line<'static>> {
     }
     if app.pin_prompt {
         let opt = |k: &str, d: &str| vec![k.to_string().bold(), d.to_string().into()];
-        return wrap_hints(
+        return wrap_keys(
             vec!["Pin type:".cyan().bold()],
             vec![
                 opt("e", " exact"),
@@ -1221,7 +1377,7 @@ fn footer_lines(app: &App, width: u16) -> Vec<Line<'static>> {
         );
     }
     if app.filter_mode {
-        return wrap_hints(
+        return wrap_keys(
             vec!["/".cyan().bold(), app.filter.clone().into(), "█".cyan()],
             vec![hint("enter keep"), hint("esc clear")],
             "   ",
@@ -1237,9 +1393,17 @@ fn footer_lines(app: &App, width: u16) -> Vec<Line<'static>> {
             global.insert(pos + 1, "esc clear".to_string());
         }
     }
-    let mut lines = Vec::new();
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    let mut placed: Vec<Placed> = Vec::new();
+    let mut add = |(l, p): (Vec<Line<'static>>, Vec<Placed>)| {
+        placed.extend(p.into_iter().map(|mut p| {
+            p.line += lines.len();
+            p
+        }));
+        lines.extend(l);
+    };
     if !item.is_empty() {
-        lines.extend(wrap_hints(
+        add(wrap_keys(
             vec!["item:".cyan().bold()],
             item.iter().map(|h| hint(h)).collect(),
             "   ",
@@ -1247,20 +1411,20 @@ fn footer_lines(app: &App, width: u16) -> Vec<Line<'static>> {
         ));
     }
     if !scan.is_empty() {
-        lines.extend(wrap_hints(
+        add(wrap_keys(
             vec!["scan:".cyan().bold()],
             scan.iter().map(|h| hint(h)).collect(),
             "   ",
             width,
         ));
     }
-    lines.extend(wrap_hints(
+    add(wrap_keys(
         prefix,
         global.iter().map(|h| hint(h)).collect(),
         "   ",
         width,
     ));
-    lines
+    (lines, placed)
 }
 
 fn removed_line(app: &App, name: &str) -> Line<'static> {

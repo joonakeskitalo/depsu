@@ -13,7 +13,8 @@ use crate::security::snyk;
 use crate::deps::tree::{Analyzer, Dependent, Hit};
 use crate::tui::view::{self, Child, GroupBy, Item, Overrides, REMOVED, Release, UNNEEDED};
 use crate::security::vuln::{Report, Severity, Source, Vuln};
-use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+use ratatui::layout::Rect;
 use ratatui::widgets::ListState;
 use semver::Version;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -498,6 +499,17 @@ pub struct Scan {
     report: Option<Report>,
 }
 
+/// Parts of the screen the mouse reacts to, set by the renderer on every frame.
+#[derive(Default)]
+pub struct Targets {
+    /// Areas that press these keys when clicked: hints, header items, the log, dialog choices.
+    pub keys: Vec<(Rect, Vec<KeyEvent>)>,
+    /// Where the package list is drawn.
+    pub list: Rect,
+    /// The list items on screen: the row (inside `list`) each starts at, its height and its
+    /// index in `view`.
+    pub items: Vec<(u16, u16, usize)>,
+}
 pub struct App {
     pub pm: Pm,
     pub rows: Vec<Row>,
@@ -555,6 +567,8 @@ pub struct App {
     pub log_page: usize,
     /// Rows the package list shows, set by the renderer, used for paging (`,` and `.`).
     pub list_page: usize,
+    /// What the mouse can click, set by the renderer.
+    pub targets: Targets,
     /// Latest versions and findings per package version. Always kept in memory; written to
     /// `cache_path` when `--cache` was given.
     cache: Cache,
@@ -729,6 +743,7 @@ impl App {
             log_scroll: 0,
             log_page: 10,
             list_page: 10,
+            targets: Targets::default(),
             cache: Cache::default(),
             cache_path: None,
             cache_dirty: false,
@@ -2143,6 +2158,68 @@ impl App {
         }
     }
 
+    /// Lines the wheel scrolls the expanded log by.
+    const WHEEL_LOG_LINES: usize = 3;
+    /// A mouse click or wheel turn. Clicks on hints, header items and dialog choices press the
+    /// keys they name. Clicks on the list move the cursor, or check the item when they hit its
+    /// mark. The wheel scrolls the list or the expanded log.
+    pub fn on_mouse(&mut self, m: MouseEvent) {
+        let focus = crate::tui::ui::focus(self);
+        match m.kind {
+            MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
+                let up = m.kind == MouseEventKind::ScrollUp;
+                match focus {
+                    crate::tui::ui::Focus::Log => {
+                        let max = self.log.len().saturating_sub(1);
+                        self.log_scroll = if up {
+                            (self.log_scroll + Self::WHEEL_LOG_LINES).min(max)
+                        } else {
+                            self.log_scroll.saturating_sub(Self::WHEEL_LOG_LINES)
+                        };
+                    }
+                    crate::tui::ui::Focus::List => {
+                        self.cursor_moved = true;
+                        self.move_cursor(if up { -1 } else { 1 });
+                    }
+                    _ => {}
+                }
+            }
+            MouseEventKind::Down(MouseButton::Left) => self.click(m.column, m.row, focus),
+            _ => {}
+        }
+    }
+    fn click(&mut self, x: u16, y: u16, focus: crate::tui::ui::Focus) {
+        let inside = |r: &Rect| x >= r.x && x < r.x + r.width && y >= r.y && y < r.y + r.height;
+        if let Some((_, keys)) = self.targets.keys.iter().find(|(r, _)| inside(r)) {
+            for key in keys.clone() {
+                self.on_key(key);
+            }
+            return;
+        }
+        if focus != crate::tui::ui::Focus::List || !inside(&self.targets.list) {
+            return;
+        }
+        let row = y - self.targets.list.y;
+        let Some(&(_, _, i)) = self
+            .targets
+            .items
+            .iter()
+            .find(|(top, h, _)| row >= *top && row < top + h)
+        else {
+            return;
+        };
+        if !self.selectable(i) {
+            return;
+        }
+        self.cursor_moved = true;
+        self.table.select(Some(i));
+        // The mark in front of a package or group checks it, like space does.
+        let on_mark = x - self.targets.list.x < 2;
+        if on_mark && matches!(self.view[i], Item::Row { .. } | Item::Header { .. }) {
+            self.toggle_cursor();
+            self.table.select(Some(i));
+        }
+    }
     fn on_log_key(&mut self, key: KeyEvent) {
         let max = self.log.len().saturating_sub(1);
         let page = self.log_page.max(1);
@@ -6418,5 +6495,133 @@ mod tests {
         assert_eq!((prefix, v.to_string()), ("~", "1.4.0".to_string()));
         assert!(override_base(&[ovr("x", "$y", "a")], "x").is_none());
         assert!(override_base(&all, "missing").is_none());
+    }
+    fn click(app: &mut App, x: u16, y: u16) {
+        app.on_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: x,
+            row: y,
+            modifiers: KeyModifiers::NONE,
+        });
+    }
+    fn wheel(app: &mut App, up: bool) {
+        app.on_mouse(MouseEvent {
+            kind: if up { MouseEventKind::ScrollUp } else { MouseEventKind::ScrollDown },
+            column: 5,
+            row: 5,
+            modifiers: KeyModifiers::NONE,
+        });
+    }
+    fn app_with_packages(n: usize) -> App {
+        let (mut app, _rx) = app_capturing_installs();
+        for i in 0..n {
+            let name = format!("p{i:02}");
+            app.current.insert(name.clone(), (Kind::Prod, "^", Version::new(1, 0, 0)));
+            app.on_fetched(name, Version::new(2, 0, 0));
+        }
+        app
+    }
+    #[test]
+    fn clicking_a_package_moves_the_cursor_to_it() {
+        let mut app = app_with_packages(5);
+        let buf = buffer(&mut app, 120, 30);
+        let (x, y) = find(&buf, "p03");
+        click(&mut app, x, y);
+        let Some(Item::Row { idx, .. }) = app.cursor_item() else { panic!("not on a package") };
+        assert_eq!(app.rows[*idx].name, "p03");
+        assert!(!app.rows[*idx].selected, "a click on the name does not check it");
+    }
+    #[test]
+    fn clicking_the_mark_of_a_package_checks_and_unchecks_it() {
+        let mut app = app_with_packages(5);
+        let buf = buffer(&mut app, 120, 30);
+        let (nx, y) = find(&buf, "p02");
+        let mark_x = nx - 2;
+        click(&mut app, mark_x, y);
+        let idx = |app: &App| match app.cursor_item() {
+            Some(Item::Row { idx, .. }) => *idx,
+            _ => panic!("not on a package"),
+        };
+        assert_eq!(app.rows[idx(&app)].name, "p02", "the cursor stays on the package");
+        assert!(app.rows[idx(&app)].selected);
+        buffer(&mut app, 120, 30);
+        click(&mut app, mark_x, y);
+        assert!(!app.rows[idx(&app)].selected);
+    }
+    #[test]
+    fn the_wheel_moves_the_cursor() {
+        let mut app = app_with_packages(5);
+        buffer(&mut app, 120, 30);
+        app.table.select(Some(0));
+        wheel(&mut app, false);
+        wheel(&mut app, false);
+        assert_eq!(app.table.selected(), Some(2));
+        wheel(&mut app, true);
+        assert_eq!(app.table.selected(), Some(1));
+    }
+    #[test]
+    fn clicking_a_hint_presses_its_key() {
+        let mut app = app_with_packages(3);
+        let was = app.show_info;
+        let buf = buffer(&mut app, 120, 30);
+        let (x, y) = find(&buf, "? details");
+        click(&mut app, x, y);
+        assert_eq!(app.show_info, !was);
+        // A hint that opens a prompt, answered by clicking its hints too.
+        let buf = buffer(&mut app, 120, 30);
+        let (x, y) = find(&buf, "/ filter");
+        click(&mut app, x, y);
+        assert!(app.filter_mode);
+        let buf = buffer(&mut app, 120, 30);
+        let (x, y) = find(&buf, "esc clear");
+        click(&mut app, x, y);
+        assert!(!app.filter_mode);
+    }
+    #[test]
+    fn clicking_the_log_opens_it_and_the_hint_closes_it() {
+        let mut app = app_with_packages(3);
+        app.push_log("hello");
+        let buf = buffer(&mut app, 120, 30);
+        let (x, y) = find(&buf, "hello");
+        click(&mut app, x, y);
+        assert!(app.log_focus);
+        let buf = buffer(&mut app, 120, 30);
+        let (x, y) = find(&buf, "tab or esc back");
+        click(&mut app, x, y);
+        assert!(!app.log_focus);
+    }
+    #[test]
+    fn the_wheel_scrolls_the_expanded_log() {
+        let mut app = app_with_packages(1);
+        for i in 0..50 {
+            app.push_log(format!("line {i}"));
+        }
+        app.log_focus = true;
+        buffer(&mut app, 120, 30);
+        wheel(&mut app, true);
+        assert_eq!(app.log_scroll, App::WHEEL_LOG_LINES);
+        wheel(&mut app, false);
+        assert_eq!(app.log_scroll, 0);
+    }
+    #[test]
+    fn a_click_behind_a_dialog_does_nothing() {
+        let (mut app, _rx) = app_to_delete_from();
+        app.on_key(key('d'));
+        let buf = buffer(&mut app, 120, 40);
+        let (x, y) = find(&buf, " packages ");
+        let before = app.table.selected();
+        click(&mut app, x + 2, y + 1);
+        assert_eq!(app.table.selected(), before);
+        assert!(app.delete_prompt.is_some());
+    }
+    #[test]
+    fn clicking_a_header_item_runs_its_key() {
+        let mut app = app_with_packages(3);
+        app.group_by = GroupBy::Release;
+        app.rebuild_view();
+        let buf = buffer(&mut app, 160, 30);
+        let (x, y) = find(&buf, "group: ");
+        click(&mut app, x, y);
+        assert_ne!(app.group_by, GroupBy::Release, "g moved on to the next grouping");
     }
 }

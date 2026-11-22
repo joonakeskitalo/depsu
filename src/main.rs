@@ -5,7 +5,8 @@ mod security;
 mod tui;
 
 use anyhow::{Result, bail};
-use ratatui::crossterm::event::{self, Event, KeyEventKind};
+use ratatui::crossterm::ExecutableCommand;
+use ratatui::crossterm::event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyEventKind};
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -46,7 +47,14 @@ KEYS:
     p              override a vulnerable dependency with the fixed version a scan
                    suggests (press twice to confirm)
     v              show / hide vulnerability findings
-    q, esc         quit";
+    q, esc         quit
+
+MOUSE:
+    click          move the cursor to an item; click its mark to (un)check it
+    click          a key hint in the footer or an item in the header runs it;
+                   the log opens when clicked, dialog choices pick themselves
+    wheel          move the cursor, or scroll the expanded log
+                   (hold shift to select text with the mouse)";
 
 fn main() -> Result<()> {
     let mut dir = PathBuf::from(".");
@@ -109,7 +117,16 @@ fn main() -> Result<()> {
         app.push_log(w);
     }
     let mut terminal = ratatui::init();
+    // The terminal reports clicks and the wheel to depsu while this is on. Holding shift (alt
+    // in some terminals) selects text as usual.
+    let _ = std::io::stdout().execute(EnableMouseCapture);
+    let hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let _ = std::io::stdout().execute(DisableMouseCapture);
+        hook(info);
+    }));
     let result = run(&mut terminal, &mut app);
+    let _ = std::io::stdout().execute(DisableMouseCapture);
     ratatui::restore();
     result
 }
@@ -118,11 +135,12 @@ fn run(terminal: &mut ratatui::DefaultTerminal, app: &mut tui::app::App) -> Resu
     while !app.quit {
         app.drain_events();
         terminal.draw(|f| tui::ui::draw(f, app))?;
-        if event::poll(Duration::from_millis(100))?
-            && let Event::Key(key) = event::read()?
-            && key.kind == KeyEventKind::Press
-        {
-            app.on_key(key);
+        if event::poll(Duration::from_millis(100))? {
+            match event::read()? {
+                Event::Key(key) if key.kind == KeyEventKind::Press => app.on_key(key),
+                Event::Mouse(m) => app.on_mouse(m),
+                _ => {}
+            }
         }
     }
     Ok(())

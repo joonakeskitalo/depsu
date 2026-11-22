@@ -93,6 +93,13 @@ depsu --cache .depsu-cache.json   # remember versions and scans between runs
 The part of the screen that takes the keys has a cyan border: the package list, a prompt typed in the footer (filter, version, pin type), the expanded log, or a dialog. While a dialog is open, everything behind it is dimmed.
 
 `a` and `i` act only on the packages currently shown, so a filter narrows what they touch.
+### Mouse
+- Click an item in the list to move the cursor to it. Click the mark (`○`, `●`) in front of a package or group to check it.
+- Click a key hint in the footer to press that key. Click a header item (`group: …`, `vulns hidden`, `overrides: …`, a scan result) to run its key. Click the `selected:` heading to toggle the details panel.
+- Click the log at the bottom to expand it, and the `tab or esc back to list` hint to close it.
+- In dialogs, click the footer hints, a peer fix option or an `Add as` choice.
+- The wheel moves the cursor in the list and scrolls the expanded log.
+- depsu captures the mouse, so hold Shift (Option in some terminals) to select text.
 
 ## How it works
 
