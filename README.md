@@ -104,7 +104,7 @@ deprecation message and the checksum. Dependency changes compare with the lockfi
 - Click the log at the bottom to expand it. The list stays visible above it: click a package to give the keys back to the list, click the log to return to it. The wheel scrolls whichever the pointer is over.
 - In dialogs, click the footer hints, a peer fix option or an `Add as` choice.
 - The wheel moves the cursor in the list and scrolls the details panel and the expanded log.
-- depsu captures the mouse, so hold Shift (Option in some terminals) to select text.
+- Drag over text in the details panel or the log to select it, then press `y` (or click `y copy selection`) to copy it to the clipboard (pbcopy, wl-copy, xclip, xsel or clip.exe). `Esc` or any other key drops the selection. Elsewhere, hold Shift (Option in some terminals) to select with the terminal.
 
 ## How it works
 

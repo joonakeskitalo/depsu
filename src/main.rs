@@ -55,6 +55,7 @@ MOUSE:
     click          a key hint in the footer or an item in the header runs it;
                    the log opens when clicked, dialog choices pick themselves
     wheel          move the cursor, scroll the details panel or the expanded log
+    drag           select text in the details panel or the log; y copies it, esc drops it
                    (hold shift to select text with the mouse)";
 
 fn main() -> Result<()> {

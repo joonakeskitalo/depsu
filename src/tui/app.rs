@@ -538,6 +538,36 @@ pub struct Targets {
     /// The list items on screen: the row (inside `list`) each starts at, its height and its
     /// index in `view`.
     pub items: Vec<(u16, u16, usize)>,
+    /// Text areas the mouse can select from: inside the details and the log panels.
+    pub selectable: Vec<Rect>,
+}
+/// Text being selected with the mouse, in one of `Targets::selectable`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Selection {
+    pub area: Rect,
+    /// Where the button went down, and where the pointer is now: (column, row).
+    pub start: (u16, u16),
+    pub end: (u16, u16),
+    /// The pointer moved with the button down. A press and release in place is a click.
+    pub dragged: bool,
+    /// Log lines when it began: a new one moves the log's text under the highlight.
+    pub log_len: usize,
+}
+impl Selection {
+    /// The selected columns of row `y`, in reading order from `start` to `end`.
+    pub fn columns(&self, y: u16) -> Option<std::ops::RangeInclusive<u16>> {
+        let (a, b) = if (self.start.1, self.start.0) <= (self.end.1, self.end.0) {
+            (self.start, self.end)
+        } else {
+            (self.end, self.start)
+        };
+        if y < a.1 || y > b.1 {
+            return None;
+        }
+        let left = if y == a.1 { a.0 } else { self.area.x };
+        let right = if y == b.1 { b.0 } else { self.area.x + self.area.width - 1 };
+        Some(left..=right)
+    }
 }
 pub struct App {
     pub pm: Pm,
@@ -603,6 +633,12 @@ pub struct App {
     pub info_scroll: usize,
     /// The list item the details panel was last drawn for; another one starts at the top.
     pub info_for: Option<usize>,
+    /// Text the mouse is selecting (or selected last) in the details or the log panel.
+    pub selection: Option<Selection>,
+    /// The selected text, read off the screen by the renderer.
+    pub selection_text: String,
+    /// Puts text on the clipboard; tests swap it out.
+    pub copier: fn(&str) -> Result<(), String>,
     /// What the mouse can click, set by the renderer.
     pub targets: Targets,
     /// Latest versions and findings per package version. Always kept in memory; written to
@@ -800,6 +836,9 @@ impl App {
             item_rows: ItemSection::default(),
             info_scroll: 0,
             info_for: None,
+            selection: None,
+            selection_text: String::new(),
+            copier: crate::tui::export::copy,
             cache: Cache::default(),
             cache_path: None,
             cache_dirty: false,
@@ -2028,7 +2067,12 @@ impl App {
         {
             item.push("r restore".into());
         }
-        global.push("y copy md".into());
+        if self.selection.is_some_and(|s| s.dragged) {
+            global.push("y copy selection".into());
+            global.push("esc unselect".into());
+        } else {
+            global.push("y copy md".into());
+        }
         global.push("q quit".into());
         (item, scan, global)
     }
@@ -2037,6 +2081,14 @@ impl App {
 
     pub fn on_key(&mut self, key: KeyEvent) {
         self.cursor_moved = true;
+        // With text selected, `y` copies it and Esc drops it; any other key drops it and goes on.
+        if self.selection.take().is_some_and(|s| s.dragged) {
+            match key.code {
+                KeyCode::Char('y') if key.modifiers.is_empty() => return self.copy_selection(),
+                KeyCode::Esc => return,
+                _ => {}
+            }
+        }
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
             self.quit = true;
             return;
@@ -2289,8 +2341,62 @@ impl App {
                     _ => {}
                 }
             }
-            MouseEventKind::Down(MouseButton::Left) => self.click(m.column, m.row, focus),
+            MouseEventKind::Down(MouseButton::Left) => {
+                let at = (m.column, m.row);
+                let area = matches!(focus, crate::tui::ui::Focus::List | crate::tui::ui::Focus::Log)
+                    .then(|| self.targets.selectable.iter().find(|r| r.contains(at.into())).copied())
+                    .flatten();
+                match area {
+                    // Text can be selected here: whether this is a click is known on release.
+                    Some(area) => {
+                        self.selection = Some(Selection {
+                            area,
+                            start: at,
+                            end: at,
+                            dragged: false,
+                            log_len: self.log.len(),
+                        })
+                    }
+                    // The selection is dropped after the click, so the `y copy selection` hint
+                    // still has it to copy.
+                    None => {
+                        self.click(m.column, m.row, focus);
+                        self.selection = None;
+                    }
+                }
+            }
+            MouseEventKind::Drag(MouseButton::Left) => {
+                if let Some(s) = &mut self.selection {
+                    let a = s.area;
+                    s.end = (
+                        m.column.clamp(a.x, a.x + a.width - 1),
+                        m.row.clamp(a.y, a.y + a.height - 1),
+                    );
+                    s.dragged |= s.end != s.start;
+                }
+            }
+            MouseEventKind::Up(MouseButton::Left) => match self.selection {
+                // The text stays selected; `y` copies it.
+                Some(s) if s.dragged => {}
+                Some(s) => {
+                    self.selection = None;
+                    self.click(s.start.0, s.start.1, focus);
+                }
+                None => {}
+            },
             _ => {}
+        }
+    }
+    /// Puts the selected text on the clipboard, when the user presses `y`. The highlight goes,
+    /// as the log line saying so moves the text under it.
+    fn copy_selection(&mut self) {
+        let text = std::mem::take(&mut self.selection_text);
+        if text.trim().is_empty() {
+            return;
+        }
+        match (self.copier)(&text) {
+            Ok(()) => self.push_log(format!("✔ copied {} characters", text.chars().count())),
+            Err(e) => self.push_log(format!("✘ copy failed: {e}")),
         }
     }
     /// Scrolls the details panel a line; the renderer keeps it within the contents.
@@ -6676,13 +6782,11 @@ mod tests {
         assert!(override_base(&[ovr("x", "$y", "a")], "x").is_none());
         assert!(override_base(&all, "missing").is_none());
     }
+    /// A press and release in place, as a terminal reports a click.
     fn click(app: &mut App, x: u16, y: u16) {
-        app.on_mouse(MouseEvent {
-            kind: MouseEventKind::Down(MouseButton::Left),
-            column: x,
-            row: y,
-            modifiers: KeyModifiers::NONE,
-        });
+        for kind in [MouseEventKind::Down(MouseButton::Left), MouseEventKind::Up(MouseButton::Left)] {
+            app.on_mouse(MouseEvent { kind, column: x, row: y, modifiers: KeyModifiers::NONE });
+        }
     }
     fn wheel(app: &mut App, up: bool, at: (u16, u16)) {
         app.on_mouse(MouseEvent {
@@ -7046,5 +7150,96 @@ mod tests {
         .unwrap();
         app.reload_project();
         wait_until(&mut app, |app| app.info.get("a").is_some_and(|(_, i)| i.deprecated.is_none()));
+    }
+    static COPIED: Mutex<Vec<String>> = Mutex::new(Vec::new());
+    fn capture(text: &str) -> Result<(), String> {
+        COPIED.lock().unwrap().push(text.to_string());
+        Ok(())
+    }
+    /// Whether `text` went to the clipboard (tests run in parallel and share it).
+    fn copied(text: &str) -> bool {
+        COPIED.lock().unwrap().iter().any(|t| t == text)
+    }
+    fn mouse(app: &mut App, kind: MouseEventKind, x: u16, y: u16) {
+        app.on_mouse(MouseEvent { kind, column: x, row: y, modifiers: KeyModifiers::NONE });
+    }
+    /// Presses at `from`, drags to `to` and releases, redrawing as the terminal would.
+    fn drag(app: &mut App, from: (u16, u16), to: (u16, u16)) {
+        mouse(app, MouseEventKind::Down(MouseButton::Left), from.0, from.1);
+        buffer(app, 120, 30);
+        mouse(app, MouseEventKind::Drag(MouseButton::Left), to.0, to.1);
+        buffer(app, 120, 30);
+        mouse(app, MouseEventKind::Up(MouseButton::Left), to.0, to.1);
+    }
+    #[test]
+    fn dragging_over_the_log_selects_and_copies_its_text() {
+        let mut app = app_with_packages(2);
+        app.copier = capture;
+        app.push_log("first line here");
+        app.push_log("second line");
+        let buf = buffer(&mut app, 120, 30);
+        let (x1, y1) = find(&buf, "line here");
+        let (x2, y2) = find(&buf, "second");
+        drag(&mut app, (x1, y1), (x2 + 5, y2));
+        assert!(!app.log_focus, "a drag is not a click: the log stays as it was");
+        // Nothing is copied until the user asks.
+        buffer(&mut app, 120, 30);
+        assert!(!copied("line here\nsecond"));
+        assert!(app.hints().2.contains(&"y copy selection".to_string()));
+        app.on_key(key('y'));
+        assert!(copied("line here\nsecond"));
+        assert!(app.log.last().unwrap().starts_with("✔ copied 16 characters"));
+        assert!(app.selection.is_none());
+        // While dragging, the selection is highlighted; a key drops it.
+        let buf = buffer(&mut app, 120, 30);
+        let (x, y) = find(&buf, "second");
+        mouse(&mut app, MouseEventKind::Down(MouseButton::Left), x, y);
+        mouse(&mut app, MouseEventKind::Drag(MouseButton::Left), x + 3, y);
+        let buf = buffer(&mut app, 120, 30);
+        assert!(buf[(x + 1, y)].modifier.contains(ratatui::style::Modifier::REVERSED));
+        assert!(!buf[(x + 4, y)].modifier.contains(ratatui::style::Modifier::REVERSED));
+        app.on_key(key('j'));
+        assert!(app.selection.is_none());
+    }
+    #[test]
+    fn dragging_backwards_over_the_details_selects_too() {
+        let mut app = app_with_long_details();
+        app.copier = capture;
+        cursor_to_name(&mut app, "p01");
+        app.info_for = app.table.selected();
+        let buf = buffer(&mut app, 120, 30);
+        let (x, y) = find(&buf, "user-02@1.0.2");
+        // From the end of "user-02@1.0.2" back to its start, on one row.
+        drag(&mut app, (x + 12, y), (x, y));
+        buffer(&mut app, 120, 30);
+        assert!(!copied("user-02@1.0.2"));
+        // The footer hint copies it too.
+        let buf = buffer(&mut app, 120, 30);
+        let (hx, hy) = find(&buf, "y copy selection");
+        click(&mut app, hx, hy);
+        assert!(copied("user-02@1.0.2"));
+        assert!(app.selection.is_none());
+        // Esc drops a selection without copying or quitting. (The log line about the copy
+        // moved the panel.)
+        let buf = buffer(&mut app, 120, 30);
+        let (x, y) = find(&buf, "user-02@1.0.2");
+        drag(&mut app, (x, y), (x + 6, y));
+        assert!(app.selection.is_some_and(|s| s.dragged));
+        buffer(&mut app, 120, 30);
+        app.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(app.selection.is_none() && !app.quit);
+        assert!(!copied("user-02"));
+    }
+    #[test]
+    fn a_click_without_a_drag_still_does_what_it_did() {
+        let mut app = app_with_packages(2);
+        app.copier = capture;
+        app.push_log("hello");
+        let buf = buffer(&mut app, 120, 30);
+        let (x, y) = find(&buf, "hello");
+        mouse(&mut app, MouseEventKind::Down(MouseButton::Left), x, y);
+        mouse(&mut app, MouseEventKind::Up(MouseButton::Left), x, y);
+        assert!(app.log_focus, "the log opened");
+        assert!(app.selection.is_none());
     }
 }

@@ -21,6 +21,42 @@ fn log_line(l: &str) -> Line<'static> {
     };
     Line::from(Span::styled(l.to_string(), Style::new().fg(color)))
 }
+/// Highlights the text the mouse is selecting and reads it off the screen for copying.
+fn draw_selection(f: &mut Frame, app: &mut App) {
+    app.selection_text.clear();
+    let Some(sel) = app.selection.filter(|s| s.dragged) else {
+        return;
+    };
+    // The panel may have moved or gone (a resize, the log closing), or a new log line moved
+    // the text under the highlight.
+    if !app.targets.selectable.contains(&sel.area) || sel.log_len != app.log.len() {
+        app.selection = None;
+        return;
+    }
+    let buf = f.buffer_mut();
+    let mut rows = Vec::new();
+    for y in sel.area.y..sel.area.y + sel.area.height {
+        let Some(cols) = sel.columns(y) else {
+            continue;
+        };
+        let mut row = String::new();
+        let mut skip = 0;
+        for x in cols {
+            let cell = &mut buf[(x, y)];
+            cell.modifier.insert(Modifier::REVERSED);
+            // A wide character covers the cell after it, which holds nothing of its own.
+            if skip > 0 {
+                skip -= 1;
+                continue;
+            }
+            let sym = cell.symbol();
+            skip = Span::raw(sym).width().saturating_sub(1);
+            row.push_str(sym);
+        }
+        rows.push(row.trim_end().to_string());
+    }
+    app.selection_text = rows.join("\n");
+}
 /// Columns the section content is indented relative to the section titles.
 const PAD: u16 = 2;
 fn pad(r: ratatui::layout::Rect) -> ratatui::layout::Rect {
@@ -263,6 +299,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
             format!("{info_title} · ? to hide")
         };
         let inner = panel(f, info_area, title, false);
+        app.targets.selectable.push(inner);
         let lines: Vec<Line> = if info_lines.is_empty() {
             vec![Line::from(Span::styled(
                 "nothing more to show for this item",
@@ -281,6 +318,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         (true, n) => format!("log (↑{n} older) · tab to close"),
     };
     let log_body = panel(f, log_area, title, focus == Focus::Log);
+    app.targets.selectable.push(log_body);
     let h = (log_body.height as usize).max(1);
     app.log_page = h;
     if app.log_focus {
@@ -300,6 +338,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         add_targets(help, footer_hits, &mut app.targets.keys);
         f.render_widget(Paragraph::new(footer), help);
     }
+    draw_selection(f, app);
     // A dialog has the keys: what's behind it is dimmed, so only the dialog stands out.
     if focus == Focus::Dialog {
         let area = f.area();
