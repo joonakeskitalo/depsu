@@ -506,6 +506,8 @@ pub struct Targets {
     pub keys: Vec<(Rect, Vec<KeyEvent>)>,
     /// Where the package list is drawn.
     pub list: Rect,
+    /// The box around the package list, with its border.
+    pub list_panel: Rect,
     /// The list items on screen: the row (inside `list`) each starts at, its height and its
     /// index in `view`.
     pub items: Vec<(u16, u16, usize)>,
@@ -2165,10 +2167,17 @@ impl App {
     /// mark. The wheel scrolls the list or the expanded log.
     pub fn on_mouse(&mut self, m: MouseEvent) {
         let focus = crate::tui::ui::focus(self);
+        let over_list = self.targets.list_panel.contains((m.column, m.row).into());
         match m.kind {
             MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
                 let up = m.kind == MouseEventKind::ScrollUp;
                 match focus {
+                    // The list stays visible next to the expanded log: the wheel scrolls
+                    // whichever the pointer is over.
+                    crate::tui::ui::Focus::Log if over_list => {
+                        self.cursor_moved = true;
+                        self.move_cursor(if up { -1 } else { 1 });
+                    }
                     crate::tui::ui::Focus::Log => {
                         let max = self.log.len().saturating_sub(1);
                         self.log_scroll = if up {
@@ -2188,13 +2197,18 @@ impl App {
             _ => {}
         }
     }
-    fn click(&mut self, x: u16, y: u16, focus: crate::tui::ui::Focus) {
+    fn click(&mut self, x: u16, y: u16, mut focus: crate::tui::ui::Focus) {
         let inside = |r: &Rect| x >= r.x && x < r.x + r.width && y >= r.y && y < r.y + r.height;
         if let Some((_, keys)) = self.targets.keys.iter().find(|(r, _)| inside(r)) {
             for key in keys.clone() {
                 self.on_key(key);
             }
             return;
+        }
+        // A click in the list, next to the expanded log, gives the list the keys back.
+        if focus == crate::tui::ui::Focus::Log && inside(&self.targets.list_panel) {
+            self.log_focus = false;
+            focus = crate::tui::ui::Focus::List;
         }
         if focus != crate::tui::ui::Focus::List || !inside(&self.targets.list) {
             return;
@@ -6504,11 +6518,11 @@ mod tests {
             modifiers: KeyModifiers::NONE,
         });
     }
-    fn wheel(app: &mut App, up: bool) {
+    fn wheel(app: &mut App, up: bool, at: (u16, u16)) {
         app.on_mouse(MouseEvent {
             kind: if up { MouseEventKind::ScrollUp } else { MouseEventKind::ScrollDown },
-            column: 5,
-            row: 5,
+            column: at.0,
+            row: at.1,
             modifiers: KeyModifiers::NONE,
         });
     }
@@ -6553,10 +6567,10 @@ mod tests {
         let mut app = app_with_packages(5);
         buffer(&mut app, 120, 30);
         app.table.select(Some(0));
-        wheel(&mut app, false);
-        wheel(&mut app, false);
+        wheel(&mut app, false, (5, 5));
+        wheel(&mut app, false, (5, 5));
         assert_eq!(app.table.selected(), Some(2));
-        wheel(&mut app, true);
+        wheel(&mut app, true, (5, 5));
         assert_eq!(app.table.selected(), Some(1));
     }
     #[test]
@@ -6597,11 +6611,40 @@ mod tests {
             app.push_log(format!("line {i}"));
         }
         app.log_focus = true;
-        buffer(&mut app, 120, 30);
-        wheel(&mut app, true);
+        let buf = buffer(&mut app, 120, 30);
+        let (x, y) = find(&buf, "line 49");
+        wheel(&mut app, true, (x, y));
         assert_eq!(app.log_scroll, App::WHEEL_LOG_LINES);
-        wheel(&mut app, false);
+        wheel(&mut app, false, (x, y));
         assert_eq!(app.log_scroll, 0);
+        // Over the list, the wheel moves its cursor and leaves the log alone.
+        app.table.select(Some(0));
+        buffer(&mut app, 120, 30);
+        wheel(&mut app, false, (5, 5));
+        assert_eq!(app.log_scroll, 0);
+        assert!(app.log_focus);
+    }
+    #[test]
+    fn the_log_is_boxed_and_the_list_stays_visible_beside_it() {
+        let mut app = app_with_packages(5);
+        app.push_log("hello");
+        app.log_focus = true;
+        let buf = buffer(&mut app, 120, 30);
+        let (_, list_y) = find(&buf, " packages ");
+        let (_, log_y) = find(&buf, " log ");
+        let (_, row_y) = find(&buf, "p01");
+        assert!(list_y < row_y && row_y < log_y, "the packages are above the log");
+        // A click on a package gives the keys back to the list and selects it.
+        let (x, y) = find(&buf, "p03");
+        click(&mut app, x, y);
+        assert!(!app.log_focus);
+        let Some(Item::Row { idx, .. }) = app.cursor_item() else { panic!("not on a package") };
+        assert_eq!(app.rows[*idx].name, "p03");
+        // A click on the log takes them again.
+        let buf = buffer(&mut app, 120, 30);
+        let (x, y) = find(&buf, "hello");
+        click(&mut app, x, y);
+        assert!(app.log_focus);
     }
     #[test]
     fn a_click_behind_a_dialog_does_nothing() {

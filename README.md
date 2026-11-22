@@ -96,7 +96,7 @@ The part of the screen that takes the keys has a cyan border: the package list, 
 ### Mouse
 - Click an item in the list to move the cursor to it. Click the mark (`○`, `●`) in front of a package or group to check it.
 - Click a key hint in the footer to press that key. Click a header item (`group: …`, `vulns hidden`, `overrides: …`, a scan result) to run its key. Click the `selected:` heading to toggle the details panel.
-- Click the log at the bottom to expand it, and the `tab or esc back to list` hint to close it.
+- Click the log at the bottom to expand it. The list stays visible above it: click a package to give the keys back to the list, click the log to return to it. The wheel scrolls whichever the pointer is over.
 - In dialogs, click the footer hints, a peer fix option or an `Add as` choice.
 - The wheel moves the cursor in the list and scrolls the expanded log.
 - depsu captures the mouse, so hold Shift (Option in some terminals) to select text.

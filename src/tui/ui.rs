@@ -21,54 +21,6 @@ fn log_line(l: &str) -> Line<'static> {
     };
     Line::from(Span::styled(l.to_string(), Style::new().fg(color)))
 }
-/// The expanded, scrollable log that replaces the package list.
-fn draw_log(f: &mut Frame, app: &mut App) {
-    let hint = |t: &str, key: Option<KeyCode>| (vec![t.to_string().dark_gray()], key.map(plain));
-    let (footer, footer_hits) = wrap_atoms(
-        Vec::new(),
-        vec![
-            hint("↑/↓ scroll", None),
-            hint(", . page", None),
-            hint("Home/End oldest/newest", None),
-            hint("tab or esc back to list", Some(KeyCode::Tab)),
-            hint("q quit", Some(KeyCode::Char('q'))),
-        ],
-        "   ",
-        inner_width(f),
-    );
-    // The header's keys would scroll the log, so only the footer reacts to the mouse.
-    let (header_lines, _) = header_lines(app, f.area().width);
-    let [header, log_area, keys_rule, help] = Layout::vertical([
-        Constraint::Length(header_lines.len() as u16),
-        Constraint::Min(5),
-        Constraint::Length(1),
-        Constraint::Length(footer.len() as u16),
-    ])
-    .areas(f.area());
-    let help = pad(help);
-    add_targets(help, footer_hits, &mut app.targets.keys);
-    let title = if app.log_scroll > 0 {
-        format!("log (↑{} older)", app.log_scroll)
-    } else {
-        "log".to_string()
-    };
-    f.render_widget(Paragraph::new(header_lines), header);
-    let body = panel(f, log_area, title, true);
-    let h = (body.height as usize).max(1);
-    app.log_page = h;
-    app.log_scroll = app.log_scroll.min(app.log.len().saturating_sub(h));
-    let end = app.log.len() - app.log_scroll;
-    let start = end.saturating_sub(h);
-    let lines: Vec<Line> = app.log[start..end].iter().map(|l| log_line(l)).collect();
-    f.render_widget(Paragraph::new(lines), body);
-    f.render_widget(
-        Block::default()
-            .borders(Borders::TOP)
-            .border_style(Style::new().fg(Color::DarkGray)),
-        keys_rule,
-    );
-    f.render_widget(Paragraph::new(footer), help);
-}
 /// Columns the section content is indented relative to the section titles.
 const PAD: u16 = 2;
 fn pad(r: ratatui::layout::Rect) -> ratatui::layout::Rect {
@@ -175,9 +127,6 @@ fn panel_width(f: &Frame) -> u16 {
 pub fn draw(f: &mut Frame, app: &mut App) {
     let log_h = (app.log.len() as u16).clamp(1, 5);
     app.targets = Default::default();
-    if app.log_focus {
-        return draw_log(f, app);
-    }
     let focus = focus(app);
     let footer_boxed = focus == Focus::Footer;
     let (footer, footer_hits) = footer_lines(
@@ -185,14 +134,16 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         if footer_boxed { panel_width(f) } else { inner_width(f) },
     );
     let (header_lines, header_hits) = header_lines(app, f.area().width);
-    let used_by_lines = if app.show_info {
+    // The details panel makes room for the expanded log.
+    let info = app.show_info && !app.log_focus;
+    let used_by_lines = if info {
         let mut lines = used_by_lines(app, inner_width(f));
         lines.extend(peer_lines(app, inner_width(f)));
         lines
     } else {
         Vec::new()
     };
-    let summary_h = if app.show_info {
+    let summary_h = if info {
         SUMMARY_LINES
     } else {
         0
@@ -200,20 +151,27 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     // The package list and a footer prompt are boxed; the border and the title take the rows
     // the heading took.
     let footer_h = footer.len() as u16 + if footer_boxed { 2 } else { 1 };
-    let [header, list_area, info_rule, used_by, summary, log_rule, log, keys_area] =
+    // The log is boxed like the list. Expanded, it takes 7/8 of the room, and the list keeps
+    // the rest so both can be clicked.
+    let collapsed_h = log_h + 2;
+    let log_box_h = if app.log_focus {
+        let room = f.area().height.saturating_sub(header_lines.len() as u16 + footer_h);
+        (room * 7 / 8).clamp(collapsed_h, room.saturating_sub(7).max(collapsed_h))
+    } else {
+        collapsed_h
+    };
+    let [header, list_area, info_rule, used_by, summary, log_area, keys_area] =
         Layout::vertical([
             Constraint::Length(header_lines.len() as u16),
             Constraint::Min(5),
-            Constraint::Length(if app.show_info { 2 } else { 0 }),
-            Constraint::Length(if app.show_info { used_by_lines.len().max(1) as u16 } else { 0 }),
+            Constraint::Length(if info { 2 } else { 0 }),
+            Constraint::Length(if info { used_by_lines.len().max(1) as u16 } else { 0 }),
             Constraint::Length(summary_h),
-            Constraint::Length(2),
-            Constraint::Length(log_h),
+            Constraint::Length(log_box_h),
             Constraint::Length(footer_h),
         ])
         .areas(f.area());
-
-    let (used_by, summary, log) = (pad(used_by), pad(summary), pad(log));
+    let (used_by, summary) = (pad(used_by), pad(summary));
     f.render_widget(Paragraph::new(header_lines), header);
     // Part of the screen outside the list reacts to the mouse only while the list has the keys:
     // the keys a click stands for would go to a prompt otherwise.
@@ -221,14 +179,14 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     if clickable {
         add_targets(header, header_hits, &mut app.targets.keys);
         let full = f.area().width;
-        if app.show_info {
+        if info {
             let r = Rect { width: full, ..info_rule };
             app.targets.keys.push((r, vec![plain(KeyCode::Char('?'))]));
         }
         // The log: a click opens it.
-        let r = Rect { x: log_rule.x, y: log_rule.y, width: full, height: log_rule.height + log.height };
-        app.targets.keys.push((r, vec![plain(KeyCode::Tab)]));
+        app.targets.keys.push((log_area, vec![plain(KeyCode::Tab)]));
     }
+    app.targets.list_panel = list_area;
     let body = panel(f, list_area, "packages", focus == Focus::List);
 
     let grouped = app.group_by != GroupBy::None;
@@ -283,7 +241,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         Some(Item::Removed { name }) => format!("selected: {name}"),
         _ => "selected".to_string(),
     };
-    if app.show_info {
+    if info {
         heading(f, info_rule, info_title);
         f.render_widget(Paragraph::new(used_by_lines), used_by);
     }
@@ -294,16 +252,22 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         );
     }
 
-    let lines: Vec<Line> = app
-        .log
-        .iter()
-        .rev()
-        .take(log_h as usize)
-        .rev()
-        .map(|l| log_line(l))
-        .collect();
-    heading(f, log_rule, "log");
-    f.render_widget(Paragraph::new(lines), log);
+    let title = if app.log_focus && app.log_scroll > 0 {
+        format!("log (↑{} older)", app.log_scroll)
+    } else {
+        "log".to_string()
+    };
+    let log_body = panel(f, log_area, title, focus == Focus::Log);
+    let h = (log_body.height as usize).max(1);
+    app.log_page = h;
+    if app.log_focus {
+        app.log_scroll = app.log_scroll.min(app.log.len().saturating_sub(h));
+    }
+    let scroll = if app.log_focus { app.log_scroll } else { 0 };
+    let end = app.log.len() - scroll;
+    let start = end.saturating_sub(h);
+    let lines: Vec<Line> = app.log[start..end].iter().map(|l| log_line(l)).collect();
+    f.render_widget(Paragraph::new(lines), log_body);
     if footer_boxed {
         let inner = panel(f, keys_area, "", true);
         add_targets(inner, footer_hits, &mut app.targets.keys);
@@ -1293,6 +1257,21 @@ fn add_targets(area: Rect, placed: Vec<Placed>, out: &mut Vec<(Rect, Vec<KeyEven
 }
 fn footer_lines(app: &App, width: u16) -> (Vec<Line<'static>>, Vec<Placed>) {
     let hint = |t: &str| vec![t.to_string().dark_gray()];
+    if app.log_focus {
+        let hint = |t: &str, key: Option<KeyCode>| (vec![t.to_string().dark_gray()], key.map(plain));
+        return wrap_atoms(
+            Vec::new(),
+            vec![
+                hint("↑/↓ scroll", None),
+                hint(", . page", None),
+                hint("Home/End oldest/newest", None),
+                hint("tab or esc back to list", Some(KeyCode::Tab)),
+                hint("q quit", Some(KeyCode::Char('q'))),
+            ],
+            "   ",
+            width,
+        );
+    }
     if app.input.is_some() {
         return wrap_keys(
             vec!["Add a package:".cyan().bold()],
