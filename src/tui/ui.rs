@@ -154,7 +154,8 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     };
     // The package list and a footer prompt are boxed; the border and the title take the rows
     // the heading took.
-    let footer_h = footer.len() as u16 + if footer_boxed { 2 } else { 1 };
+    // A footer prompt is boxed. The hints sit right under the log's box, with no rule.
+    let footer_h = footer.len() as u16 + if footer_boxed { 2 } else { 0 };
     // The log is boxed like the list. Expanded, it takes 7/8 of the room, and the list keeps
     // the rest so both can be clicked.
     let collapsed_h = log_h + 2;
@@ -283,16 +284,9 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         add_targets(inner, footer_hits, &mut app.targets.keys);
         f.render_widget(Paragraph::new(footer), inner);
     } else {
-        let [rule, help] =
-            Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).areas(keys_area);
-        f.render_widget(
-            Block::default()
-                .borders(Borders::TOP)
-                .border_style(Style::new().fg(Color::DarkGray)),
-            rule,
-        );
-        add_targets(pad(help), footer_hits, &mut app.targets.keys);
-        f.render_widget(Paragraph::new(footer), pad(help));
+        let help = pad(keys_area);
+        add_targets(help, footer_hits, &mut app.targets.keys);
+        f.render_widget(Paragraph::new(footer), help);
     }
     // A dialog has the keys: what's behind it is dimmed, so only the dialog stands out.
     if focus == Focus::Dialog {
