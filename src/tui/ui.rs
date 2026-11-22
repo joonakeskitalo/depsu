@@ -132,11 +132,11 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     let footer_w = if footer_boxed { panel_width(f) } else { inner_width(f) };
     // The item hints change with the cursor. Their section keeps the tallest height it has had
     // at this width, so the screen does not change size as the cursor moves.
-    if app.item_rows.0 != footer_w {
-        app.item_rows = (footer_w, 1);
+    if app.item_rows.footer_w != footer_w {
+        app.item_rows = crate::tui::app::ItemSection { footer_w, rows: 1 };
     }
-    let (footer, footer_hits, item_rows) = footer_lines(app, footer_w, app.item_rows.1);
-    app.item_rows.1 = app.item_rows.1.max(item_rows);
+    let (footer, footer_hits, used) = footer_lines(app, footer_w, app.item_rows);
+    app.item_rows.rows = app.item_rows.rows.max(used.rows);
     let (header_lines, header_hits) = header_lines(app, f.area().width);
     // The details panel makes room for the expanded log.
     let info = app.show_info && !app.log_focus;
@@ -1266,10 +1266,15 @@ fn add_targets(area: Rect, placed: Vec<Placed>, out: &mut Vec<(Rect, Vec<KeyEven
     }
 }
 /// The footer, the clicks of its hints, and how many lines the item hints took. The item hints
-/// are padded to `item_rows` lines.
-fn footer_lines(app: &App, width: u16, item_rows: usize) -> (Vec<Line<'static>>, Vec<Placed>, usize) {
+/// are given at least the size in `section`.
+fn footer_lines(
+    app: &App,
+    width: u16,
+    section: crate::tui::app::ItemSection,
+) -> (Vec<Line<'static>>, Vec<Placed>, crate::tui::app::ItemSection) {
+    let unused = crate::tui::app::ItemSection { footer_w: width, rows: 0 };
+    let prompt = |(l, p): (Vec<Line<'static>>, Vec<Placed>)| (l, p, unused);
     let hint = |t: &str| vec![t.to_string().dark_gray()];
-    let prompt = |(l, p): (Vec<Line<'static>>, Vec<Placed>)| (l, p, 0);
     if app.log_focus {
         let hint = |t: &str, key: Option<KeyCode>| (vec![t.to_string().dark_gray()], key.map(plain));
         return prompt(wrap_atoms(
@@ -1391,34 +1396,73 @@ fn footer_lines(app: &App, width: u16, item_rows: usize) -> (Vec<Line<'static>>,
         }));
         lines.extend(l);
     };
-    let (mut item_lines, item_hits) = if item.is_empty() {
-        (vec![Line::from(vec![Span::raw(" "), "item:".dark_gray()])], Vec::new())
+    // The item hints and the scan hints sit side by side. The item hints get a column of a
+    // fixed width, so the scan hints stay put as the cursor moves.
+    let keyed = |h: &String| {
+        let atom = hint(h);
+        let key = hint_key(&atom);
+        (atom, key)
+    };
+    let label = |t: &str, on: bool| -> Span<'static> {
+        if on { t.to_string().cyan().bold() } else { t.to_string().dark_gray() }
+    };
+    const SEP: &str = "   ";
+    let one_line = |prefix: &str, atoms: &[String]| -> u16 {
+        // Leading space, the prefix, then each hint after a separator.
+        (1 + prefix.chars().count() + atoms.iter().map(|h| SEP.len() + h.chars().count()).sum::<usize>())
+            as u16
+    };
+    // The scan hints get a column at the right as wide as their longest set (with the `v`
+    // toggle, reading "hidden"); the item hints get the rest. Neither depends on the cursor.
+    let mut widest_scan = scan.clone();
+    widest_scan.retain(|h| !h.starts_with("v "));
+    widest_scan.push("v vulns: hidden".to_string());
+    let scan_w = one_line("scan:", &widest_scan);
+    let item_w = width.saturating_sub(scan_w).max(width / 2);
+    let (mut item_lines, item_hits) = wrap_atoms(
+        vec![label("item:", !item.is_empty())],
+        item.iter().map(keyed).collect(),
+        SEP,
+        item_w,
+    );
+    let item_used = item_lines.len();
+    let (scan_lines, scan_hits) = if scan.is_empty() {
+        (Vec::new(), Vec::new())
     } else {
-        wrap_keys(
-            vec!["item:".cyan().bold()],
-            item.iter().map(|h| hint(h)).collect(),
-            "   ",
-            width,
+        wrap_atoms(
+            vec![label("scan:", true)],
+            scan.iter().map(keyed).collect(),
+            SEP,
+            width.saturating_sub(item_w),
         )
     };
-    let item_used = item_lines.len();
-    item_lines.resize(item_used.max(item_rows), Line::default());
-    add((item_lines, item_hits));
-    if !scan.is_empty() {
-        add(wrap_keys(
-            vec!["scan:".cyan().bold()],
-            scan.iter().map(|h| hint(h)).collect(),
-            "   ",
-            width,
-        ));
+    let scan_rows = scan_lines.len();
+    let rows = item_used.max(scan_rows).max(section.rows);
+    item_lines.resize(rows, Line::default());
+    for (i, line) in item_lines.iter_mut().enumerate() {
+        let w = line.width() as u16;
+        if let Some(s) = scan_lines.get(i) {
+            line.spans.push(Span::raw(" ".repeat(item_w.saturating_sub(w) as usize)));
+            line.spans.extend(s.spans.iter().cloned());
+        }
     }
+    let mut hits = item_hits;
+    hits.extend(scan_hits.into_iter().map(|mut p| {
+        p.x += item_w;
+        p
+    }));
+    add((item_lines, hits));
     add(wrap_keys(
         prefix,
         global.iter().map(|h| hint(h)).collect(),
         "   ",
         width,
     ));
-    (lines, placed, item_used)
+    (
+        lines,
+        placed,
+        crate::tui::app::ItemSection { footer_w: width, rows: item_used.max(scan_rows) },
+    )
 }
 
 fn removed_line(app: &App, name: &str) -> Line<'static> {

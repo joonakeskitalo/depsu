@@ -499,6 +499,15 @@ pub struct Scan {
     report: Option<Report>,
 }
 
+/// The lines the footer's item hints are given, so the footer does not change height as the
+/// cursor moves. It grows to the most the hints have needed and is reset when the footer's
+/// width changes.
+#[derive(Default, Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ItemSection {
+    /// The footer width this was measured at.
+    pub footer_w: u16,
+    pub rows: usize,
+}
 /// Parts of the screen the mouse reacts to, set by the renderer on every frame.
 #[derive(Default)]
 pub struct Targets {
@@ -571,7 +580,7 @@ pub struct App {
     pub list_page: usize,
     /// The footer's width and the most lines its item hints have taken at it, set by the
     /// renderer so the footer keeps its height as the cursor moves.
-    pub item_rows: (u16, usize),
+    pub item_rows: ItemSection,
     /// What the mouse can click, set by the renderer.
     pub targets: Targets,
     /// Latest versions and findings per package version. Always kept in memory; written to
@@ -749,7 +758,7 @@ impl App {
             log_page: 10,
             list_page: 10,
             targets: Targets::default(),
-            item_rows: (0, 1),
+            item_rows: ItemSection::default(),
             cache: Cache::default(),
             cache_path: None,
             cache_dirty: false,
@@ -6716,5 +6725,43 @@ mod tests {
         }
         let settled = &seen[app.view.len()..];
         assert!(settled.windows(2).all(|w| w[0] == w[1]), "{seen:?}");
+    }
+    #[test]
+    fn scan_hints_share_the_item_row_and_stay_clickable() {
+        let mut app = app_with_packages(3);
+        let buf = buffer(&mut app, 110, 16);
+        let (ix, iy) = find(&buf, "item:");
+        let (sx, sy) = find(&buf, "s snyk");
+        assert_eq!(iy, sy, "one row");
+        assert!(sx > ix);
+        click(&mut app, sx, sy);
+        assert!(!matches!(app.snyk.status, ScanStatus::NotRun), "the click started a scan");
+    }
+    #[test]
+    fn the_scan_hints_keep_their_column_as_the_cursor_moves() {
+        for w in [120, 90, 60] {
+            let mut app = app_with_three_findings();
+            app.table.select(Some(0));
+            let mut seen = Vec::new();
+            for _ in 0..app.view.len() * 2 {
+                let buf = buffer(&mut app, w, 30);
+                seen.push(find(&buf, "scan:"));
+                app.on_key(key('j'));
+                if app.table.selected() == Some(app.view.len() - 1) {
+                    app.table.select(Some(0));
+                }
+            }
+            assert!(seen.windows(2).all(|p| p[0] == p[1]), "width {w}: {seen:?}");
+            // The column does not depend on the item hints at all: a package with more of
+            // them (`f fix unmet peers`) and one without findings put it in the same place.
+            let mut peers = app_with_peers();
+            let mut cols = vec![seen[0].0];
+            for _ in 0..peers.view.len() {
+                cols.push(find(&buffer(&mut peers, w, 30), "scan:").0);
+                peers.on_key(key('j'));
+            }
+            cols.push(find(&buffer(&mut app_with_packages(2), w, 30), "scan:").0);
+            assert!(cols.windows(2).all(|p| p[0] == p[1]), "width {w}: {cols:?}");
+        }
     }
 }
