@@ -87,13 +87,17 @@ depsu --cache .depsu-cache.json   # remember versions and scans between runs
 | `n` | Run `npm audit` / `bun audit` (whichever the project uses) |
 | `v` | Show / hide vulnerability findings |
 | `R` | Fetch the latest versions again, ignoring the cache |
-| `?` | Show / hide the details panel for the highlighted package: installed packages that use it, its peer dependencies with the versions installed, and its override summary. A package with an installed peer outside the range it declares is flagged in the list with `⚠ unmet peer: react ^18.0.0 (has 19.0.0)` |
+| `?` | Show / hide the details panel for the highlighted package: whether it is deprecated, its install scripts, installed version, size and file count, engines and platform (`os`, `cpu`, `libc`), the lockfile's integrity checksum, its dependencies and how they changed since the last commit, installed packages that use it, its peer dependencies with the versions installed, and its override summary. A package with an installed peer outside the range it declares is flagged in the list with `⚠ unmet peer: react ^18.0.0 (has 19.0.0)` |
 | `Shift+↑` / `Shift+↓` | Scroll the details panel. It keeps the same height for every package; its title shows which lines are in view when there are more |
 | `q` / `Esc` | Quit (press twice while an install is running) |
 
 The part of the screen that takes the keys has a cyan border: the package list, a prompt typed in the footer (filter, version, pin type), the expanded log, or a dialog. While a dialog is open, everything behind it is dimmed.
 
 `a` and `i` act only on the packages currently shown, so a filter narrows what they touch.
+The details come from disk only, nothing is downloaded. The installed copy in `node_modules` is read
+first, and the lockfile (`package-lock.json` or `pnpm-lock.yaml`) fills in the rest and gives the
+deprecation message and the checksum. Dependency changes compare with the lockfile in `HEAD`
+(`git show`). The size is that of the installed copy, its own `node_modules` left out.
 ### Mouse
 - Click an item in the list to move the cursor to it. Click the mark (`○`, `●`) in front of a package or group to check it.
 - Click a key hint in the footer to press that key. Click a header item (`group: …`, `vulns hidden`, `overrides: …`, a scan result) to run its key. Click the `selected:` heading to toggle the details panel.

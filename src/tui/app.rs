@@ -37,6 +37,13 @@ pub enum Event {
     Unneeded(Vec<(String, Unneeded)>),
     /// Installed packages that depend on each package, by name.
     Dependents(HashMap<String, Vec<Dependent>>),
+    /// What `node_modules` and the lockfile say about a package (`generation` tells answers
+    /// from before an install apart).
+    Info {
+        name: String,
+        generation: u64,
+        info: crate::deps::info::Info,
+    },
     Scan {
         source: Source,
         result: Result<Report, String>,
@@ -87,6 +94,15 @@ pub enum Event {
     },
 }
 
+/// Messages for the thread that reads package details.
+enum InfoMsg {
+    /// Read this one next: it is under the cursor.
+    Get { name: String, generation: u64 },
+    /// Read these when nothing more urgent is waiting.
+    Prefetch { names: Vec<String>, generation: u64 },
+    /// `node_modules`, the lockfile or HEAD changed: what was read before `generation` is stale.
+    Reset { generation: u64 },
+}
 /// Messages for the dependency tree analysis thread.
 enum TreeMsg {
     Analyze(String),
@@ -627,6 +643,16 @@ pub struct App {
     /// False until the first key press: the cursor then stays at the top of the package list.
     cursor_moved: bool,
     tree_tx: Option<Sender<TreeMsg>>,
+    /// Asks the thread that reads package details from disk.
+    info_tx: Sender<InfoMsg>,
+    /// Package details read so far, by name, with the generation they were read in. When
+    /// `node_modules` or HEAD changes they are read again, and the old ones are shown until
+    /// the new ones arrive, so the panel doesn't blank out and refill.
+    pub info: HashMap<String, (u64, crate::deps::info::Info)>,
+    /// Details asked for in this generation and not answered yet.
+    info_pending: HashSet<String>,
+    /// Bumped when the details read so far go stale.
+    info_generation: u64,
     events_tx: Sender<Event>,
     /// Target version of each package being installed.
     install_targets: HashMap<String, Version>,
@@ -718,6 +744,13 @@ impl App {
         };
 
         let events_tx = tx.clone();
+        // Package details are read off the drawing thread: sizing a big package walks
+        // thousands of files.
+        let (info_tx, info_rx) = mpsc::channel::<InfoMsg>();
+        {
+            let (dir, tx) = (dir.clone(), tx.clone());
+            thread::spawn(move || info_worker(dir, info_rx, tx));
+        }
         // One install worker: package managers don't tolerate parallel installs.
         let worker_dir = dir.clone();
         thread::spawn(move || install_worker(worker_dir, pm, job_rx, tx));
@@ -794,6 +827,10 @@ impl App {
             changed: HashSet::new(),
             cursor_moved: false,
             tree_tx,
+            info_tx,
+            info: HashMap::new(),
+            info_pending: HashSet::new(),
+            info_generation: 0,
             events_tx,
             install_targets: HashMap::new(),
             confirm_conflicts: None,
@@ -814,6 +851,7 @@ impl App {
         }
         app.apply_cached_scans();
         app.begin_fetch(names.into_iter().collect(), true);
+        app.prefetch_info();
         app
     }
 
@@ -1147,6 +1185,37 @@ impl App {
         git_branch(&self.dir)
     }
 
+    /// The details of the package under the cursor, asking for them when they haven't been
+    /// read yet. `None` until they arrive, or when the cursor is not on a package.
+    pub fn cursor_info(&mut self) -> Option<&crate::deps::info::Info> {
+        let Some(Item::Row { idx, .. }) = self.cursor_item() else {
+            return None;
+        };
+        let name = self.rows[*idx].name.clone();
+        let generation = self.info_generation;
+        let fresh = self.info.get(&name).is_some_and(|(g, _)| *g == generation);
+        if !fresh && self.info_pending.insert(name.clone()) {
+            let _ = self.info_tx.send(InfoMsg::Get { name: name.clone(), generation });
+        }
+        self.info.get(&name).map(|(_, i)| i)
+    }
+    /// Has the details of every package read in the background, so they are there by the
+    /// time the cursor gets to them.
+    fn prefetch_info(&mut self) {
+        let generation = self.info_generation;
+        let mut names: Vec<String> = self.current.keys().cloned().collect();
+        names.sort();
+        names.retain(|n| self.info_pending.insert(n.clone()));
+        let _ = self.info_tx.send(InfoMsg::Prefetch { names, generation });
+    }
+    /// `node_modules`, the lockfile or HEAD changed: reads the details again. The old ones
+    /// stay on screen until the new ones replace them.
+    fn forget_info(&mut self) {
+        self.info_pending.clear();
+        self.info_generation += 1;
+        let _ = self.info_tx.send(InfoMsg::Reset { generation: self.info_generation });
+        self.prefetch_info();
+    }
     pub fn push_log(&mut self, msg: impl Into<String>) {
         self.log.push(msg.into());
         if self.log.len() > 200 {
@@ -1177,6 +1246,15 @@ impl App {
                 }
                 Event::Tree { name, hits } => self.on_tree(name, hits),
                 Event::Dependents(map) => self.dependents = map,
+                Event::Info { name, generation, info } => {
+                    if generation == self.info_generation {
+                        self.info_pending.remove(&name);
+                    }
+                    // An older answer never replaces a newer one.
+                    if self.info.get(&name).is_none_or(|(g, _)| *g <= generation) {
+                        self.info.insert(name, (generation, info));
+                    }
+                }
                 Event::Scan { source, result } => self.on_scan(source, result),
                 Event::Unneeded(found) => {
                     self.unneeded = found.into_iter().collect();
@@ -1487,6 +1565,8 @@ impl App {
     /// `node_modules`. Called after every install, since updating a package changes what its
     /// dependents ask for, which overrides still matter and which overrides apply where.
     fn reload_project(&mut self) {
+        // An install or uninstall changed node_modules and the lockfile.
+        self.forget_info();
         let manifest = match package::read_manifest(&self.dir.join("package.json")) {
             Ok(m) => m,
             Err(e) => {
@@ -2541,6 +2621,8 @@ impl App {
             Ok(hash) => {
                 if let Some(p) = self.commit_prompt.take() {
                     self.push_log(format!("✔ committed {hash}: {}", p.title.text().trim()));
+                    // Dependency changes are counted from the last commit.
+                    self.forget_info();
                     // Committed fixes aren't listed again in the next commit.
                     self.session_fixes.retain(|f| !p.plan.fixes.contains(f));
                 }
@@ -4144,6 +4226,50 @@ fn anchor_of(item: &Item) -> (u8, String) {
     }
 }
 
+/// Reads package details off the drawing thread (sizing a big package walks thousands of
+/// files). The package under the cursor goes first; the rest are read ahead in the background.
+fn info_worker(dir: PathBuf, rx: Receiver<InfoMsg>, tx: Sender<Event>) {
+    let mut reader = crate::deps::info::Reader::new(dir);
+    let mut queue: VecDeque<(String, u64)> = VecDeque::new();
+    let mut done: HashSet<String> = HashSet::new();
+    let mut generation = 0;
+    loop {
+        // Every waiting message is taken in before the next package is read, so a cursor move
+        // jumps the queue.
+        let msg = if queue.is_empty() {
+            match rx.recv() {
+                Ok(m) => Some(m),
+                Err(_) => return,
+            }
+        } else {
+            rx.try_recv().ok()
+        };
+        match msg {
+            Some(InfoMsg::Reset { generation: g }) => {
+                reader.reset();
+                generation = g;
+                done.clear();
+                queue.clear();
+            }
+            Some(InfoMsg::Get { name, generation: g }) => queue.push_front((name, g)),
+            Some(InfoMsg::Prefetch { names, generation: g }) => {
+                queue.extend(names.into_iter().map(|n| (n, g)))
+            }
+            None => {
+                let Some((name, g)) = queue.pop_front() else {
+                    continue;
+                };
+                if g != generation || !done.insert(name.clone()) {
+                    continue;
+                }
+                let info = reader.info(&name);
+                if tx.send(Event::Info { name, generation, info }).is_err() {
+                    return;
+                }
+            }
+        }
+    }
+}
 fn install_worker(dir: PathBuf, pm: Pm, jobs: Receiver<Job>, tx: Sender<Event>) {
     while let Ok(job) = jobs.recv() {
         let names: Vec<String> = job
@@ -6834,7 +6960,7 @@ mod tests {
         cursor_to_name(&mut app, "p01");
         let buf = buffer(&mut app, 100, 40);
         let (x, y) = find(&buf, " selected: p01 · 1–6 of ");
-        assert!(find_row(&buf, y + 1, "used by 40"), "the panel starts with the first line");
+        assert!(!find_row(&buf, y + 1, "user-"), "the panel starts at the top");
         // The wheel over the panel scrolls it; the list's cursor stays.
         let at = app.table.selected();
         for _ in 0..3 {
@@ -6870,5 +6996,55 @@ mod tests {
     fn find_row(buf: &ratatui::buffer::Buffer, y: u16, needle: &str) -> bool {
         let row: String = (0..buf.area.width).map(|x| buf[(x, y)].symbol().to_string()).collect();
         row.contains(needle)
+    }
+    #[test]
+    fn the_details_panel_shows_what_node_modules_and_the_lockfile_say() {
+        let mut app = app_with_installed("2.0.0", &[], |_| {});
+        let dir = app.dir.clone();
+        let a = dir.join("node_modules/a");
+        std::fs::create_dir_all(&a).unwrap();
+        std::fs::write(
+            a.join("package.json"),
+            r#"{"name":"a","version":"1.0.0","scripts":{"postinstall":"node setup.js"},
+                "engines":{"node":">=18"},"os":["darwin"],"dependencies":{"x":"^1.0.0"}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("package-lock.json"),
+            r#"{"lockfileVersion":3,"packages":{"node_modules/a":{"version":"1.0.0",
+                "integrity":"sha512-0123456789abcdefXYZ","deprecated":"use b"}}}"#,
+        )
+        .unwrap();
+        // The files were written after the start: read again, as after an install.
+        app.forget_info();
+        app.show_info = true;
+        cursor_to_name(&mut app, "a");
+        buffer(&mut app, 140, 40);
+        wait_until(&mut app, |app| app.info.get("a").is_some_and(|(_, i)| i.deprecated.is_some()));
+        assert!(app.info.contains_key("b"), "read ahead, before the cursor got there");
+        let screen = render(&mut app, 140, 40).join("\n");
+        for want in [
+            "⚠ deprecated: use b",
+            "⚠ install scripts: postinstall: node setup.js",
+            "installed 1.0.0 · ",
+            "engines: node >=18 · platform: os darwin",
+            "integrity: sha512-0123456789ab… (package-lock.json)",
+            "1 dependency: x ^1.0.0",
+        ] {
+            assert!(screen.contains(want), "{want:?} missing in\n{screen}");
+        }
+        // An install changes node_modules: the details are read again, and the old ones are
+        // shown until then.
+        app.reload_project();
+        let before = render(&mut app, 140, 40).join("\n");
+        assert!(before.contains("⚠ deprecated: use b"), "no blank panel while re-reading");
+        std::fs::write(
+            dir.join("package-lock.json"),
+            r#"{"lockfileVersion":3,"packages":{"node_modules/a":{"version":"1.0.0",
+                "integrity":"sha512-0123456789abcdefXYZ"}}}"#,
+        )
+        .unwrap();
+        app.reload_project();
+        wait_until(&mut app, |app| app.info.get("a").is_some_and(|(_, i)| i.deprecated.is_none()));
     }
 }

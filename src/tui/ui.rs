@@ -125,7 +125,14 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     let info = app.show_info && !app.log_focus;
     // Everything about the item under the cursor, in full: the panel scrolls.
     let info_lines = if info {
-        let mut lines = used_by_lines(app, panel_width(f));
+        let on_package = matches!(app.cursor_item(), Some(Item::Row { .. }));
+        let details = app.cursor_info().cloned();
+        let mut lines = if on_package {
+            package_lines(details.as_ref(), panel_width(f) as usize)
+        } else {
+            Vec::new()
+        };
+        lines.extend(used_by_lines(app, panel_width(f)));
         lines.extend(peer_lines(app, panel_width(f)));
         lines.extend(summary_lines(app, panel_width(f) as usize));
         // The box pads its contents already: drop the space the wrappers start lines with.
@@ -2073,6 +2080,119 @@ fn summary_lines(app: &App, width: usize) -> Vec<Line<'static>> {
     lines
 }
 
+/// For the package under the cursor: what its installed copy and the lockfile say about it.
+/// `None` while it is being read.
+fn package_lines(info: Option<&crate::deps::info::Info>, width: usize) -> Vec<Line<'static>> {
+    use crate::deps::info::{InstallScripts, human_size};
+    let dim = Style::new().fg(Color::DarkGray);
+    let (cyan, yellow, red) = (
+        Style::new().fg(Color::Cyan),
+        Style::new().fg(Color::Yellow),
+        Style::new().fg(Color::Red).add_modifier(Modifier::BOLD),
+    );
+    let Some(i) = info else {
+        // The rows the details will take, so the rest of the panel doesn't move when they
+        // arrive.
+        return ["install scripts …", "installed …", "engines … · platform …", "integrity …", "dependencies …"]
+            .iter()
+            .map(|t| Line::from(Span::styled(t.to_string(), dim)))
+            .collect();
+    };
+    let mut lines = Vec::new();
+    let mut add = |spans: Vec<Span<'static>>| {
+        lines.extend(wrap(Span::raw(""), Span::raw("  "), spans, width));
+    };
+    if let Some(msg) = &i.deprecated {
+        add(vec![Span::styled("⚠ deprecated: ", red), Span::styled(msg.clone(), red)]);
+    }
+    match &i.install {
+        InstallScripts::Some(scripts) if scripts.is_empty() => add(vec![Span::styled(
+            format!("⚠ runs install scripts (says {})", i.lockfile.unwrap_or("the lockfile")),
+            yellow,
+        )]),
+        InstallScripts::Some(scripts) => {
+            let list: Vec<String> = scripts.iter().map(|(s, c)| format!("{s}: {c}")).collect();
+            add(vec![
+                Span::styled("⚠ install scripts: ", yellow),
+                Span::styled(list.join(", "), yellow),
+            ]);
+        }
+        InstallScripts::None => add(vec![Span::styled("no install scripts", dim)]),
+        InstallScripts::Unknown => add(vec![Span::styled("not installed: nothing to read", dim)]),
+    }
+    // What it is: version, size, files.
+    let mut what = Vec::new();
+    if let Some(v) = &i.version {
+        what.push(format!("installed {v}"));
+    }
+    if let Some((bytes, files)) = i.size {
+        what.push(format!("{} in {files} file{}", human_size(bytes), if files == 1 { "" } else { "s" }));
+    }
+    if !what.is_empty() {
+        add(vec![Span::styled(what.join(" · "), cyan)]);
+    }
+    // Where it runs.
+    let mut runs = Vec::new();
+    if !i.engines.is_empty() {
+        let e: Vec<String> = i.engines.iter().map(|(k, v)| format!("{k} {v}")).collect();
+        runs.push(format!("engines: {}", e.join(", ")));
+    }
+    if i.platform.is_empty() {
+        runs.push("platform: any".to_string());
+    } else {
+        let p: Vec<String> = i.platform.iter().map(|(k, v)| format!("{k} {}", v.join(", "))).collect();
+        runs.push(format!("platform: {}", p.join("; ")));
+    }
+    add(vec![Span::styled(runs.join(" · "), cyan)]);
+    match (&i.integrity, i.lockfile) {
+        (Some(sum), Some(file)) => {
+            // `sha512-` and enough of the hash to tell it apart.
+            let short: String = match sum.split_once('-') {
+                Some((alg, hash)) => format!("{alg}-{}…", hash.chars().take(12).collect::<String>()),
+                None => sum.chars().take(20).collect(),
+            };
+            add(vec![Span::styled(format!("integrity: {short} ({file})"), cyan)]);
+        }
+        (None, Some(file)) => add(vec![Span::styled(format!("⚠ no integrity checksum in {file}"), yellow)]),
+        (_, None) => add(vec![Span::styled("integrity: no npm or pnpm lockfile to read", dim)]),
+    }
+    if i.dependencies.is_empty() {
+        add(vec![Span::styled("no dependencies", dim)]);
+    } else {
+        let list: Vec<String> = i.dependencies.iter().map(|(n, r)| format!("{n} {r}")).collect();
+        add(vec![
+            Span::styled(format!("{} dependenc{}: ", list.len(), if list.len() == 1 { "y" } else { "ies" }), cyan),
+            Span::styled(list.join(", "), cyan),
+        ]);
+    }
+    if let Some(c) = &i.since_commit {
+        let from = c.from.as_ref().map(|v| format!(" ({v} then)")).unwrap_or_default();
+        if c.is_empty() {
+            add(vec![Span::styled(format!("dependencies unchanged since the last commit{from}"), dim)]);
+        } else {
+            let mut parts: Vec<Span<'static>> =
+                vec![Span::styled(format!("since the last commit{from}: "), cyan)];
+            let mut items: Vec<Span<'static>> = Vec::new();
+            for (n, r) in &c.added {
+                items.push(Span::styled(format!("+ {n} {r}"), Style::new().fg(Color::Green)));
+            }
+            for (n, _) in &c.removed {
+                items.push(Span::styled(format!("− {n}"), Style::new().fg(Color::Red)));
+            }
+            for (n, o, r) in &c.changed {
+                items.push(Span::styled(format!("{n} {o} → {r}"), yellow));
+            }
+            for (k, it) in items.into_iter().enumerate() {
+                if k > 0 {
+                    parts.push(Span::raw(", "));
+                }
+                parts.push(it);
+            }
+            add(parts);
+        }
+    }
+    lines
+}
 /// For the package under the cursor: the installed packages that depend on it.
 fn used_by_lines(app: &App, width: u16) -> Vec<Line<'static>> {
     let Some(Item::Row { idx, .. }) = app.cursor_item() else {
