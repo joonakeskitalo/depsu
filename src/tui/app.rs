@@ -517,6 +517,8 @@ pub struct Targets {
     pub list: Rect,
     /// The box around the package list, with its border.
     pub list_panel: Rect,
+    /// The box of the details panel (empty when hidden).
+    pub info_panel: Rect,
     /// The list items on screen: the row (inside `list`) each starts at, its height and its
     /// index in `view`.
     pub items: Vec<(u16, u16, usize)>,
@@ -581,6 +583,10 @@ pub struct App {
     /// The footer's width and the most lines its item hints have taken at it, set by the
     /// renderer so the footer keeps its height as the cursor moves.
     pub item_rows: ItemSection,
+    /// Lines the details panel is scrolled down by.
+    pub info_scroll: usize,
+    /// The list item the details panel was last drawn for; another one starts at the top.
+    pub info_for: Option<usize>,
     /// What the mouse can click, set by the renderer.
     pub targets: Targets,
     /// Latest versions and findings per package version. Always kept in memory; written to
@@ -759,6 +765,8 @@ impl App {
             list_page: 10,
             targets: Targets::default(),
             item_rows: ItemSection::default(),
+            info_scroll: 0,
+            info_for: None,
             cache: Cache::default(),
             cache_path: None,
             cache_dirty: false,
@@ -2102,6 +2110,9 @@ impl App {
                 self.group_by = self.group_by.next();
                 self.rebuild_view();
             }
+            KeyCode::Down | KeyCode::Up if key.modifiers.contains(KeyModifiers::SHIFT) => {
+                self.scroll_info(key.code == KeyCode::Up)
+            }
             KeyCode::Down | KeyCode::Char('j') => self.move_cursor(1),
             KeyCode::Up | KeyCode::Char('k') => self.move_cursor(-1),
             // A page is what the list shows, less a row that stays in view for context.
@@ -2171,10 +2182,12 @@ impl App {
     pub fn on_mouse(&mut self, m: MouseEvent) {
         let focus = crate::tui::ui::focus(self);
         let over_list = self.targets.list_panel.contains((m.column, m.row).into());
+        let over_info = self.targets.info_panel.contains((m.column, m.row).into());
         match m.kind {
             MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
                 let up = m.kind == MouseEventKind::ScrollUp;
                 match focus {
+                    crate::tui::ui::Focus::List if over_info => self.scroll_info(up),
                     // The list stays visible next to the expanded log: the wheel scrolls
                     // whichever the pointer is over.
                     crate::tui::ui::Focus::Log if over_list => {
@@ -2199,6 +2212,14 @@ impl App {
             MouseEventKind::Down(MouseButton::Left) => self.click(m.column, m.row, focus),
             _ => {}
         }
+    }
+    /// Scrolls the details panel a line; the renderer keeps it within the contents.
+    fn scroll_info(&mut self, up: bool) {
+        self.info_scroll = if up {
+            self.info_scroll.saturating_sub(1)
+        } else {
+            self.info_scroll + 1
+        };
     }
     fn click(&mut self, x: u16, y: u16, mut focus: crate::tui::ui::Focus) {
         let inside = |r: &Rect| x >= r.x && x < r.x + r.width && y >= r.y && y < r.y + r.height;
@@ -6763,5 +6784,91 @@ mod tests {
             cols.push(find(&buffer(&mut app_with_packages(2), w, 30), "scan:").0);
             assert!(cols.windows(2).all(|p| p[0] == p[1]), "width {w}: {cols:?}");
         }
+    }
+    #[test]
+    fn the_details_panel_is_boxed_and_its_title_hides_it() {
+        let mut app = app_with_peers();
+        app.show_info = true;
+        let buf = buffer(&mut app, 100, 30);
+        let (x, y) = find(&buf, " selected: ");
+        assert!((0..x).any(|c| buf[(c, y)].symbol() == "┌"), "a box corner left of the title");
+        let (tx, _) = find(&buf, "2 peer dependencies");
+        let (lx, _) = find(&buf, "… 2 latest");
+        assert_eq!(tx, lx, "lined up with the log");
+        click(&mut app, x, y);
+        assert!(!app.show_info);
+    }
+    /// A project where `p01` is used by many packages, so its details run long.
+    fn app_with_long_details() -> App {
+        let mut app = app_with_packages(4);
+        let users = (0..40)
+            .map(|i| Dependent {
+                name: format!("user-{i:02}"),
+                version: Some(Version::new(1, 0, i)),
+                range: "^1.0.0".into(),
+                direct: format!("user-{i:02}"),
+            })
+            .collect();
+        app.dependents.insert("p01".into(), users);
+        app.show_info = true;
+        app.table.select(Some(0));
+        app
+    }
+    fn cursor_to_name(app: &mut App, name: &str) {
+        cursor_to(app, |i| matches!(i, Item::Row { name: n, .. } if n == name));
+    }
+    #[test]
+    fn the_details_panel_keeps_its_height_whatever_the_item() {
+        let mut app = app_with_long_details();
+        let mut seen = Vec::new();
+        for _ in 0..app.view.len() {
+            buffer(&mut app, 100, 40);
+            seen.push((app.targets.info_panel.height, app.list_page));
+            app.on_key(key('j'));
+        }
+        assert!(seen.windows(2).all(|w| w[0] == w[1]), "{seen:?}");
+    }
+    #[test]
+    fn long_details_scroll_and_a_new_item_starts_at_the_top() {
+        let mut app = app_with_long_details();
+        cursor_to_name(&mut app, "p01");
+        let buf = buffer(&mut app, 100, 40);
+        let (x, y) = find(&buf, " selected: p01 · 1–6 of ");
+        assert!(find_row(&buf, y + 1, "used by 40"), "the panel starts with the first line");
+        // The wheel over the panel scrolls it; the list's cursor stays.
+        let at = app.table.selected();
+        for _ in 0..3 {
+            wheel(&mut app, false, (x + 4, y + 2));
+        }
+        assert_eq!(app.table.selected(), at);
+        let buf = buffer(&mut app, 100, 40);
+        find(&buf, " selected: p01 · 4–9 of ");
+        // So do shift+arrows, and it stops at the ends.
+        for _ in 0..100 {
+            app.on_key(KeyEvent::new(KeyCode::Up, KeyModifiers::SHIFT));
+        }
+        let buf = buffer(&mut app, 100, 40);
+        find(&buf, " selected: p01 · 1–6 of ");
+        app.on_key(KeyEvent::new(KeyCode::Down, KeyModifiers::SHIFT));
+        for _ in 0..100 {
+            wheel(&mut app, false, (x + 4, y + 2));
+            buffer(&mut app, 100, 40);
+        }
+        let total = find_total(&buffer(&mut app, 100, 40));
+        assert_eq!(app.info_scroll, total - 6, "the last page");
+        // Another package is shown from the top, and so is p01 again.
+        cursor_to_name(&mut app, "p02");
+        buffer(&mut app, 100, 40);
+        assert_eq!(app.info_scroll, 0);
+    }
+    fn find_total(buf: &ratatui::buffer::Buffer) -> usize {
+        let (x, y) = find(buf, " selected: p01 · ");
+        let row: String = (x..buf.area.width).map(|c| buf[(c, y)].symbol().to_string()).collect();
+        let after = row.split(" of ").nth(1).unwrap();
+        after.split_whitespace().next().unwrap().parse().unwrap()
+    }
+    fn find_row(buf: &ratatui::buffer::Buffer, y: u16, needle: &str) -> bool {
+        let row: String = (0..buf.area.width).map(|x| buf[(x, y)].symbol().to_string()).collect();
+        row.contains(needle)
     }
 }

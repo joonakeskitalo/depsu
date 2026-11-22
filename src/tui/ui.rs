@@ -36,23 +36,6 @@ fn inner_width(f: &Frame) -> u16 {
     f.area().width.saturating_sub(PAD)
 }
 
-/// A two-line section heading: a horizontal rule, and below it the title of what follows.
-fn heading(f: &mut Frame, area: ratatui::layout::Rect, title: impl Into<String>) {
-    let [line, text] = Layout::vertical([Constraint::Length(1), Constraint::Length(1)]).areas(area);
-    f.render_widget(
-        Block::default()
-            .borders(Borders::TOP)
-            .border_style(Style::new().fg(Color::DarkGray)),
-        line,
-    );
-    f.render_widget(
-        Line::from(Span::styled(
-            format!(" {}", title.into()),
-            Style::new().fg(Color::DarkGray).add_modifier(Modifier::BOLD),
-        )),
-        text,
-    );
-}
 /// Where the keys go: that part of the screen gets a bright border.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Focus {
@@ -140,17 +123,20 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     let (header_lines, header_hits) = header_lines(app, f.area().width);
     // The details panel makes room for the expanded log.
     let info = app.show_info && !app.log_focus;
-    let used_by_lines = if info {
-        let mut lines = used_by_lines(app, inner_width(f));
-        lines.extend(peer_lines(app, inner_width(f)));
+    // Everything about the item under the cursor, in full: the panel scrolls.
+    let info_lines = if info {
+        let mut lines = used_by_lines(app, panel_width(f));
+        lines.extend(peer_lines(app, panel_width(f)));
+        lines.extend(summary_lines(app, panel_width(f) as usize));
+        // The box pads its contents already: drop the space the wrappers start lines with.
+        for l in &mut lines {
+            if l.spans.first().is_some_and(|s| s.content == " ") {
+                l.spans.remove(0);
+            }
+        }
         lines
     } else {
         Vec::new()
-    };
-    let summary_h = if info {
-        SUMMARY_LINES
-    } else {
-        0
     };
     // The package list and a footer prompt are boxed; the border and the title take the rows
     // the heading took.
@@ -165,27 +151,27 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     } else {
         collapsed_h
     };
-    let [header, list_area, info_rule, used_by, summary, log_area, keys_area] =
-        Layout::vertical([
-            Constraint::Length(header_lines.len() as u16),
-            Constraint::Min(5),
-            Constraint::Length(if info { 2 } else { 0 }),
-            Constraint::Length(if info { used_by_lines.len().max(1) as u16 } else { 0 }),
-            Constraint::Length(summary_h),
-            Constraint::Length(log_box_h),
-            Constraint::Length(footer_h),
-        ])
-        .areas(f.area());
-    let (used_by, summary) = (pad(used_by), pad(summary));
+    // The details panel is boxed like the list and the log. It has the same height whatever
+    // the item, so the screen does not jump as the cursor moves; longer contents scroll.
+    let info_h = if info { INFO_LINES + 2 } else { 0 };
+    let [header, list_area, info_area, log_area, keys_area] = Layout::vertical([
+        Constraint::Length(header_lines.len() as u16),
+        Constraint::Min(5),
+        Constraint::Length(info_h),
+        Constraint::Length(log_box_h),
+        Constraint::Length(footer_h),
+    ])
+    .areas(f.area());
     f.render_widget(Paragraph::new(header_lines), header);
     // Part of the screen outside the list reacts to the mouse only while the list has the keys:
     // the keys a click stands for would go to a prompt otherwise.
     let clickable = focus == Focus::List;
     if clickable {
         add_targets(header, header_hits, &mut app.targets.keys);
-        let full = f.area().width;
+        app.targets.info_panel = info_area;
         if info {
-            let r = Rect { width: full, ..info_rule };
+            // The title row of the details panel hides it.
+            let r = Rect { height: 1, ..info_area };
             app.targets.keys.push((r, vec![plain(KeyCode::Char('?'))]));
         }
         // The log: a click opens it.
@@ -252,14 +238,33 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         _ => "selected".to_string(),
     };
     if info {
-        heading(f, info_rule, info_title);
-        f.render_widget(Paragraph::new(used_by_lines), used_by);
-    }
-    if summary_h > 0 {
-        f.render_widget(
-            Paragraph::new(summary_lines(app, summary.width as usize)),
-            summary,
-        );
+        // A new item is shown from the top.
+        if app.info_for != app.table.selected() {
+            app.info_for = app.table.selected();
+            app.info_scroll = 0;
+        }
+        let h = INFO_LINES as usize;
+        let total = info_lines.len();
+        app.info_scroll = app.info_scroll.min(total.saturating_sub(h));
+        let title = if total > h {
+            format!(
+                "{info_title} · {}–{} of {total} · shift+↑↓ scroll · ? to hide",
+                app.info_scroll + 1,
+                (app.info_scroll + h).min(total)
+            )
+        } else {
+            format!("{info_title} · ? to hide")
+        };
+        let inner = panel(f, info_area, title, false);
+        let lines: Vec<Line> = if info_lines.is_empty() {
+            vec![Line::from(Span::styled(
+                "nothing more to show for this item",
+                Style::new().fg(Color::DarkGray),
+            ))]
+        } else {
+            info_lines.into_iter().skip(app.info_scroll).take(h).collect()
+        };
+        f.render_widget(Paragraph::new(lines), inner);
     }
 
     // The title is the toggle: a click on the panel does the same as tab.
@@ -2016,7 +2021,8 @@ fn own_override_note(app: &App, r: &AppRow, o: &Override) -> (Compat, String) {
 }
 
 /// Lines reserved at the bottom for the override summary while the nested lists are hidden.
-const SUMMARY_LINES: u16 = 3;
+/// Rows of content the details panel shows; more scroll.
+const INFO_LINES: u16 = 6;
 
 /// Text summary of the overrides of the highlighted package, wrapped to `width`. Shown in
 /// place of the nested lists when those are hidden.
@@ -2042,21 +2048,16 @@ fn summary_lines(app: &App, width: usize) -> Vec<Line<'static>> {
         spans.push(Span::styled(text, Style::new().fg(compat_color(c))));
     }
     if !r.tree_hits.is_empty() {
-        // Risky hits come first, so they survive the cut-off.
+        // Risky hits come first.
         let shown: Vec<String> = r
             .tree_hits
             .iter()
-            .take(3)
             .map(|h| match app.unneeded(&h.over) {
                 Some(u) => format!("{} ✂ may be removed: {}", hit_text(h), u.reason(&h.over)),
                 None => hit_text(h),
             })
             .collect();
-        let more = r.tree_hits.len().saturating_sub(3);
-        let mut text = format!("↳ overrides in dependency tree: {}", shown.join(", "));
-        if more > 0 {
-            text.push_str(&format!(", +{more} more"));
-        }
+        let text = format!("↳ overrides in dependency tree: {}", shown.join(", "));
         let color = if r.tree_hits.iter().any(|h| h.risk == Compat::Conflict) {
             Color::Yellow
         } else {
@@ -2068,20 +2069,7 @@ fn summary_lines(app: &App, width: usize) -> Vec<Line<'static>> {
         return Vec::new();
     }
 
-    // Two columns stay free for the " …" shown when the text is cut off.
-    let mut lines = wrap(
-        Span::raw(" "),
-        Span::raw(" "),
-        spans,
-        width.saturating_sub(2),
-    );
-    if lines.len() > SUMMARY_LINES as usize {
-        lines.truncate(SUMMARY_LINES as usize);
-        if let Some(last) = lines.last_mut() {
-            last.spans
-                .push(Span::styled(" …", Style::new().fg(Color::DarkGray)));
-        }
-    }
+    let lines = wrap(Span::raw(" "), Span::raw(" "), spans, width);
     lines
 }
 
@@ -2112,14 +2100,7 @@ fn used_by_lines(app: &App, width: u16) -> Vec<Line<'static>> {
         .map(|p| vec![Span::styled(p, cyan)])
         .collect();
     atoms[0].insert(0, Span::styled(label, cyan));
-    let mut lines = wrap_hints(Vec::new(), atoms, ", ", width);
-    if lines.len() > MAX_USED_BY_LINES {
-        lines.truncate(MAX_USED_BY_LINES);
-        if let Some(last) = lines.last_mut() {
-            last.spans.push(Span::styled(" …", Style::new().fg(Color::DarkGray)));
-        }
-    }
-    lines
+    wrap_hints(Vec::new(), atoms, ", ", width)
 }
 /// For the package under the cursor: the peer dependencies its installed copy declares, and
 /// the version of each the project has.
@@ -2151,18 +2132,9 @@ fn peer_lines(app: &App, width: u16) -> Vec<Line<'static>> {
         })
         .collect();
     atoms[0].insert(0, Span::styled(label, cyan));
-    let mut lines = wrap_hints(Vec::new(), atoms, ", ", width);
-    if lines.len() > MAX_USED_BY_LINES {
-        lines.truncate(MAX_USED_BY_LINES);
-        if let Some(last) = lines.last_mut() {
-            last.spans.push(Span::styled(" …", Style::new().fg(Color::DarkGray)));
-        }
-    }
-    lines
+    wrap_hints(Vec::new(), atoms, ", ", width)
 }
 
-/// Most lines the list of dependents takes in the selected section.
-const MAX_USED_BY_LINES: usize = 4;
 
 fn hit_text(h: &Hit) -> String {
     let mut t = format!("{} → {}", h.over.name, h.over.value);

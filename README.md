@@ -88,6 +88,7 @@ depsu --cache .depsu-cache.json   # remember versions and scans between runs
 | `v` | Show / hide vulnerability findings |
 | `R` | Fetch the latest versions again, ignoring the cache |
 | `?` | Show / hide the details panel for the highlighted package: installed packages that use it, its peer dependencies with the versions installed, and its override summary. A package with an installed peer outside the range it declares is flagged in the list with `⚠ unmet peer: react ^18.0.0 (has 19.0.0)` |
+| `Shift+↑` / `Shift+↓` | Scroll the details panel. It keeps the same height for every package; its title shows which lines are in view when there are more |
 | `q` / `Esc` | Quit (press twice while an install is running) |
 
 The part of the screen that takes the keys has a cyan border: the package list, a prompt typed in the footer (filter, version, pin type), the expanded log, or a dialog. While a dialog is open, everything behind it is dimmed.
@@ -98,7 +99,7 @@ The part of the screen that takes the keys has a cyan border: the package list, 
 - Click a key hint in the footer to press that key. Click a header item (`group: …`, `vulns hidden`, `overrides: …`, a scan result) to run its key. Click the `selected:` heading to toggle the details panel.
 - Click the log at the bottom to expand it. The list stays visible above it: click a package to give the keys back to the list, click the log to return to it. The wheel scrolls whichever the pointer is over.
 - In dialogs, click the footer hints, a peer fix option or an `Add as` choice.
-- The wheel moves the cursor in the list and scrolls the expanded log.
+- The wheel moves the cursor in the list and scrolls the details panel and the expanded log.
 - depsu captures the mouse, so hold Shift (Option in some terminals) to select text.
 
 ## How it works

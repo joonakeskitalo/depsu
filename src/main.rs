@@ -43,6 +43,7 @@ KEYS:
     +              add a package as a dependency, dev dependency or override
     R              fetch the latest versions again (ignoring the cache)
     ?              show / hide the details panel
+    shift+up/down  scroll the details panel
     P              ask how to pin the selected packages (e exact, c ^, t ~, m >=)
     p              override a vulnerable dependency with the fixed version a scan
                    suggests (press twice to confirm)
@@ -53,7 +54,7 @@ MOUSE:
     click          move the cursor to an item; click its mark to (un)check it
     click          a key hint in the footer or an item in the header runs it;
                    the log opens when clicked, dialog choices pick themselves
-    wheel          move the cursor, or scroll the expanded log
+    wheel          move the cursor, scroll the details panel or the expanded log
                    (hold shift to select text with the mouse)";
 
 fn main() -> Result<()> {
