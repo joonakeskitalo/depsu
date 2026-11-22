@@ -5,7 +5,7 @@
 //! (potentially huge) `versions` section is never downloaded. On a 404 the request is
 //! retried once asking for the full `application/json` document.
 
-use crate::npmrc::Npmrc;
+use crate::config::npmrc::Npmrc;
 use semver::Version;
 use serde::Deserializer as _;
 use serde::de::{self, IgnoredAny, MapAccess, Visitor};

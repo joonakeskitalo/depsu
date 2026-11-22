@@ -1,24 +1,8 @@
-mod app;
-mod blocked;
-mod audit;
-mod bunfig;
-mod cache;
-mod commit;
-mod edit;
-mod export;
-mod npmrc;
-mod overrides;
-mod package;
-mod peers;
-mod pm;
+mod config;
+mod deps;
 mod registry;
-mod snyk;
-mod textfield;
-mod tree;
-mod ui;
-mod view;
-mod vuln;
-mod yarnrc;
+mod security;
+mod tui;
 
 use anyhow::{Result, bail};
 use ratatui::crossterm::event::{self, Event, KeyEventKind};
@@ -93,7 +77,7 @@ fn main() -> Result<()> {
             },
             "--pm" => {
                 let v = args.next().unwrap_or_default();
-                match pm::Pm::parse(&v) {
+                match config::pm::Pm::parse(&v) {
                     Some(p) => forced_pm = Some(p),
                     None => bail!("unknown package manager `{v}` (use npm, yarn, pnpm or bun)"),
                 }
@@ -103,24 +87,24 @@ fn main() -> Result<()> {
     }
 
     let dir = dir.canonicalize()?;
-    let manifest = package::read_manifest(&dir.join("package.json"))?;
-    let pm = forced_pm.unwrap_or_else(|| pm::Pm::detect(&dir, manifest.package_manager.as_deref()));
-    let overrides = overrides::collect(&manifest.raw, pm);
+    let manifest = deps::package::read_manifest(&dir.join("package.json"))?;
+    let pm = forced_pm.unwrap_or_else(|| config::pm::Pm::detect(&dir, manifest.package_manager.as_deref()));
+    let overrides = deps::overrides::collect(&manifest.raw, pm);
     // Each package manager has its own idea of where the registry settings live.
-    let (rc, warnings) = if pm == pm::Pm::Yarn && yarnrc::is_yarn_modern(&dir) {
+    let (rc, warnings) = if pm == config::pm::Pm::Yarn && config::yarnrc::is_yarn_modern(&dir) {
         // Yarn 2+ reads `.yarnrc.yml` only and ignores `.npmrc` completely.
-        yarnrc::load(&dir)
+        config::yarnrc::load(&dir)
     } else {
-        let mut rc = npmrc::Npmrc::load(&dir);
+        let mut rc = config::npmrc::Npmrc::load(&dir);
         // Bun reads bunfig.toml (taking precedence over .npmrc), so honour it for bun projects.
-        let warnings = if pm == pm::Pm::Bun {
-            bunfig::merge_into(&mut rc, &dir)
+        let warnings = if pm == config::pm::Pm::Bun {
+            config::bunfig::merge_into(&mut rc, &dir)
         } else {
             Vec::new()
         };
         (rc, warnings)
     };
-    let mut app = app::App::start(dir, pm, manifest.deps, rc, overrides, cache_path);
+    let mut app = tui::app::App::start(dir, pm, manifest.deps, rc, overrides, cache_path);
     for w in warnings {
         app.push_log(w);
     }
@@ -130,10 +114,10 @@ fn main() -> Result<()> {
     result
 }
 
-fn run(terminal: &mut ratatui::DefaultTerminal, app: &mut app::App) -> Result<()> {
+fn run(terminal: &mut ratatui::DefaultTerminal, app: &mut tui::app::App) -> Result<()> {
     while !app.quit {
         app.drain_events();
-        terminal.draw(|f| ui::draw(f, app))?;
+        terminal.draw(|f| tui::ui::draw(f, app))?;
         if event::poll(Duration::from_millis(100))?
             && let Event::Key(key) = event::read()?
             && key.kind == KeyEventKind::Press

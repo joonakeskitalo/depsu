@@ -6,9 +6,9 @@
 //! The changes come from comparing `package.json` (and npm's lockfile, for the versions
 //! actually installed) at `HEAD` with the working tree, so the title describes what the
 //! commit contains, also changes made outside depsu.
-use crate::overrides;
-use crate::package::parse_spec;
-use crate::pm::Pm;
+use crate::deps::overrides;
+use crate::deps::package::parse_spec;
+use crate::config::pm::Pm;
 use semver::Version;
 use serde_json::Value;
 use std::collections::{BTreeMap, HashMap};
@@ -368,7 +368,7 @@ pub fn prepare(dir: &Path, pm: Pm) -> Result<Plan, String> {
     let old = parse(at_head("package.json"));
     let new = parse(std::fs::read_to_string(dir.join("package.json")).ok());
     let lock_versions = |text: Option<String>| {
-        text.and_then(|t| crate::tree::npm_lock_versions_from(&t))
+        text.and_then(|t| crate::deps::tree::npm_lock_versions_from(&t))
             .unwrap_or_default()
     };
     let (old_lock, new_lock) = match &lock {

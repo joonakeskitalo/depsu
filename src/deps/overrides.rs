@@ -7,7 +7,7 @@
 //! - yarn, pnpm, bun: the override silently wins, so the update is only effective when the
 //!   new version satisfies the override.
 
-use crate::pm::Pm;
+use crate::config::pm::Pm;
 use semver::{Version, VersionReq};
 use serde_json::{Map, Value};
 

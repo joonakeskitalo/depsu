@@ -1,18 +1,18 @@
 //! Application state, background workers and key handling.
 
-use crate::audit;
-use crate::cache::{Cache, Findings};
-use crate::edit::{self, Change};
-use crate::npmrc::Npmrc;
-use crate::overrides::{self, Compat, Override, Unneeded};
-use crate::package::{self, Dep, Kind, parse_spec};
-use crate::peers;
-use crate::pm::Pm;
-use crate::registry;
-use crate::snyk;
-use crate::tree::{Analyzer, Dependent, Hit};
-use crate::view::{self, Child, GroupBy, Item, Overrides, REMOVED, Release, UNNEEDED};
-use crate::vuln::{Report, Severity, Source, Vuln};
+use crate::security::audit;
+use crate::registry::cache::{Cache, Findings};
+use crate::deps::edit::{self, Change};
+use crate::config::npmrc::Npmrc;
+use crate::deps::overrides::{self, Compat, Override, Unneeded};
+use crate::deps::package::{self, Dep, Kind, parse_spec};
+use crate::deps::peers;
+use crate::config::pm::Pm;
+use crate::registry::registry;
+use crate::security::snyk;
+use crate::deps::tree::{Analyzer, Dependent, Hit};
+use crate::tui::view::{self, Child, GroupBy, Item, Overrides, REMOVED, Release, UNNEEDED};
+use crate::security::vuln::{Report, Severity, Source, Vuln};
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::widgets::ListState;
 use semver::Version;
@@ -56,14 +56,14 @@ pub enum Event {
         result: Result<registry::Packument, String>,
     },
     /// The changes to commit were looked at.
-    CommitPrepared(Result<crate::commit::Plan, String>),
+    CommitPrepared(Result<crate::deps::commit::Plan, String>),
     /// git committed (the short hash), or failed.
     Committed(Result<String, String>),
     /// Versions the registry refuses to hand out were found.
     Blocked {
         plan: Vec<(String, Version)>,
         ovr: Vec<(Override, String)>,
-        blocked: Vec<crate::blocked::Blocked>,
+        blocked: Vec<crate::registry::blocked::Blocked>,
         after_failure: bool,
     },
     /// The ways to fix a package's unmet peers were looked up.
@@ -142,7 +142,7 @@ fn peers_of(
     lock: Option<&HashMap<String, Version>>,
     name: &str,
 ) -> Vec<Peer> {
-    let mut peers: Vec<Peer> = crate::tree::installed_peers(dir, name)
+    let mut peers: Vec<Peer> = crate::deps::tree::installed_peers(dir, name)
         .unwrap_or_default()
         .into_iter()
         .map(|(peer, range)| Peer {
@@ -172,7 +172,7 @@ pub struct BlockedPrompt {
     /// The install that was about to run (empty when it already failed).
     pub plan: Vec<(String, Version)>,
     ovr: Vec<(Override, String)>,
-    pub blocked: Vec<crate::blocked::Blocked>,
+    pub blocked: Vec<crate::registry::blocked::Blocked>,
     /// The install already failed: the blocked version may be a nested package.
     pub after_failure: bool,
 }
@@ -218,7 +218,7 @@ pub enum InputPurpose {
 /// type, e.g. `^18.3.1`.
 pub struct VersionEdit {
     pub name: String,
-    pub field: crate::textfield::TextField,
+    pub field: crate::tui::textfield::TextField,
     /// The package's published versions, once the registry answered.
     pub doc: Option<Result<registry::Packument, String>>,
     /// Why the last Enter didn't install.
@@ -292,9 +292,9 @@ struct Adding {
 
 /// The commit `c` proposes, with its title and body as the user edits them.
 pub struct CommitPrompt {
-    pub plan: crate::commit::Plan,
-    pub title: crate::textfield::TextField,
-    pub body: crate::textfield::TextField,
+    pub plan: crate::deps::commit::Plan,
+    pub title: crate::tui::textfield::TextField,
+    pub body: crate::tui::textfield::TextField,
     /// The user changed the body: it no longer follows the title.
     pub body_edited: bool,
     /// The field the keys go to; Tab switches.
@@ -527,9 +527,9 @@ pub struct App {
     pub commit_prompt: Option<CommitPrompt>,
     /// Vulnerabilities queued installs and overrides will fix, with the row name or override
     /// key of the job that fixes them.
-    queued_fixes: Vec<(String, crate::commit::Fixed)>,
+    queued_fixes: Vec<(String, crate::deps::commit::Fixed)>,
     /// Vulnerabilities fixed in this session and not committed yet.
-    pub session_fixes: Vec<crate::commit::Fixed>,
+    pub session_fixes: Vec<crate::deps::commit::Fixed>,
     /// Packages to install with an exact version the next time they are queued, because a
     /// range would resolve to a blocked version again.
     exact_once: HashSet<String>,
@@ -929,7 +929,7 @@ impl App {
     /// Reads the resolved version of each listed package: the lockfile's, or else the one in
     /// `node_modules`.
     fn read_installed_versions(&mut self) {
-        let lock = crate::tree::npm_lock_versions(&self.dir);
+        let lock = crate::deps::tree::npm_lock_versions(&self.dir);
         for r in self.rows.iter_mut() {
             r.installed = resolved_version(&self.dir, lock.as_ref(), &r.name);
             r.peers = peers_of(&self.dir, lock.as_ref(), &r.name);
@@ -1302,7 +1302,7 @@ impl App {
         let forbidden = result
             .as_ref()
             .err()
-            .and_then(|e| crate::blocked::parse_forbidden(e));
+            .and_then(|e| crate::registry::blocked::parse_forbidden(e));
         let added: Vec<(String, Adding)> = names
             .iter()
             .filter_map(|n| Some((n.clone(), self.adding.remove(n)?)))
@@ -1550,7 +1550,7 @@ impl App {
         }
     }
     fn insert_row(&mut self, mut row: Row) {
-        let lock = crate::tree::npm_lock_versions(&self.dir);
+        let lock = crate::deps::tree::npm_lock_versions(&self.dir);
         row.installed = resolved_version(&self.dir, lock.as_ref(), &row.name);
         row.peers = peers_of(&self.dir, lock.as_ref(), &row.name);
         // Keep rows sorted by (kind, name) so late arrivals don't shuffle randomly.
@@ -2126,8 +2126,8 @@ impl App {
             }
             KeyCode::Char('d') => self.delete_selected(),
             KeyCode::Char('y') => {
-                let md = crate::export::markdown(self);
-                match crate::export::copy(&md) {
+                let md = crate::tui::export::markdown(self);
+                match crate::tui::export::copy(&md) {
                     Ok(()) => self.push_log(format!(
                         "✔ copied Markdown report to clipboard ({} lines)",
                         md.lines().count()
@@ -2233,7 +2233,7 @@ impl App {
             .collect();
         let (dir, fetcher, tx) = (self.dir.clone(), self.fetcher.clone(), self.events_tx.clone());
         thread::spawn(move || {
-            let lock = crate::tree::npm_lock_versions(&dir);
+            let lock = crate::deps::tree::npm_lock_versions(&dir);
             let installed = |n: &str| resolved_version(&dir, lock.as_ref(), n);
             let fetch = |n: &str| fetcher(n);
             let (options, notes) = peers::fix_options(
@@ -2289,11 +2289,11 @@ impl App {
         self.push_log("… looking at what changed since the last commit");
         let (dir, pm, tx) = (self.dir.clone(), self.pm, self.events_tx.clone());
         thread::spawn(move || {
-            let _ = tx.send(Event::CommitPrepared(crate::commit::prepare(&dir, pm)));
+            let _ = tx.send(Event::CommitPrepared(crate::deps::commit::prepare(&dir, pm)));
         });
     }
 
-    fn on_commit_prepared(&mut self, result: Result<crate::commit::Plan, String>) {
+    fn on_commit_prepared(&mut self, result: Result<crate::deps::commit::Plan, String>) {
         let plan = match result {
             Ok(p) => p.with_fixes(&self.session_fixes),
             Err(e) => return self.push_log(format!("✘ Can't commit: {e}")),
@@ -2304,10 +2304,10 @@ impl App {
         self.filter_mode = false;
         self.pin_prompt = false;
         self.input = None;
-        let body = crate::commit::body_for(&plan, &plan.title).unwrap_or_default();
+        let body = crate::deps::commit::body_for(&plan, &plan.title).unwrap_or_default();
         self.commit_prompt = Some(CommitPrompt {
-            title: crate::textfield::TextField::new(plan.title.clone()),
-            body: crate::textfield::TextField::new(body),
+            title: crate::tui::textfield::TextField::new(plan.title.clone()),
+            body: crate::tui::textfield::TextField::new(body),
             body_edited: false,
             field: CommitField::Title,
             plan,
@@ -2392,7 +2392,7 @@ impl App {
             CommitField::Body => p.body_edited = true,
             // A body the user hasn't touched keeps leaving out what the title says.
             CommitField::Title if !p.body_edited => {
-                let body = crate::commit::body_for(&p.plan, p.title.text()).unwrap_or_default();
+                let body = crate::deps::commit::body_for(&p.plan, p.title.text()).unwrap_or_default();
                 p.body.set(body);
             }
             CommitField::Title => {}
@@ -2416,7 +2416,7 @@ impl App {
         p.error = None;
         let (dir, plan, tx) = (self.dir.clone(), p.plan.clone(), self.events_tx.clone());
         thread::spawn(move || {
-            let result = crate::commit::run(&dir, &plan, &title, body.as_deref());
+            let result = crate::deps::commit::run(&dir, &plan, &title, body.as_deref());
             let _ = tx.send(Event::Committed(result));
         });
     }
@@ -2467,7 +2467,7 @@ impl App {
         let name = r.name.clone();
         self.version_edit = Some(VersionEdit {
             name: name.clone(),
-            field: crate::textfield::TextField::new(format!("{}{now}", r.prefix)),
+            field: crate::tui::textfield::TextField::new(format!("{}{now}", r.prefix)),
             doc: None,
             error: None,
         });
@@ -2722,7 +2722,7 @@ impl App {
         &mut self,
         plan: Vec<(String, Version)>,
         ovr: Vec<(Override, String)>,
-        blocked: Vec<crate::blocked::Blocked>,
+        blocked: Vec<crate::registry::blocked::Blocked>,
         after_failure: bool,
     ) {
         if !after_failure {
@@ -2809,11 +2809,11 @@ impl App {
         thread::spawn(move || {
             let alternative = fetcher(&name)
                 .ok()
-                .and_then(|doc| crate::blocked::latest_available(&doc, &version, &|u| prober(&name, u)));
+                .and_then(|doc| crate::registry::blocked::latest_available(&doc, &version, &|u| prober(&name, u)));
             let _ = tx.send(Event::Blocked {
                 plan: Vec::new(),
                 ovr: Vec::new(),
-                blocked: vec![crate::blocked::Blocked {
+                blocked: vec![crate::registry::blocked::Blocked {
                     name,
                     version,
                     alternative,
@@ -3357,9 +3357,9 @@ impl App {
             self.events_tx.clone(),
         );
         thread::spawn(move || {
-            let lock = crate::tree::npm_lock_versions(&dir);
+            let lock = crate::deps::tree::npm_lock_versions(&dir);
             let installed = |n: &str| resolved_version(&dir, lock.as_ref(), n);
-            let installed_peers = |n: &str| crate::tree::installed_peers(&dir, n);
+            let installed_peers = |n: &str| crate::deps::tree::installed_peers(&dir, n);
             // Each package document is fetched once for both checks.
             let memo: std::cell::RefCell<HashMap<String, Result<registry::Packument, String>>> =
                 Default::default();
@@ -3372,7 +3372,7 @@ impl App {
                 r
             };
             // A version the registry refuses would only fail the install.
-            let blocked = crate::blocked::find_blocked(&plan, &fetch, &|n, u| prober(n, u), &direct);
+            let blocked = crate::registry::blocked::find_blocked(&plan, &fetch, &|n, u| prober(n, u), &direct);
             if !blocked.is_empty() {
                 let _ = tx.send(Event::Blocked {
                     plan,
@@ -3654,7 +3654,7 @@ fn resolved_version(
     name: &str,
 ) -> Option<Version> {
     lock.and_then(|l| l.get(name).cloned())
-        .or_else(|| crate::tree::installed_version(dir, name))
+        .or_else(|| crate::deps::tree::installed_version(dir, name))
 }
 
 /// The key that starts a scan with `source`.
@@ -3941,7 +3941,7 @@ impl App {
                 }
             };
             let key = loc.join("\u{1f}");
-            let fixes: Vec<crate::commit::Fixed> = self
+            let fixes: Vec<crate::deps::commit::Fixed> = self
                 .rows
                 .iter()
                 .flat_map(|r| &r.vulns)
@@ -3965,8 +3965,8 @@ impl App {
     }
 }
 /// `v`, fixed by changing `package`, as the commit lists it.
-fn fixed(package: &str, v: &Vuln) -> crate::commit::Fixed {
-    crate::commit::Fixed {
+fn fixed(package: &str, v: &Vuln) -> crate::deps::commit::Fixed {
+    crate::deps::commit::Fixed {
         package: package.to_string(),
         id: v.id.clone(),
         title: v.title.clone(),
@@ -4245,7 +4245,7 @@ fn run_pm(dir: &std::path::Path, pm: Pm, args: &[String]) -> Result<(), String> 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cache::Scans;
+    use crate::registry::cache::Scans;
     fn vuln(direct: &str, version: &str, id: &str) -> Vuln {
         Vuln {
             source: Source::Snyk,
@@ -4850,7 +4850,7 @@ mod tests {
 
     /// A fake registry: `a` has 1.0.0, 1.5.0 and 2.0.0; `lodash` has 4.17.20 and 4.17.21.
     fn fake_registry() -> Fetcher {
-        use crate::registry::{Packument, VersionInfo};
+        use crate::registry::registry::{Packument, VersionInfo};
         let doc = |name: &str, latest: &str, versions: &[&str]| Packument {
             latest: Some(Version::parse(latest).unwrap()),
             versions: versions
@@ -4932,7 +4932,7 @@ mod tests {
         assert!(matches!(app.cursor_item(), Some(Item::Row { name, .. }) if name == "a"));
         edit_version(&mut app);
         assert_eq!(version_field(&app), "^1.0.0", "pre-filled with what it has now");
-        assert_eq!(crate::ui::focus(&app), crate::ui::Focus::Dialog);
+        assert_eq!(crate::tui::ui::focus(&app), crate::tui::ui::Focus::Dialog);
         let screen = render(&mut app, 120, 40).join("\n");
         assert!(screen.contains(" Version of a "), "{screen}");
         assert!(screen.contains("package.json  ^1.0.0"), "{screen}");
@@ -5221,7 +5221,7 @@ mod tests {
     /// The screen as text, one string per row.
     fn render(app: &mut App, w: u16, h: u16) -> Vec<String> {
         let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(w, h)).unwrap();
-        term.draw(|f| crate::ui::draw(f, app)).unwrap();
+        term.draw(|f| crate::tui::ui::draw(f, app)).unwrap();
         let buf = term.backend().buffer().clone();
         (0..h)
             .map(|y| (0..w).map(|x| buf[(x, y)].symbol().to_string()).collect())
@@ -5334,7 +5334,7 @@ mod tests {
     ) -> (String, Option<ratatui::style::Color>) {
         let (w, h) = (220u16, 30u16);
         let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(w, h)).unwrap();
-        term.draw(|f| crate::ui::draw(f, app)).unwrap();
+        term.draw(|f| crate::tui::ui::draw(f, app)).unwrap();
         let buf = term.backend().buffer().clone();
         for y in 0..h {
             let line: String = (0..w).map(|x| buf[(x, y)].symbol().to_string()).collect();
@@ -5433,7 +5433,7 @@ mod tests {
         app.current.insert("c".into(), (Kind::Prod, "^", Version::new(1, 0, 0)));
         app.on_fetched("c".into(), Version::new(1, 0, 0));
 
-        let md = crate::export::markdown(&app);
+        let md = crate::tui::export::markdown(&app);
         let vulnerable = md.find("## Packages with vulnerabilities").expect("own table");
         let others = md.find("## Other packages").expect("the rest");
         let snyk = md.find("## Snyk report").expect("findings after the packages");
@@ -5454,7 +5454,7 @@ mod tests {
     #[test]
     fn a_report_without_findings_has_a_single_package_table() {
         let app = app_with_cache("1.0.0", |_| {});
-        let md = crate::export::markdown(&app);
+        let md = crate::tui::export::markdown(&app);
         assert!(md.contains("## Packages\n"));
         assert!(!md.contains("with vulnerabilities") && !md.contains("Other packages"));
         assert!(md.contains("| a | dep |") && md.contains("| b | dep |"));
@@ -5521,7 +5521,7 @@ mod tests {
 
     /// A registry where `a` 0.9.0 accepts `b ^1`, and `b` has 2.0.0 and 2.1.0.
     fn peer_fix_registry() -> Fetcher {
-        use crate::registry::{Packument, VersionInfo};
+        use crate::registry::registry::{Packument, VersionInfo};
         let doc = |latest: &str, versions: &[(&str, &[(&str, &str)])]| Packument {
             latest: Some(Version::parse(latest).unwrap()),
             versions: versions
@@ -5620,7 +5620,7 @@ mod tests {
         app.show_overrides = Overrides::Full;
         app.dependents.insert(
             "b".into(),
-            vec![crate::tree::Dependent {
+            vec![crate::deps::tree::Dependent {
                 name: "a".into(),
                 version: Some(Version::new(1, 0, 0)),
                 range: "^1.0.0".into(),
@@ -5702,7 +5702,7 @@ mod tests {
         for n in &names {
             app.dependents.insert(
                 n.clone(),
-                vec![crate::tree::Dependent {
+                vec![crate::deps::tree::Dependent {
                     name: format!("{n}-consumer"),
                     version: None,
                     range: "^1.0.0".into(),
@@ -6095,7 +6095,7 @@ mod tests {
 
     fn buffer(app: &mut App, w: u16, h: u16) -> ratatui::buffer::Buffer {
         let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(w, h)).unwrap();
-        term.draw(|f| crate::ui::draw(f, app)).unwrap();
+        term.draw(|f| crate::tui::ui::draw(f, app)).unwrap();
         term.backend().buffer().clone()
     }
     /// The cell where the screen text `needle` starts: (column, row).
@@ -6116,7 +6116,7 @@ mod tests {
     fn the_package_list_has_a_bright_border_while_it_has_the_keys() {
         use ratatui::style::{Color, Modifier};
         let (mut app, _rx) = app_capturing_installs();
-        assert_eq!(crate::ui::focus(&app), crate::ui::Focus::List);
+        assert_eq!(crate::tui::ui::focus(&app), crate::tui::ui::Focus::List);
         let buf = buffer(&mut app, 100, 30);
         let (x, y) = find(&buf, " packages ");
         assert_eq!(buf[(x, y)].fg, Color::Cyan);
@@ -6131,7 +6131,7 @@ mod tests {
         use ratatui::style::Color;
         let (mut app, _rx) = app_capturing_installs();
         app.on_key(key('/'));
-        assert_eq!(crate::ui::focus(&app), crate::ui::Focus::Footer);
+        assert_eq!(crate::tui::ui::focus(&app), crate::tui::ui::Focus::Footer);
         let buf = buffer(&mut app, 100, 30);
         let (x, y) = find(&buf, " packages ");
         assert_eq!(buf[(x, y)].fg, Color::DarkGray, "the list is inactive");
@@ -6148,7 +6148,7 @@ mod tests {
         use ratatui::style::{Color, Modifier};
         let (mut app, _rx) = app_to_delete_from();
         app.on_key(key('d'));
-        assert_eq!(crate::ui::focus(&app), crate::ui::Focus::Dialog);
+        assert_eq!(crate::tui::ui::focus(&app), crate::tui::ui::Focus::Dialog);
         let buf = buffer(&mut app, 120, 40);
         let (x, y) = find(&buf, " packages ");
         assert!(buf[(x, y)].modifier.contains(Modifier::DIM), "the list is dimmed");
@@ -6166,7 +6166,7 @@ mod tests {
         let (mut app, _rx) = app_capturing_installs();
         app.push_log("hello");
         app.on_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
-        assert_eq!(crate::ui::focus(&app), crate::ui::Focus::Log);
+        assert_eq!(crate::tui::ui::focus(&app), crate::tui::ui::Focus::Log);
         let buf = buffer(&mut app, 100, 30);
         let (x, y) = find(&buf, " log ");
         assert_eq!(buf[(x, y)].fg, Color::Cyan);
@@ -6369,7 +6369,7 @@ mod tests {
     #[test]
     fn both_scanners_are_named_when_neither_has_scanned_the_version() {
         assert_eq!(
-            crate::ui::unscanned_label(&[Source::Snyk, Source::NpmAudit]),
+            crate::tui::ui::unscanned_label(&[Source::Snyk, Source::NpmAudit]),
             "↻ snyk (s) and npm audit (n) haven't scanned this version"
         );
     }

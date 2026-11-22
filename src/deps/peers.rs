@@ -9,8 +9,8 @@
 //!
 //! For each such package the check suggests a version that fits, when it is one of the
 //! project's own dependencies and the registry has one.
-use crate::overrides::satisfies;
-use crate::registry::Packument;
+use crate::deps::overrides::satisfies;
+use crate::registry::registry::Packument;
 use semver::Version;
 use std::collections::HashMap;
 
@@ -138,7 +138,7 @@ pub fn check(plan: &[(String, Version)], p: &Project) -> Report {
                 continue;
             }
             // A version of `dep` that accepts every updated package it peers on.
-            let fits = |info: &crate::registry::VersionInfo| {
+            let fits = |info: &crate::registry::registry::VersionInfo| {
                 plan.iter().all(|(n, v)| {
                     info.peers
                         .get(n)
@@ -238,7 +238,7 @@ pub fn fix_options(
     if p.direct.iter().any(|d| d == package) {
         match (p.fetch)(package) {
             Ok(doc) => {
-                let fits = |info: &crate::registry::VersionInfo| {
+                let fits = |info: &crate::registry::registry::VersionInfo| {
                     info.peers.iter().all(|(peer, range)| match (p.installed)(peer) {
                         Some(v) => satisfies(range, &v) != Some(false),
                         None => true,
@@ -268,7 +268,7 @@ pub fn fix_options(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::registry::VersionInfo;
+    use crate::registry::registry::VersionInfo;
     use std::collections::BTreeMap;
 
     fn v(s: &str) -> Version {

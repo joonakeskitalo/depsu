@@ -1,10 +1,10 @@
-use crate::app::{App, VersionRange, Row as AppRow, ScanStatus, Status, scan_key};
-use crate::overrides::{self, Compat, Override};
-use crate::package::Kind;
-use crate::pm::Pm;
-use crate::tree::{self, Hit};
-use crate::view::{Child, GroupBy, Item, Overrides, Release, UNNEEDED};
-use crate::vuln::{Severity, Source};
+use crate::tui::app::{App, VersionRange, Row as AppRow, ScanStatus, Status, scan_key};
+use crate::deps::overrides::{self, Compat, Override};
+use crate::deps::package::Kind;
+use crate::config::pm::Pm;
+use crate::deps::tree::{self, Hit};
+use crate::tui::view::{Child, GroupBy, Item, Overrides, Release, UNNEEDED};
+use crate::security::vuln::{Severity, Source};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style, Stylize};
@@ -114,7 +114,7 @@ pub enum Focus {
 pub fn focus(app: &App) -> Focus {
     let add_dialog = matches!(
         &app.input,
-        Some(i) if matches!(i.purpose, crate::app::InputPurpose::Add { .. })
+        Some(i) if matches!(i.purpose, crate::tui::app::InputPurpose::Add { .. })
     );
     if app.peer_prompt.is_some()
         || app.version_edit.is_some()
@@ -313,7 +313,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         draw_version_edit(f, app, e);
     }
     if let Some(input) = &app.input
-        && let crate::app::InputPurpose::Add { add_as } = &input.purpose
+        && let crate::tui::app::InputPurpose::Add { add_as } = &input.purpose
     {
         draw_add_dialog(f, app, input, *add_as);
     }
@@ -321,7 +321,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
 
 /// The lines of `field` as spans, with the cursor shown when `active`: the character under
 /// it reversed, or a block at the end of a line.
-fn field_lines(field: &crate::textfield::TextField, active: bool, style: Style) -> Vec<Vec<Span<'static>>> {
+fn field_lines(field: &crate::tui::textfield::TextField, active: bool, style: Style) -> Vec<Vec<Span<'static>>> {
     let (text, cursor) = (field.text(), field.cursor());
     let mut out = Vec::new();
     let mut start = 0;
@@ -354,8 +354,8 @@ fn field_lines(field: &crate::textfield::TextField, active: bool, style: Style) 
 
 /// The version of a package being edited (`e`): what it has now, the version as typed, and
 /// whether that version is published.
-fn draw_version_edit(f: &mut Frame, app: &App, e: &crate::app::VersionEdit) {
-    use crate::app::VersionCheck;
+fn draw_version_edit(f: &mut Frame, app: &App, e: &crate::tui::app::VersionEdit) {
+    use crate::tui::app::VersionCheck;
     let width = f.area().width.saturating_sub(4).min(80);
     let inner = (width as usize).saturating_sub(4);
     let bold = Style::new().add_modifier(Modifier::BOLD);
@@ -438,8 +438,8 @@ fn draw_version_edit(f: &mut Frame, app: &App, e: &crate::app::VersionEdit) {
 }
 
 /// The commit `c` proposes: its title and body to edit, and which files.
-fn draw_commit_dialog(f: &mut Frame, p: &crate::app::CommitPrompt) {
-    use crate::app::CommitField;
+fn draw_commit_dialog(f: &mut Frame, p: &crate::tui::app::CommitPrompt) {
+    use crate::tui::app::CommitField;
     let width = f.area().width.saturating_sub(4).min(90);
     let inner = (width as usize).saturating_sub(4);
     let bold = Style::new().add_modifier(Modifier::BOLD);
@@ -579,7 +579,7 @@ fn draw_commit_dialog(f: &mut Frame, p: &crate::app::CommitPrompt) {
 }
 
 /// Versions the registry refuses to hand out, and what it hands out instead.
-fn draw_blocked_prompt(f: &mut Frame, p: &crate::app::BlockedPrompt) {
+fn draw_blocked_prompt(f: &mut Frame, p: &crate::tui::app::BlockedPrompt) {
     let width = f.area().width.saturating_sub(4).min(84);
     let inner = (width as usize).saturating_sub(4);
     let bold = Style::new().add_modifier(Modifier::BOLD);
@@ -614,7 +614,7 @@ fn draw_blocked_prompt(f: &mut Frame, p: &crate::app::BlockedPrompt) {
         ));
     }
     lines.push(Line::default());
-    let found: Vec<&crate::blocked::Blocked> =
+    let found: Vec<&crate::registry::blocked::Blocked> =
         p.blocked.iter().filter(|b| b.alternative.is_some()).collect();
     if !found.is_empty() {
         let what: Vec<String> = found
@@ -653,7 +653,7 @@ fn draw_blocked_prompt(f: &mut Frame, p: &crate::app::BlockedPrompt) {
 }
 
 /// What `d` is about to delete, to confirm.
-fn draw_delete_prompt(f: &mut Frame, app: &App, p: &crate::app::DeletePrompt) {
+fn draw_delete_prompt(f: &mut Frame, app: &App, p: &crate::tui::app::DeletePrompt) {
     let width = f.area().width.saturating_sub(4).min(80);
     let inner = (width as usize).saturating_sub(4);
     let bold = Style::new().add_modifier(Modifier::BOLD);
@@ -776,7 +776,7 @@ fn draw_delete_prompt(f: &mut Frame, app: &App, p: &crate::app::DeletePrompt) {
 }
 
 /// The ways to fix a package's unmet peers (`f`), to pick from.
-fn draw_peer_fix(f: &mut Frame, p: &crate::app::PeerFix) {
+fn draw_peer_fix(f: &mut Frame, p: &crate::tui::app::PeerFix) {
     let width = f.area().width.saturating_sub(4).min(80);
     let inner = (width as usize).saturating_sub(4);
     let dim = Style::new().fg(Color::DarkGray);
@@ -879,8 +879,8 @@ fn draw_dialog(f: &mut Frame, title: &str, mut lines: Vec<Line<'static>>, width:
 }
 
 /// The dialog for adding a package (`+`): its name and what to add it as.
-fn draw_add_dialog(f: &mut Frame, app: &App, input: &crate::app::Input, add_as: crate::app::AddAs) {
-    use crate::app::AddAs;
+fn draw_add_dialog(f: &mut Frame, app: &App, input: &crate::tui::app::Input, add_as: crate::tui::app::AddAs) {
+    use crate::tui::app::AddAs;
     let width = f.area().width.saturating_sub(4).min(72);
     let inner = (width as usize).saturating_sub(4);
     let dim = Style::new().fg(Color::DarkGray);
@@ -897,8 +897,8 @@ fn draw_add_dialog(f: &mut Frame, app: &App, input: &crate::app::Input, add_as: 
     ]));
     lines.push(Line::default());
     let overrides_in = match app.pm {
-        crate::pm::Pm::Yarn => "resolutions",
-        crate::pm::Pm::Pnpm => "pnpm.overrides",
+        crate::config::pm::Pm::Yarn => "resolutions",
+        crate::config::pm::Pm::Pnpm => "pnpm.overrides",
         _ => "overrides",
     };
     for (i, a) in AddAs::ALL.iter().enumerate() {
@@ -948,7 +948,7 @@ fn draw_add_dialog(f: &mut Frame, app: &App, input: &crate::app::Input, add_as: 
 
 /// The question about other packages an install needs changed, in a box in the middle of the
 /// screen.
-fn draw_peer_prompt(f: &mut Frame, p: &crate::app::PeerPrompt) {
+fn draw_peer_prompt(f: &mut Frame, p: &crate::tui::app::PeerPrompt) {
     let area = f.area();
     let width = area.width.saturating_sub(4).min(90);
     // Inside the border and one column of padding on each side.
@@ -1155,10 +1155,10 @@ fn footer_lines(app: &App, width: u16) -> Vec<Line<'static>> {
     }
     if let Some(p) = &app.commit_prompt {
         let keys = match p.field {
-            crate::app::CommitField::Title => {
+            crate::tui::app::CommitField::Title => {
                 vec![hint("editing the title"), hint("enter commit"), hint("tab body")]
             }
-            crate::app::CommitField::Body => vec![
+            crate::tui::app::CommitField::Body => vec![
                 hint("editing the body"),
                 hint("ctrl+s commit"),
                 hint("enter new line"),
@@ -1286,7 +1286,7 @@ fn removed_line(app: &App, name: &str) -> Line<'static> {
 }
 
 fn header_line(app: &App, label: &str, members: &[usize]) -> Line<'static> {
-    if label == crate::view::REMOVED && members.is_empty() {
+    if label == crate::tui::view::REMOVED && members.is_empty() {
         return Line::from(format!("✂ {label} ({})", app.removed.len()))
             .style(Style::new().fg(Color::Magenta).add_modifier(Modifier::BOLD));
     }
@@ -1311,7 +1311,7 @@ fn header_line(app: &App, label: &str, members: &[usize]) -> Line<'static> {
         "Patch" => Color::Green,
         "Minor" => Color::Yellow,
         "Major" => Color::Red,
-        crate::view::UP_TO_DATE => Color::DarkGray,
+        crate::tui::view::UP_TO_DATE => Color::DarkGray,
         _ => Color::Cyan,
     };
     Line::from(format!("{mark} {label} ({})", members.len()))
@@ -1655,7 +1655,7 @@ fn detail_lines(
 
 /// What fixes a finding. Fixes a key can apply stand out in green with the key to press;
 /// fixes depsu can't apply, or no fix at all, stay grey.
-fn fix_spans(app: &App, r: &AppRow, v: &crate::vuln::Vuln) -> Vec<Span<'static>> {
+fn fix_spans(app: &App, r: &AppRow, v: &crate::security::vuln::Vuln) -> Vec<Span<'static>> {
     let fixable = Style::new().fg(Color::Green).add_modifier(Modifier::BOLD);
     if let Some(to) = app.vuln_install_fix(r, v) {
         return vec![

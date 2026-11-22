@@ -1,6 +1,6 @@
 //! Markdown export of the package versions and the vulnerability reports.
-use crate::app::{App, Row, ScanStatus};
-use crate::vuln::{Severity, Source, Vuln};
+use crate::tui::app::{App, Row, ScanStatus};
+use crate::security::vuln::{Severity, Source, Vuln};
 use std::io::Write;
 use std::process::{Command, Stdio};
 

@@ -1,7 +1,7 @@
 //! Snyk integration: runs `snyk test --json` and turns the result into per-dependency
 //! vulnerabilities and the upgrade versions Snyk suggests.
 
-use crate::vuln::{Report, Severity, Source, Vuln};
+use crate::security::vuln::{Report, Severity, Source, Vuln};
 use semver::Version;
 use serde_json::Value;
 use std::collections::HashSet;
@@ -209,10 +209,10 @@ pub fn scan(dir: &Path) -> Result<Report, String> {
 mod tests {
     use super::*;
 
-    const DIRECT: &str = include_str!("../tests/fixtures/snyk_direct.json");
-    const TRANSITIVE: &str = include_str!("../tests/fixtures/snyk_transitive.json");
-    const ERROR: &str = include_str!("../tests/fixtures/snyk_error.json");
-    const CLEAN: &str = include_str!("../tests/fixtures/snyk_clean.json");
+    const DIRECT: &str = include_str!("../../tests/fixtures/snyk_direct.json");
+    const TRANSITIVE: &str = include_str!("../../tests/fixtures/snyk_transitive.json");
+    const ERROR: &str = include_str!("../../tests/fixtures/snyk_error.json");
+    const CLEAN: &str = include_str!("../../tests/fixtures/snyk_clean.json");
 
     #[test]
     fn splits_scoped_names() {
@@ -269,7 +269,7 @@ mod tests {
         assert!(!r.fixes.contains_key("@scope/old"));
     }
 
-    const TRANSITIVE_REAL: &str = include_str!("../tests/fixtures/snyk_transitive_real.json");
+    const TRANSITIVE_REAL: &str = include_str!("../../tests/fixtures/snyk_transitive_real.json");
 
     fn summary(r: &Report, direct: &str, id: &str) -> String {
         r.vulns

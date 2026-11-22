@@ -15,7 +15,7 @@
 //! "@acme" = { url = "https://r.example/", token = "$T" }
 //! ```
 
-use crate::npmrc::Npmrc;
+use crate::config::npmrc::Npmrc;
 use std::path::Path;
 use toml::Value;
 

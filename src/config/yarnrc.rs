@@ -20,7 +20,7 @@
 //! `npmAlwaysAuth` is set. `depsu` sends them whenever they are configured, which is what a
 //! private registry needs anyway.
 
-use crate::npmrc::Npmrc;
+use crate::config::npmrc::Npmrc;
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
 use serde_yaml_ng::Value;

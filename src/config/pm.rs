@@ -1,6 +1,6 @@
 //! Package manager detection and install command construction.
 
-use crate::package::Kind;
+use crate::deps::package::Kind;
 use std::path::Path;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

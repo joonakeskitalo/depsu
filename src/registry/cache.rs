@@ -3,7 +3,7 @@
 //! again. Findings are stored per project and per package version: what a package brings in
 //! depends on the project's lockfile and overrides, so the same version can be clean in one
 //! project and vulnerable in another. Latest versions are shared by all projects.
-use crate::vuln::Vuln;
+use crate::security::vuln::Vuln;
 use anyhow::{Context, Result};
 use semver::Version;
 use serde::{Deserialize, Serialize};
@@ -106,7 +106,7 @@ impl Scans {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::vuln::{Severity, Source};
+    use crate::security::vuln::{Severity, Source};
 
     fn vuln(id: &str) -> Vuln {
         Vuln {

@@ -2,7 +2,7 @@
 //! below it, since an override can change the behaviour of the package even when the
 //! overridden dependency is several levels deep.
 
-use crate::overrides::{Compat, Override, Unneeded, assess, satisfies};
+use crate::deps::overrides::{Compat, Override, Unneeded, assess, satisfies};
 use semver::Version;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -570,8 +570,8 @@ pub fn risk(o: &Override, requested: &str) -> Compat {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::overrides::collect;
-    use crate::pm::Pm;
+    use crate::deps::overrides::collect;
+    use crate::config::pm::Pm;
     use serde_json::json;
 
     fn tmp(name: &str) -> PathBuf {

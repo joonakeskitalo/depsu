@@ -5,9 +5,9 @@
 //! (`node_modules`) afterwards, which gives the same per-dependency view as Snyk: the
 //! vulnerable package, its installed version, and the path from the direct dependency.
 
-use crate::pm::Pm;
-use crate::tree::{Analyzer, Located};
-use crate::vuln::{Report, Severity, Source, Vuln};
+use crate::config::pm::Pm;
+use crate::deps::tree::{Analyzer, Located};
+use crate::security::vuln::{Report, Severity, Source, Vuln};
 use semver::Version;
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
@@ -503,11 +503,11 @@ mod tests {
     use super::*;
     use std::path::PathBuf;
 
-    const NPM: &str = include_str!("../tests/fixtures/npm_audit.json");
-    const NPM_ERROR: &str = include_str!("../tests/fixtures/npm_audit_error.json");
-    const NPM_CLEAN: &str = include_str!("../tests/fixtures/npm_audit_clean.json");
-    const BUN: &str = include_str!("../tests/fixtures/bun_audit.json");
-    const BUN_PLAN: &str = include_str!("../tests/fixtures/bun_plan.json");
+    const NPM: &str = include_str!("../../tests/fixtures/npm_audit.json");
+    const NPM_ERROR: &str = include_str!("../../tests/fixtures/npm_audit_error.json");
+    const NPM_CLEAN: &str = include_str!("../../tests/fixtures/npm_audit_clean.json");
+    const BUN: &str = include_str!("../../tests/fixtures/bun_audit.json");
+    const BUN_PLAN: &str = include_str!("../../tests/fixtures/bun_plan.json");
 
     #[test]
     fn parses_npm_audit_advisories_and_fixes() {

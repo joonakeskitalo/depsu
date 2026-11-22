@@ -2,7 +2,7 @@
 //! Nexus Firewall and the like) list every version in the package document but answer 403
 //! when the file of a blocked one is downloaded, so an install of it fails. This finds the
 //! newest version that can be downloaded instead.
-use crate::registry::Packument;
+use crate::registry::registry::Packument;
 use semver::Version;
 
 /// How many older versions are tried before giving up.
@@ -101,7 +101,7 @@ fn from_tarball_url(url: &str) -> Option<(String, Version)> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::registry::VersionInfo;
+    use crate::registry::registry::VersionInfo;
 
     fn v(s: &str) -> Version {
         Version::parse(s).unwrap()

@@ -1,7 +1,7 @@
 //! Grouping and filtering of the outdated-package list into display items.
 
-use crate::app::Row;
-use crate::package::Kind;
+use crate::tui::app::Row;
+use crate::deps::package::Kind;
 use semver::Version;
 use std::collections::HashMap;
 
@@ -283,9 +283,9 @@ fn grouped(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::app::Status;
-    use crate::overrides::Compat;
-    use crate::package::Kind;
+    use crate::tui::app::Status;
+    use crate::deps::overrides::Compat;
+    use crate::deps::package::Kind;
 
     fn row(name: &str, cur: &str, latest: &str) -> Row {
         Row {
@@ -456,9 +456,9 @@ mod tests {
         );
     }
 
-    fn hit(name: &str, risk: crate::overrides::Compat) -> crate::tree::Hit {
-        crate::tree::Hit {
-            over: crate::overrides::Override {
+    fn hit(name: &str, risk: crate::deps::overrides::Compat) -> crate::deps::tree::Hit {
+        crate::deps::tree::Hit {
+            over: crate::deps::overrides::Override {
                 name: name.into(),
                 range: None,
                 value: "1.0.0".into(),
@@ -475,7 +475,7 @@ mod tests {
 
     #[test]
     fn nests_overrides_under_their_package() {
-        use crate::overrides::Compat;
+        use crate::deps::overrides::Compat;
         let mut rows = vec![row("a", "1.0.0", "2.0.0"), row("b", "1.0.0", "2.0.0")];
         rows[0].overrides = vec![hit("a", Compat::Ok).over];
         rows[0].tree_hits = (0..7).map(|i| hit(&format!("t{i}"), Compat::Ok)).collect();
