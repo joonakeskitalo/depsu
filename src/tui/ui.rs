@@ -129,10 +129,14 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     app.targets = Default::default();
     let focus = focus(app);
     let footer_boxed = focus == Focus::Footer;
-    let (footer, footer_hits) = footer_lines(
-        app,
-        if footer_boxed { panel_width(f) } else { inner_width(f) },
-    );
+    let footer_w = if footer_boxed { panel_width(f) } else { inner_width(f) };
+    // The item hints change with the cursor. Their section keeps the tallest height it has had
+    // at this width, so the screen does not change size as the cursor moves.
+    if app.item_rows.0 != footer_w {
+        app.item_rows = (footer_w, 1);
+    }
+    let (footer, footer_hits, item_rows) = footer_lines(app, footer_w, app.item_rows.1);
+    app.item_rows.1 = app.item_rows.1.max(item_rows);
     let (header_lines, header_hits) = header_lines(app, f.area().width);
     // The details panel makes room for the expanded log.
     let info = app.show_info && !app.log_focus;
@@ -187,6 +191,11 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         app.targets.keys.push((log_area, vec![plain(KeyCode::Tab)]));
     }
     app.targets.list_panel = list_area;
+    if focus == Focus::Log {
+        // The title of the expanded log closes it.
+        let title_row = Rect { height: 1, ..log_area };
+        app.targets.keys.push((title_row, vec![plain(KeyCode::Tab)]));
+    }
     let body = panel(f, list_area, "packages", focus == Focus::List);
 
     let grouped = app.group_by != GroupBy::None;
@@ -252,10 +261,11 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         );
     }
 
-    let title = if app.log_focus && app.log_scroll > 0 {
-        format!("log (↑{} older)", app.log_scroll)
-    } else {
-        "log".to_string()
+    // The title is the toggle: a click on the panel does the same as tab.
+    let title = match (app.log_focus, app.log_scroll) {
+        (false, _) => "log · tab to expand".to_string(),
+        (true, 0) => "log · tab to close".to_string(),
+        (true, n) => format!("log (↑{n} older) · tab to close"),
     };
     let log_body = panel(f, log_area, title, focus == Focus::Log);
     let h = (log_body.height as usize).max(1);
@@ -1261,38 +1271,38 @@ fn add_targets(area: Rect, placed: Vec<Placed>, out: &mut Vec<(Rect, Vec<KeyEven
         out.push((Rect { x, y, width: w, height: 1 }, p.keys));
     }
 }
-fn footer_lines(app: &App, width: u16) -> (Vec<Line<'static>>, Vec<Placed>) {
+/// The footer, the clicks of its hints, and how many lines the item hints took. The item hints
+/// are padded to `item_rows` lines.
+fn footer_lines(app: &App, width: u16, item_rows: usize) -> (Vec<Line<'static>>, Vec<Placed>, usize) {
     let hint = |t: &str| vec![t.to_string().dark_gray()];
+    let prompt = |(l, p): (Vec<Line<'static>>, Vec<Placed>)| (l, p, 0);
     if app.log_focus {
         let hint = |t: &str, key: Option<KeyCode>| (vec![t.to_string().dark_gray()], key.map(plain));
-        return wrap_atoms(
+        return prompt(wrap_atoms(
             Vec::new(),
             vec![
-                hint("↑/↓ scroll", None),
-                hint(", . page", None),
                 hint("Home/End oldest/newest", None),
-                hint("tab or esc back to list", Some(KeyCode::Tab)),
                 hint("q quit", Some(KeyCode::Char('q'))),
             ],
             "   ",
             width,
-        );
+        ));
     }
     if app.input.is_some() {
-        return wrap_keys(
+        return prompt(wrap_keys(
             vec!["Add a package:".cyan().bold()],
             vec![hint("see the dialog above"), hint("enter add"), hint("esc cancel")],
             "   ",
             width,
-        );
+        ));
     }
     if app.version_edit.is_some() {
-        return wrap_keys(
+        return prompt(wrap_keys(
             vec!["Edit the version:".cyan().bold()],
             vec![hint("← → home end move"), hint("enter install"), hint("esc cancel")],
             "   ",
             width,
-        );
+        ));
     }
     if let Some(p) = &app.commit_prompt {
         let keys = match p.field {
@@ -1309,7 +1319,7 @@ fn footer_lines(app: &App, width: u16) -> (Vec<Line<'static>>, Vec<Placed>) {
         let mut keys = keys;
         keys.push(hint("← → ↑ ↓ home end move"));
         keys.push(hint("esc cancel"));
-        return wrap_keys(vec!["Commit:".cyan().bold()], keys, "   ", width);
+        return prompt(wrap_keys(vec!["Commit:".cyan().bold()], keys, "   ", width));
     }
     if let Some(p) = &app.blocked_prompt {
         let mut keys = Vec::new();
@@ -1320,35 +1330,35 @@ fn footer_lines(app: &App, width: u16) -> (Vec<Line<'static>>, Vec<Placed>) {
             keys.push(hint("n install the others only"));
         }
         keys.push(hint("any other key cancels"));
-        return wrap_keys(vec!["Answer the dialog above:".cyan().bold()], keys, "   ", width);
+        return prompt(wrap_keys(vec!["Answer the dialog above:".cyan().bold()], keys, "   ", width));
     }
     if app.delete_prompt.is_some() {
-        return wrap_keys(
+        return prompt(wrap_keys(
             vec!["Answer the dialog above:".cyan().bold()],
             vec![hint("y or enter delete"), hint("any other key cancels")],
             "   ",
             width,
-        );
+        ));
     }
     if app.peer_fix.is_some() {
-        return wrap_keys(
+        return prompt(wrap_keys(
             vec!["Answer the dialog above:".cyan().bold()],
             vec![hint("↑↓ choose"), hint("enter or 1-9 fix"), hint("any other key cancels")],
             "   ",
             width,
-        );
+        ));
     }
     if app.peer_prompt.is_some() {
-        return wrap_keys(
+        return prompt(wrap_keys(
             vec!["Answer the dialog above:".cyan().bold()],
             vec![hint("y"), hint("n"), hint("any other key cancels")],
             "   ",
             width,
-        );
+        ));
     }
     if app.pin_prompt {
         let opt = |k: &str, d: &str| vec![k.to_string().bold(), d.to_string().into()];
-        return wrap_keys(
+        return prompt(wrap_keys(
             vec!["Pin type:".cyan().bold()],
             vec![
                 opt("e", " exact"),
@@ -1359,15 +1369,15 @@ fn footer_lines(app: &App, width: u16) -> (Vec<Line<'static>>, Vec<Placed>) {
             ],
             "   ",
             width,
-        );
+        ));
     }
     if app.filter_mode {
-        return wrap_keys(
+        return prompt(wrap_keys(
             vec!["/".cyan().bold(), app.filter.clone().into(), "█".cyan()],
             vec![hint("enter keep"), hint("esc clear")],
             "   ",
             width,
-        );
+        ));
     }
     let (item, scan, mut global) = app.hints();
     let mut prefix = vec!["all:".cyan().bold()];
@@ -1387,14 +1397,19 @@ fn footer_lines(app: &App, width: u16) -> (Vec<Line<'static>>, Vec<Placed>) {
         }));
         lines.extend(l);
     };
-    if !item.is_empty() {
-        add(wrap_keys(
+    let (mut item_lines, item_hits) = if item.is_empty() {
+        (vec![Line::from(vec![Span::raw(" "), "item:".dark_gray()])], Vec::new())
+    } else {
+        wrap_keys(
             vec!["item:".cyan().bold()],
             item.iter().map(|h| hint(h)).collect(),
             "   ",
             width,
-        ));
-    }
+        )
+    };
+    let item_used = item_lines.len();
+    item_lines.resize(item_used.max(item_rows), Line::default());
+    add((item_lines, item_hits));
     if !scan.is_empty() {
         add(wrap_keys(
             vec!["scan:".cyan().bold()],
@@ -1409,7 +1424,7 @@ fn footer_lines(app: &App, width: u16) -> (Vec<Line<'static>>, Vec<Placed>) {
         "   ",
         width,
     ));
-    (lines, placed)
+    (lines, placed, item_used)
 }
 
 fn removed_line(app: &App, name: &str) -> Line<'static> {

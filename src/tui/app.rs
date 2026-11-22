@@ -569,6 +569,9 @@ pub struct App {
     pub log_page: usize,
     /// Rows the package list shows, set by the renderer, used for paging (`,` and `.`).
     pub list_page: usize,
+    /// The footer's width and the most lines its item hints have taken at it, set by the
+    /// renderer so the footer keeps its height as the cursor moves.
+    pub item_rows: (u16, usize),
     /// What the mouse can click, set by the renderer.
     pub targets: Targets,
     /// Latest versions and findings per package version. Always kept in memory; written to
@@ -746,6 +749,7 @@ impl App {
             log_page: 10,
             list_page: 10,
             targets: Targets::default(),
+            item_rows: (0, 1),
             cache: Cache::default(),
             cache_path: None,
             cache_dirty: false,
@@ -1854,21 +1858,6 @@ impl App {
         let mut item: Vec<String> = Vec::new();
         let mut global: Vec<String> = Vec::new();
         let mut scan: Vec<String> = Vec::new();
-        if !self.view.is_empty() {
-            global.push("↑/↓ move".into());
-            global.push(", . page".into());
-        }
-        let cursor_selectable = match self.cursor_item() {
-            Some(Item::Row { idx, .. }) => self.rows[*idx].can_select(),
-            Some(Item::Header { members, .. }) => {
-                members.iter().any(|&i| self.rows[i].can_select())
-            }
-            Some(it) => self.detail_override(it).is_some(),
-            None => false,
-        };
-        if cursor_selectable {
-            item.push("space select".into());
-        }
         if self.visible_rows().iter().any(|&i| self.rows[i].can_select()) {
             global.push("a all".into());
         }
@@ -1943,7 +1932,6 @@ impl App {
             item.push("r restore".into());
         }
         global.push("y copy md".into());
-        global.push("tab log".into());
         global.push("q quit".into());
         (item, scan, global)
     }
@@ -6316,7 +6304,7 @@ mod tests {
             app.on_key(key(','));
         }
         assert_eq!(at(&app), 0);
-        assert!(app.hints().2.contains(&", . page".to_string()));
+        assert!(!app.hints().2.contains(&", . page".to_string()), "obvious keys are not listed");
 
         // In the log, too.
         for i in 0..100 {
@@ -6622,7 +6610,7 @@ mod tests {
         click(&mut app, x, y);
         assert!(app.log_focus);
         let buf = buffer(&mut app, 120, 30);
-        let (x, y) = find(&buf, "tab or esc back");
+        let (x, y) = find(&buf, " log · tab to close");
         click(&mut app, x, y);
         assert!(!app.log_focus);
     }
@@ -6701,5 +6689,32 @@ mod tests {
         std::fs::write(dir.join(".git/HEAD"), "0123456789abcdef\n").unwrap();
         assert_eq!(git_branch(&sub).as_deref(), Some("0123456"), "detached");
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+    #[test]
+    fn the_footer_keeps_its_height_whatever_is_under_the_cursor() {
+        // One finding has no fix, so nothing acts on it and its item row is empty.
+        let mut app = app_with_three_findings();
+        app.table.select(Some(0));
+        let mut seen = Vec::new();
+        for _ in 0..app.view.len() {
+            buffer(&mut app, 80, 30);
+            // The footer sits at the bottom, so a taller one shortens the list.
+            seen.push(app.list_page);
+            app.on_key(key('j'));
+        }
+        assert!(seen.windows(2).all(|w| w[0] == w[1]), "{seen:?}");
+        // On a narrow screen the item hints of a package wrap; those of a finding do not.
+        let mut seen = Vec::new();
+        app.table.select(Some(0));
+        for _ in 0..app.view.len() * 2 {
+            buffer(&mut app, 50, 40);
+            seen.push(app.list_page);
+            app.on_key(key('j'));
+            if app.table.selected() == Some(app.view.len() - 1) {
+                app.table.select(Some(0));
+            }
+        }
+        let settled = &seen[app.view.len()..];
+        assert!(settled.windows(2).all(|w| w[0] == w[1]), "{seen:?}");
     }
 }
