@@ -46,6 +46,8 @@ pub enum Event {
     },
     /// The versions of node, npm and the package manager installed here.
     Tools(std::collections::BTreeMap<String, Version>),
+    /// Checksums were added to the lockfile (the packages), with what couldn't be done.
+    IntegrityAdded(Result<Vec<String>, String>, Vec<String>),
     Scan {
         source: Source,
         result: Result<Report, String>,
@@ -1252,6 +1254,49 @@ impl App {
         }
         self.info.get(&name).map(|(_, i)| i)
     }
+    /// The packages `I` adds a checksum to: the checked ones, or the one under the cursor, that
+    /// the lockfile lists without one.
+    fn integrity_targets(&self) -> Vec<String> {
+        self.acting_rows(|r| self.info.get(&r.name).is_some_and(|(_, i)| i.missing_integrity))
+            .into_iter()
+            .map(|i| self.rows[i].name.clone())
+            .collect()
+    }
+    /// Adds the checksum the registry publishes for the locked version of each target to
+    /// `package-lock.json`. Nothing is installed or downloaded but the registry documents.
+    fn add_integrity(&mut self) {
+        let names = self.integrity_targets();
+        if names.is_empty() {
+            return self.push_log("Nothing to add a checksum to: the lockfile has them all.");
+        }
+        let lockfile = self.info.get(&names[0]).and_then(|(_, i)| i.lockfile);
+        if lockfile != Some("package-lock.json") {
+            return self.push_log(
+                "depsu adds checksums to package-lock.json only; run `pnpm install --fix-lockfile` for pnpm-lock.yaml.",
+            );
+        }
+        if self.installing() {
+            return self.push_log("An install is running: add the checksums when it's done.");
+        }
+        self.push_log(format!("… asking the registry for the checksum of {}", names.join(", ")));
+        let (dir, fetcher, tx) = (self.dir.clone(), self.fetcher.clone(), self.events_tx.clone());
+        thread::spawn(move || {
+            let mut sums = Vec::new();
+            let mut problems = Vec::new();
+            for name in names {
+                match checksum_for(&dir, &fetcher, &name) {
+                    Ok(sum) => sums.push((name, sum)),
+                    Err(e) => problems.push(format!("{name}: {e}")),
+                }
+            }
+            let result = if sums.is_empty() {
+                Ok(Vec::new())
+            } else {
+                crate::deps::info::set_npm_integrity(&dir, &sums)
+            };
+            let _ = tx.send(Event::IntegrityAdded(result, problems));
+        });
+    }
     /// The `engines` entries of the installed copy of `name` that the tools installed here
     /// don't satisfy. Empty until its details and the tool versions are known.
     pub fn engine_problems(&self, name: &str) -> Vec<crate::deps::info::EngineProblem> {
@@ -1307,6 +1352,22 @@ impl App {
                 }
                 Event::Tree { name, hits } => self.on_tree(name, hits),
                 Event::Dependents(map) => self.dependents = map,
+                Event::IntegrityAdded(result, problems) => {
+                    for p in problems {
+                        self.push_log(format!("! {p}"));
+                    }
+                    match result {
+                        Ok(done) if done.is_empty() => self.push_log("No checksums added."),
+                        Ok(done) => {
+                            self.push_log(format!(
+                                "✔ added the registry's integrity checksum to package-lock.json: {}",
+                                done.join(", ")
+                            ));
+                            self.forget_info();
+                        }
+                        Err(e) => self.push_log(format!("✘ {e}")),
+                    }
+                }
                 Event::Tools(found) => {
                     for (tool, v) in found {
                         self.tools.entry(tool).or_insert(v);
@@ -2087,6 +2148,9 @@ impl App {
         if !self.acting_rows(|r| !r.busy() && r.changed_from.is_some()).is_empty() {
             item.push("r revert".into());
         }
+        if self.show_info && !self.integrity_targets().is_empty() {
+            item.push("I add checksum".into());
+        }
         if let Some(Item::Removed { name }) = self.cursor_item()
             && self
                 .removed_pkg(name)
@@ -2307,6 +2371,7 @@ impl App {
             KeyCode::Char('R') => self.refetch_latest(),
             KeyCode::Char('r') => self.revert_selected(),
             KeyCode::Char('e') => self.ask_version(),
+            KeyCode::Char('I') => self.add_integrity(),
             KeyCode::Char('f') => self.fix_unmet_peers(),
             KeyCode::Char('c') => self.prepare_commit(),
             KeyCode::Char('+') => {
@@ -4359,6 +4424,35 @@ fn anchor_of(item: &Item) -> (u8, String) {
     }
 }
 
+/// The checksum the registry publishes for the version of `name` the lockfile pins, if it
+/// is for the same file the lockfile says was downloaded.
+fn checksum_for(dir: &std::path::Path, fetcher: &Fetcher, name: &str) -> Result<String, String> {
+    let (version, resolved) =
+        crate::deps::info::npm_lock_entry(dir, name).ok_or("not in package-lock.json")?;
+    if let Some(r) = &resolved
+        && (r.starts_with("git") || r.contains("://github.com/") && !r.ends_with(".tgz"))
+    {
+        return Err(format!("installed from git ({r}); npm keeps no checksum for git packages"));
+    }
+    let doc = fetcher(name)?;
+    let info = doc
+        .versions
+        .get(&version)
+        .ok_or_else(|| format!("the registry has no {version}"))?;
+    let sum = info
+        .integrity
+        .clone()
+        .ok_or_else(|| format!("the registry publishes no checksum for {version}"))?;
+    // The same file: the registry's tarball and the lockfile's `resolved` name it alike (a
+    // mirror may serve it from another host).
+    let file = |u: &str| u.rsplit('/').next().unwrap_or(u).to_string();
+    if let (Some(r), Some(t)) = (&resolved, &info.tarball)
+        && file(r) != file(t)
+    {
+        return Err(format!("the lockfile has {r}, the registry {t}: not adding a checksum for another file"));
+    }
+    Ok(sum)
+}
 /// Reads package details off the drawing thread (sizing a big package walks thousands of
 /// files). The package under the cursor goes first; the rest are read ahead in the background.
 fn info_worker(dir: PathBuf, rx: Receiver<InfoMsg>, tx: Sender<Event>) {
@@ -5922,6 +6016,7 @@ mod tests {
                         VersionInfo {
                             peers: peers.iter().map(|(n, r)| (n.to_string(), r.to_string())).collect(),
                             tarball: None,
+                            integrity: None,
                         },
                     )
                 })
@@ -7310,5 +7405,85 @@ mod tests {
         cursor_on_finding(&mut app, "NOFIX");
         let screen = render(&mut app, 120, 36).join("\n");
         assert!(screen.contains("│ no fix available"), "{screen}");
+    }
+    #[test]
+    fn the_list_flags_a_package_without_an_integrity_checksum() {
+        let mut app = app_with_installed("2.0.0", &[("a", "1.0.0"), ("b", "1.0.0")], |_| {});
+        std::fs::write(
+            app.dir.join("package-lock.json"),
+            r#"{"lockfileVersion":3,"packages":{
+                "node_modules/a":{"version":"1.0.0","resolved":"https://r/a.tgz"},
+                "node_modules/b":{"version":"1.0.0","resolved":"https://r/b.tgz","integrity":"sha512-b"}}}"#,
+        )
+        .unwrap();
+        app.forget_info();
+        wait_until(&mut app, |app| app.info.get("a").is_some_and(|(_, i)| i.missing_integrity));
+        wait_until(&mut app, |app| app.info.get("b").is_some_and(|(_, i)| i.integrity.is_some()));
+        let row = |app: &mut App, name: &str| {
+            let screen = render(app, 140, 30);
+            screen
+                .iter()
+                .find(|l| l.contains(&format!("· {name} ")) || l.contains(&format!("○ {name} ")))
+                .unwrap()
+                .clone()
+        };
+        // Only with the details panel open.
+        app.show_info = false;
+        assert!(!row(&mut app, "a").contains("integrity"));
+        app.show_info = true;
+        assert!(row(&mut app, "a").contains("⚠ no integrity checksum"));
+        assert!(!row(&mut app, "b").contains("integrity"));
+    }
+    /// A project whose lockfile has `a` without a checksum, and a registry that publishes it.
+    fn app_missing_a_checksum(resolved: &str) -> App {
+        let mut app = app_with_installed("2.0.0", &[("a", "1.0.0"), ("b", "1.0.0")], |_| {});
+        let lock = format!(
+            "{{\n  \"lockfileVersion\": 3,\n  \"packages\": {{\n    \"node_modules/a\": {{\n      \"version\": \"1.0.0\",\n      \"resolved\": \"{resolved}\"\n    }}\n  }}\n}}\n"
+        );
+        std::fs::write(app.dir.join("package-lock.json"), lock).unwrap();
+        app.fetcher = Arc::new(|name: &str| {
+            let mut doc = crate::registry::registry::Packument::default();
+            doc.versions.insert(
+                Version::new(1, 0, 0),
+                crate::registry::registry::VersionInfo {
+                    tarball: Some(format!("https://registry.npmjs.org/{name}/-/{name}-1.0.0.tgz")),
+                    integrity: Some(format!("sha512-{name}-sum")),
+                    ..Default::default()
+                },
+            );
+            Ok(doc)
+        });
+        app.forget_info();
+        app.show_info = true;
+        cursor_to_name(&mut app, "a");
+        wait_until(&mut app, |app| app.info.get("a").is_some_and(|(_, i)| i.missing_integrity));
+        app
+    }
+    #[test]
+    fn capital_i_adds_the_registry_s_checksum_to_the_lockfile() {
+        let mut app = app_missing_a_checksum("https://mirror.example/npm/a/-/a-1.0.0.tgz");
+        assert!(app.hints().0.contains(&"I add checksum".to_string()));
+        app.on_key(key('I'));
+        wait_until(&mut app, |app| app.log.iter().any(|l| l.starts_with("✔ added")));
+        let lock = std::fs::read_to_string(app.dir.join("package-lock.json")).unwrap();
+        assert!(
+            lock.contains("\"resolved\": \"https://mirror.example/npm/a/-/a-1.0.0.tgz\",\n      \"integrity\": \"sha512-a-sum\"\n"),
+            "{lock}"
+        );
+        // The details are read again, and nothing is missing any more.
+        wait_until(&mut app, |app| app.info.get("a").is_some_and(|(_, i)| i.integrity.is_some()));
+        assert!(!app.hints().0.contains(&"I add checksum".to_string()));
+    }
+    #[test]
+    fn capital_i_refuses_a_checksum_for_another_file_or_a_git_package() {
+        let mut app = app_missing_a_checksum("https://other.example/a/-/a-1.0.0-patched.tgz");
+        app.on_key(key('I'));
+        wait_until(&mut app, |app| app.log.iter().any(|l| l == "No checksums added."));
+        assert!(app.log.iter().any(|l| l.contains("not adding a checksum for another file")), "{:?}", app.log);
+        assert!(!std::fs::read_to_string(app.dir.join("package-lock.json")).unwrap().contains("integrity"));
+        let mut app = app_missing_a_checksum("git+ssh://git@github.com/a/a.git#abc123");
+        app.on_key(key('I'));
+        wait_until(&mut app, |app| app.log.iter().any(|l| l == "No checksums added."));
+        assert!(app.log.iter().any(|l| l.contains("npm keeps no checksum for git packages")), "{:?}", app.log);
     }
 }

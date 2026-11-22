@@ -29,6 +29,10 @@ pub struct Info {
     pub since_commit: Option<DepChanges>,
     /// The lockfile's checksum of the package file, e.g. `sha512-…`.
     pub integrity: Option<String>,
+    /// The lockfile lists the package as downloaded from a registry or a git repository, but
+    /// without a checksum, so the package manager can't verify what it installs. Packages
+    /// linked from a local folder have none and aren't counted.
+    pub missing_integrity: bool,
     /// The lockfile it was read from, or `None` when there is none.
     pub lockfile: Option<&'static str>,
 }
@@ -145,6 +149,7 @@ impl Reader {
             dependencies,
             since_commit,
             integrity: entry.as_ref().and_then(integrity),
+            missing_integrity: entry.as_ref().is_some_and(|e| integrity(e).is_none() && !is_local(e)),
             lockfile,
             version,
         }
@@ -267,6 +272,16 @@ fn pnpm_entries(lock: serde_yaml_ng::Value) -> BTreeMap<String, Value> {
     out.into_iter().map(|(k, (_, v))| (k, v)).collect()
 }
 
+/// A lockfile entry for a package linked from a folder: a workspace, `file:` or `link:`.
+fn is_local(entry: &Value) -> bool {
+    let resolved = entry
+        .get("resolved")
+        .or_else(|| entry.get("resolution")?.get("directory"))
+        .and_then(Value::as_str);
+    entry.get("link").and_then(Value::as_bool) == Some(true)
+        || entry.get("resolution").is_some_and(|r| r.get("directory").is_some())
+        || resolved.is_some_and(|r| r.starts_with("file:") || r.starts_with("link:") || !r.contains(':'))
+}
 fn integrity(entry: &Value) -> Option<String> {
     entry
         .get("integrity")
@@ -334,6 +349,92 @@ fn dir_size(dir: &Path) -> (u64, u64) {
         }
     }
     (bytes, files)
+}
+
+/// The packages that got an integrity checksum between two versions of a lockfile (`file` is
+/// its name): locked at the same version, without one before and with one now.
+pub fn integrity_added(file: &str, old: &str, new: &str) -> Vec<(String, Version)> {
+    let file: &'static str = match file {
+        "package-lock.json" => "package-lock.json",
+        "pnpm-lock.yaml" => "pnpm-lock.yaml",
+        _ => return Vec::new(),
+    };
+    let (Some(old), Some(new)) = (Lock::parse(file, old), Lock::parse(file, new)) else {
+        return Vec::new();
+    };
+    let version = |e: &Value| e.get("version").and_then(Value::as_str).and_then(|v| Version::parse(v).ok());
+    new.entries
+        .iter()
+        .filter_map(|(name, now)| {
+            let before = old.entries.get(name)?;
+            let v = version(now)?;
+            (version(before) == Some(v.clone()) && integrity(before).is_none() && integrity(now).is_some())
+                .then(|| (name.clone(), v))
+        })
+        .collect()
+}
+
+/// What `package-lock.json` says about a package that lacks a checksum: its version and where
+/// it was downloaded from.
+pub fn npm_lock_entry(dir: &Path, name: &str) -> Option<(Version, Option<String>)> {
+    let text = std::fs::read_to_string(dir.join("package-lock.json")).ok()?;
+    let lock = Lock::parse("package-lock.json", &text)?;
+    let e = lock.entries.get(name)?;
+    let v = Version::parse(e.get("version")?.as_str()?).ok()?;
+    Some((v, e.get("resolved").and_then(Value::as_str).map(str::to_string)))
+}
+
+/// Writes checksums into `package-lock.json`: `integrity` of the top-level entry of each
+/// package, where npm writes it: after `resolved`, or after `version` without one. The file keeps its indentation and line
+/// endings. Returns the packages it wrote one for.
+pub fn set_npm_integrity(dir: &Path, sums: &[(String, String)]) -> Result<Vec<String>, String> {
+    let path = dir.join("package-lock.json");
+    let text = std::fs::read_to_string(&path).map_err(|e| format!("could not read package-lock.json: {e}"))?;
+    let mut lock: Value =
+        serde_json::from_str(&text).map_err(|e| format!("could not read package-lock.json: {e}"))?;
+    let packages = lock
+        .get_mut("packages")
+        .and_then(Value::as_object_mut)
+        .ok_or("package-lock.json has no `packages` (lockfile v1 is not supported)")?;
+    let mut done = Vec::new();
+    for (name, sum) in sums {
+        let Some(Value::Object(entry)) = packages.get_mut(&format!("node_modules/{name}")) else {
+            continue;
+        };
+        if entry.contains_key("integrity") {
+            continue;
+        }
+        // npm writes `version`, `resolved`, `integrity` first, in that order; `resolved` is
+        // left out with `omit-lockfile-registry-resolved`.
+        let at = ["resolved", "version", "name"]
+            .iter()
+            .find_map(|k| entry.keys().position(|x| x == k))
+            .map_or(0, |i| i + 1);
+        entry.shift_insert(at, "integrity".to_string(), Value::String(sum.clone()));
+        done.push(name.clone());
+    }
+    if done.is_empty() {
+        return Ok(done);
+    }
+    // npm writes JSON.stringify(lock, null, indent) and a newline, the indent taken from the
+    // file as it was.
+    let indent: String = text
+        .lines()
+        .nth(1)
+        .map(|l| l.chars().take_while(|c| c.is_whitespace()).collect())
+        .filter(|i: &String| !i.is_empty())
+        .unwrap_or_else(|| "  ".to_string());
+    let mut out = Vec::new();
+    let fmt = serde_json::ser::PrettyFormatter::with_indent(indent.as_bytes());
+    let mut ser = serde_json::Serializer::with_formatter(&mut out, fmt);
+    serde::Serialize::serialize(&lock, &mut ser).map_err(|e| e.to_string())?;
+    let mut out = String::from_utf8(out).map_err(|e| e.to_string())?;
+    out.push('\n');
+    if text.contains("\r\n") {
+        out = out.replace('\n', "\r\n");
+    }
+    std::fs::write(&path, out).map_err(|e| format!("could not write package-lock.json: {e}"))?;
+    Ok(done)
 }
 
 /// The versions of the tools `engines` can name that this machine runs for the project in `dir`:
@@ -548,6 +649,90 @@ mod tests {
         assert_eq!(parse_tool_version("v20.11.0\n"), Some(Version::new(20, 11, 0)));
         assert_eq!(parse_tool_version("10.2.4"), Some(Version::new(10, 2, 4)));
         assert_eq!(parse_tool_version("not a version"), None);
+    }
+    #[test]
+    fn a_missing_checksum_is_noticed_except_for_local_packages() {
+        let lock = r#"{"lockfileVersion":3,"packages":{
+            "node_modules/ok":{"version":"1.0.0","resolved":"https://r/ok.tgz","integrity":"sha512-x"},
+            "node_modules/bare":{"version":"1.0.0","resolved":"https://r/bare.tgz"},
+            "node_modules/gitdep":{"version":"1.0.0","resolved":"git+ssh://git@github.com/a/b.git#abc"},
+            "node_modules/ws":{"resolved":"packages/ws","link":true},
+            "node_modules/local":{"version":"1.0.0","resolved":"file:../local"}
+        }}"#;
+        let dir = tmp("integrity");
+        write(&dir.join("package-lock.json"), lock);
+        let mut r = Reader::new(dir.clone());
+        let missing = |r: &mut Reader, n: &str| r.info(n).missing_integrity;
+        assert!(!missing(&mut r, "ok"));
+        assert!(missing(&mut r, "bare"));
+        assert!(missing(&mut r, "gitdep"), "git packages can't be verified either");
+        assert!(!missing(&mut r, "ws"), "a workspace");
+        assert!(!missing(&mut r, "local"));
+        assert!(!missing(&mut r, "absent"), "not in the lockfile at all");
+        let pnpm = "lockfileVersion: '9.0'\npackages:\n  a@1.0.0:\n    resolution: {tarball: https://r/a.tgz}\n";
+        write(&dir.join("pnpm-lock.yaml"), pnpm);
+        std::fs::remove_file(dir.join("package-lock.json")).unwrap();
+        assert!(Reader::new(dir.clone()).info("a").missing_integrity);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+    #[test]
+    fn checksums_are_written_after_resolved_keeping_the_format() {
+        let dir = tmp("setsum");
+        let lock = "{\n    \"name\": \"app\",\n    \"lockfileVersion\": 3,\n    \"packages\": {\n        \"\": {\n            \"name\": \"app\"\n        },\n        \"node_modules/a\": {\n            \"version\": \"1.0.0\",\n            \"resolved\": \"https://r/a/-/a-1.0.0.tgz\",\n            \"license\": \"MIT\"\n        },\n        \"node_modules/b\": {\n            \"version\": \"1.0.0\",\n            \"integrity\": \"sha512-keep\"\n        }\n    }\n}\n";
+        write(&dir.join("package-lock.json"), lock);
+        let done = set_npm_integrity(
+            &dir,
+            &[("a".into(), "sha512-new".into()), ("b".into(), "sha512-other".into()), ("x".into(), "sha512-x".into())],
+        )
+        .unwrap();
+        assert_eq!(done, vec!["a".to_string()], "b has one already; x isn't there");
+        let text = std::fs::read_to_string(dir.join("package-lock.json")).unwrap();
+        let want = lock.replace(
+            "\"resolved\": \"https://r/a/-/a-1.0.0.tgz\",\n",
+            "\"resolved\": \"https://r/a/-/a-1.0.0.tgz\",\n            \"integrity\": \"sha512-new\",\n",
+        );
+        assert_eq!(text, want, "only the new line differs");
+        // Without `resolved`, it goes right under `version`, not last.
+        let lock = "{\n  \"packages\": {\n    \"node_modules/c\": {\n      \"version\": \"1.0.0\",\n      \"license\": \"MIT\",\n      \"engines\": {\n        \"node\": \">=18\"\n      }\n    }\n  }\n}\n";
+        write(&dir.join("package-lock.json"), lock);
+        set_npm_integrity(&dir, &[("c".into(), "sha512-c".into())]).unwrap();
+        let text = std::fs::read_to_string(dir.join("package-lock.json")).unwrap();
+        assert_eq!(
+            text,
+            lock.replace(
+                "\"version\": \"1.0.0\",\n",
+                "\"version\": \"1.0.0\",\n      \"integrity\": \"sha512-c\",\n"
+            )
+        );
+        write(&dir.join("package-lock.json"), &want);
+        assert_eq!(
+            npm_lock_entry(&dir, "a"),
+            Some((Version::new(1, 0, 0), Some("https://r/a/-/a-1.0.0.tgz".into())))
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+    #[test]
+    fn added_checksums_are_found_between_two_lockfiles() {
+        let old = r#"{"packages":{
+            "node_modules/a":{"version":"1.0.0"},
+            "node_modules/b":{"version":"1.0.0"},
+            "node_modules/c":{"version":"1.0.0","integrity":"sha512-c"},
+            "node_modules/d":{"version":"1.0.0"}}}"#;
+        let new = r#"{"packages":{
+            "node_modules/a":{"version":"1.0.0","integrity":"sha512-a"},
+            "node_modules/b":{"version":"1.0.0"},
+            "node_modules/c":{"version":"1.0.0","integrity":"sha512-c2"},
+            "node_modules/d":{"version":"2.0.0","integrity":"sha512-d"},
+            "node_modules/e":{"version":"1.0.0","integrity":"sha512-e"}}}"#;
+        assert_eq!(
+            integrity_added("package-lock.json", old, new),
+            vec![("a".to_string(), Version::new(1, 0, 0))],
+            "b still has none, c had one, d was upgraded, e is new"
+        );
+        let old = "packages:\n  a@1.0.0:\n    resolution: {tarball: https://r/a.tgz}\n";
+        let new = "packages:\n  a@1.0.0:\n    resolution: {integrity: sha512-a, tarball: https://r/a.tgz}\n";
+        assert_eq!(integrity_added("pnpm-lock.yaml", old, new).len(), 1);
+        assert!(integrity_added("yarn.lock", "", "").is_empty());
     }
     #[test]
     fn sizes_read_like_npm_prints_them() {

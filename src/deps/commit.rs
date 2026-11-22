@@ -31,6 +31,8 @@ pub enum Change {
     OverrideAdd { name: String, value: String },
     OverrideRemove { name: String },
     OverrideChange { name: String, from: String, to: String },
+    /// The lockfile got the checksum of a package it had none for, at the same version.
+    Integrity { name: String, version: String },
 }
 
 impl Change {
@@ -48,12 +50,15 @@ impl Change {
                 ("change the override of", format!("{name} {from} to {to}"), name.clone())
             }
             Change::OverrideRemove { name } => ("remove the override of", name.clone(), name.clone()),
+            Change::Integrity { name, version } => {
+                ("add the checksum of", format!("{name} {version}"), name.clone())
+            }
         }
     }
 }
 
 /// The order kinds of change appear in a title.
-const VERBS: [&str; 8] = [
+const VERBS: [&str; 9] = [
     "upgrade",
     "downgrade",
     "add",
@@ -62,6 +67,7 @@ const VERBS: [&str; 8] = [
     "override",
     "change the override of",
     "remove the override of",
+    "add the checksum of",
 ];
 
 /// `a`, `a and b`, `a, b and c`.
@@ -119,6 +125,9 @@ pub fn title(changes: &[Change]) -> String {
     });
     let noun = if overrides_only { "overrides" } else { "dependencies" };
     match groups.as_slice() {
+        [("add the checksum of", items)] => {
+            format!("chore: add the integrity checksums of {} packages", items.len())
+        }
         [(verb, items)] if !verb.contains("override") || overrides_only => {
             let verb = verb.trim_end_matches(" the override of");
             format!("chore: {verb} {} {noun}", items.len())
@@ -378,11 +387,22 @@ pub fn prepare(dir: &Path, pm: Pm) -> Result<Plan, String> {
         }
         _ => (HashMap::new(), HashMap::new()),
     };
-    let changes = if changed.is_empty() {
+    let mut changes = if changed.is_empty() {
         Vec::new()
     } else {
         changes(&old, &new, &old_lock, &new_lock, pm)
     };
+    // Checksums the lockfile got since the last commit (e.g. depsu's `I`).
+    if let Some(l) = &lock {
+        let rel = relative(l, &dir);
+        if changed.contains(&rel) {
+            let file = l.file_name().map(|f| f.to_string_lossy().into_owned()).unwrap_or_default();
+            let (before, now) = (at_head(&rel).unwrap_or_default(), std::fs::read_to_string(l).unwrap_or_default());
+            for (name, version) in crate::deps::info::integrity_added(&file, &before, &now) {
+                changes.push(Change::Integrity { name, version: version.to_string() });
+            }
+        }
+    }
 
     let branch = git(&dir, &["symbolic-ref", "--short", "HEAD"])
         .map(|b| b.trim().to_string())
@@ -634,6 +654,26 @@ mod tests {
     }
 
     #[test]
+    fn added_checksums_have_their_own_wording() {
+        let sum = |n: &str| Change::Integrity { name: n.into(), version: "1.0.0".into() };
+        assert_eq!(title(&[sum("a")]), "chore: add the checksum of a 1.0.0");
+        assert_eq!(
+            title(&[up("eslint", "9.0.0", "9.0.1"), sum("a")]),
+            "chore: upgrade eslint 9.0.0 to 9.0.1, add the checksum of a 1.0.0"
+        );
+        // Over 72 characters with the versions: the names say it.
+        assert_eq!(
+            title(&[up("@typescript-eslint/parser", "8.57.0", "9.0.0"), sum("a")]),
+            "chore: upgrade @typescript-eslint/parser, add the checksum of a"
+        );
+        let many: Vec<Change> = (0..9).map(|i| sum(&format!("some-long-package-{i}"))).collect();
+        assert_eq!(title(&many), "chore: add the integrity checksums of 9 packages");
+        assert_eq!(
+            body(&[sum("a"), sum("b")]),
+            "- add the checksum of a 1.0.0\n- add the checksum of b 1.0.0"
+        );
+    }
+    #[test]
     fn the_body_is_left_out_when_the_title_already_says_it_all() {
         // One change.
         let p = plan_for(&[up("eslint", "8.57.0", "9.0.0")]);
@@ -780,6 +820,23 @@ mod tests {
         std::fs::remove_dir_all(root).unwrap();
     }
 
+    #[test]
+    fn a_checksum_added_to_the_lockfile_is_committed_with_its_own_title() {
+        // The committed lockfile has no checksum for eslint; now it has one.
+        let (root, dir) = repo("integrity");
+        std::fs::write(
+            dir.join("package-lock.json"),
+            r#"{"lockfileVersion":3,"packages":{"node_modules/eslint":{"version":"8.57.1","integrity":"sha512-e"}}}"#,
+        )
+        .unwrap();
+        let plan = prepare(&dir, Pm::Npm).unwrap();
+        assert_eq!(plan.title, "chore: add the checksum of eslint 8.57.1");
+        assert_eq!(plan.files, ["package-lock.json"], "package.json didn't change");
+        assert!(title_has_changes(&plan, &plan.title));
+        run(&dir, &plan, &plan.title, body_for(&plan, &plan.title).as_deref()).unwrap();
+        assert_eq!(sh(&root, &["log", "-1", "--format=%s"]), "chore: add the checksum of eslint 8.57.1");
+        std::fs::remove_dir_all(root).unwrap();
+    }
     #[test]
     fn nothing_to_commit_when_the_files_are_unchanged() {
         let (root, dir) = repo("clean");

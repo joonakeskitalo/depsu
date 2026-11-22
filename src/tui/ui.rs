@@ -1699,6 +1699,14 @@ fn row_line(app: &App, r: &AppRow, indent: usize, name_w: usize, width: usize) -
             Style::new().fg(Color::Yellow).add_modifier(Modifier::BOLD),
         ));
     }
+    // A package the lockfile lists without a checksum can't be verified when installed. Shown
+    // with the details panel, which says more about it.
+    if app.show_info && app.info.get(&r.name).is_some_and(|(_, i)| i.missing_integrity) {
+        spans.push(Span::styled(
+            "   ⚠ no integrity checksum",
+            Style::new().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+        ));
+    }
     // The engines the installed copy wants and the tools here don't have.
     let engines: Vec<String> = app
         .engine_problems(&r.name)
@@ -2235,7 +2243,15 @@ fn package_lines(
             };
             add(vec![Span::styled(format!("integrity: {short} ({file})"), cyan)]);
         }
-        (None, Some(file)) => add(vec![Span::styled(format!("⚠ no integrity checksum in {file}"), yellow)]),
+        (None, Some(file)) if i.missing_integrity => {
+            let fix = if file == "package-lock.json" {
+                ", I adds the registry's"
+            } else {
+                ", `pnpm install --fix-lockfile` adds it"
+            };
+            add(vec![Span::styled(format!("⚠ no integrity checksum in {file}{fix}"), yellow)])
+        }
+        (None, Some(file)) => add(vec![Span::styled(format!("integrity: none, not in {file} as a download"), dim)]),
         (_, None) => add(vec![Span::styled("integrity: no npm or pnpm lockfile to read", dim)]),
     }
     if i.dependencies.is_empty() {

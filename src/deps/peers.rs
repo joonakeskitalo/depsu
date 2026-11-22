@@ -285,6 +285,7 @@ mod tests {
                         v(ver),
                         VersionInfo {
                             tarball: None,
+                            integrity: None,
                             peers: peers
                                 .iter()
                                 .map(|(n, r)| (n.to_string(), r.to_string()))

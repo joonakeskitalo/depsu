@@ -107,6 +107,8 @@ pub struct VersionInfo {
     pub peers: HashMap<String, String>,
     /// Where the package file is downloaded from (`dist.tarball`).
     pub tarball: Option<String>,
+    /// The checksum the registry publishes for the package file (`dist.integrity`).
+    pub integrity: Option<String>,
 }
 
 /// The versions of a package, from its registry document.
@@ -176,6 +178,7 @@ fn parse_packument(reader: impl Read) -> Result<Packument, String> {
     #[derive(serde::Deserialize)]
     struct Dist {
         tarball: Option<String>,
+        integrity: Option<String>,
     }
     let doc: Doc = serde_json::from_reader(BufReader::new(reader))
         .map_err(|e| format!("invalid response: {e}"))?;
@@ -185,8 +188,11 @@ fn parse_packument(reader: impl Read) -> Result<Packument, String> {
             .versions
             .into_iter()
             .filter_map(|(v, info)| {
-                let tarball = info.dist.and_then(|d| d.tarball);
-                Some((Version::parse(&v).ok()?, VersionInfo { peers: info.peers, tarball }))
+                let (tarball, integrity) = match info.dist {
+                    Some(d) => (d.tarball, d.integrity),
+                    None => (None, None),
+                };
+                Some((Version::parse(&v).ok()?, VersionInfo { peers: info.peers, tarball, integrity }))
             })
             .collect(),
     })
@@ -233,7 +239,7 @@ mod tests {
     #[test]
     fn reads_versions_and_their_peers() {
         let doc = br#"{"name":"react-dom","dist-tags":{"latest":"19.0.0"},"versions":{
-            "18.2.0":{"version":"18.2.0","peerDependencies":{"react":"^18.2.0"},"dist":{"tarball":"https://r/react-dom/-/react-dom-18.2.0.tgz"}},
+            "18.2.0":{"version":"18.2.0","peerDependencies":{"react":"^18.2.0"},"dist":{"tarball":"https://r/react-dom/-/react-dom-18.2.0.tgz","integrity":"sha512-rd"}},
             "19.0.0":{"version":"19.0.0","peerDependencies":{"react":"^19.0.0"}},
             "19.1.0-rc.0":{"version":"19.1.0-rc.0"},
             "20.0.0":{"version":"20.0.0"},
@@ -247,6 +253,7 @@ mod tests {
             p.versions[&Version::new(18, 2, 0)].tarball.as_deref(),
             Some("https://r/react-dom/-/react-dom-18.2.0.tgz")
         );
+        assert_eq!(p.versions[&Version::new(18, 2, 0)].integrity.as_deref(), Some("sha512-rd"));
         // `best` skips pre-releases and anything above `latest`.
         assert_eq!(p.best(|_, _| true), Some(Version::new(19, 0, 0)));
         assert_eq!(
