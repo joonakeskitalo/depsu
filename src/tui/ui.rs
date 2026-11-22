@@ -1580,6 +1580,7 @@ fn row_line(app: &App, r: &AppRow, indent: usize, name_w: usize, width: usize) -
     let mark = match r.status {
         Status::Queued => "…",
         Status::Installing => "⟳",
+        Status::Failed if r.selected => "●",
         Status::Failed => "✘",
         Status::Idle if r.selected => "●",
         Status::Idle if !r.outdated => "·",
