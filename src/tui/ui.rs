@@ -165,6 +165,8 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         let details = app.cursor_info().cloned();
         let mut lines = if on_package {
             package_lines(details.as_ref(), &app.tools, panel_width(f) as usize)
+        } else if let Some((idx, v)) = app.cursor_vuln() {
+            vuln_lines(app, &app.rows[idx], v, panel_width(f) as usize)
         } else {
             Vec::new()
         };
@@ -278,7 +280,10 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     let info_title = match app.cursor_item() {
         Some(Item::Row { idx, .. }) => format!("selected: {}", app.rows[*idx].name),
         Some(Item::Removed { name }) => format!("selected: {name}"),
-        _ => "selected".to_string(),
+        _ => match app.cursor_vuln() {
+            Some((_, v)) => format!("selected: {} in {}", v.id, v.package),
+            None => "selected".to_string(),
+        },
     };
     if info {
         // A new item is shown from the top.
@@ -2267,6 +2272,69 @@ fn package_lines(
             }
             add(parts);
         }
+    }
+    lines
+}
+/// For the vulnerability under the cursor: what it is, where it comes in, and how to fix it.
+fn vuln_lines(app: &App, r: &AppRow, v: &crate::security::vuln::Vuln, width: usize) -> Vec<Line<'static>> {
+    let cyan = Style::new().fg(Color::Cyan);
+    let dim = Style::new().fg(Color::DarkGray);
+    let mut lines = Vec::new();
+    let mut add = |spans: Vec<Span<'static>>| {
+        lines.extend(wrap(Span::raw(""), Span::raw("  "), spans, width));
+    };
+    add(vec![
+        Span::styled(
+            format!("✱ {}", v.severity.label()),
+            Style::new().fg(severity_color(v.severity)).add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(format!("  {}", v.title)),
+        Span::styled(format!("  (found by {})", v.source.label()), dim),
+    ]);
+    // Where it comes in: the vulnerable package, and the chain from the direct dependency.
+    let mut chain = vec![match &v.direct_version {
+        Some(dv) => format!("{}@{dv}", v.direct),
+        None => v.direct.clone(),
+    }];
+    chain.extend(v.path.iter().cloned());
+    let at = if v.path.is_empty() {
+        format!("in {}@{}, a direct dependency", v.package, v.version)
+    } else {
+        format!("in {}@{} via {}", v.package, v.version, chain.join(" > "))
+    };
+    add(vec![Span::styled(at, cyan)]);
+    let mut facts = Vec::new();
+    if let Some(range) = &v.range {
+        facts.push(format!("affected: {range}"));
+    }
+    // For a direct dependency the fix line below says the same.
+    let fixes = v.newer_fixes();
+    if !v.path.is_empty() && !fixes.is_empty() {
+        facts.push(format!("fixed in {} {}", v.package, fixes.join(", ")));
+    }
+    if !v.cve.is_empty() {
+        facts.push(v.cve.join(", "));
+    }
+    if !facts.is_empty() {
+        add(vec![Span::styled(facts.join(" · "), cyan)]);
+    }
+    // What the keys do about it, as on the finding's line in the list.
+    let mut fix = fix_spans(app, r, v);
+    if let Some(first) = fix.first_mut() {
+        first.content = first.content.trim_start().trim_start_matches("· ").to_string().into();
+    }
+    fix.retain(|s| !s.content.is_empty());
+    add(fix);
+    let url = if v.id.starts_with("SNYK-") {
+        Some(format!("https://security.snyk.io/vuln/{}", v.id))
+    } else if v.id.starts_with("GHSA-") {
+        Some(format!("https://github.com/advisories/{}", v.id))
+    } else {
+        v.cve.first().map(|c| format!("https://nvd.nist.gov/vuln/detail/{c}"))
+    };
+    match url {
+        Some(u) => add(vec![Span::styled(format!("{} · {u}", v.id), dim)]),
+        None => add(vec![Span::styled(v.id.clone(), dim)]),
     }
     lines
 }

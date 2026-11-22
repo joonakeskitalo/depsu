@@ -3281,7 +3281,7 @@ impl App {
     }
 
     /// The finding under the cursor, with the index of its row.
-    fn cursor_vuln(&self) -> Option<(usize, &Vuln)> {
+    pub fn cursor_vuln(&self) -> Option<(usize, &Vuln)> {
         let Some(Item::Detail {
             idx,
             child: Child::Vuln(i),
@@ -7290,5 +7290,25 @@ mod tests {
         assert!(screen.contains("engines: node >=18 · platform: any"), "{screen}");
         assert!(!screen.contains("20.1.0"), "the installed version isn't shown when it fits");
         assert!(!screen.contains("⚠ needs"));
+    }
+    #[test]
+    fn a_selected_vulnerability_has_its_details_shown() {
+        let mut app = app_with_three_findings();
+        app.show_info = true;
+        cursor_on_finding(&mut app, "NESTED");
+        let screen = render(&mut app, 120, 36).join("\n");
+        for want in [
+            "selected: NESTED in qs",
+            "✱ high  Bad  (found by snyk)",
+            "in qs@6.0.0 via a@1.0.0 > mid > qs",
+            "fixed in qs 6.0.4",
+            "⬆ fix: p overrides qs to ^6.0.4",
+        ] {
+            assert!(screen.contains(want), "{want:?} missing in\n{screen}");
+        }
+        assert!(!screen.contains("nothing more to show"));
+        cursor_on_finding(&mut app, "NOFIX");
+        let screen = render(&mut app, 120, 36).join("\n");
+        assert!(screen.contains("│ no fix available"), "{screen}");
     }
 }
