@@ -164,7 +164,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         let on_package = matches!(app.cursor_item(), Some(Item::Row { .. }));
         let details = app.cursor_info().cloned();
         let mut lines = if on_package {
-            package_lines(details.as_ref(), panel_width(f) as usize)
+            package_lines(details.as_ref(), &app.tools, panel_width(f) as usize)
         } else {
             Vec::new()
         };
@@ -1694,6 +1694,25 @@ fn row_line(app: &App, r: &AppRow, indent: usize, name_w: usize, width: usize) -
             Style::new().fg(Color::Yellow).add_modifier(Modifier::BOLD),
         ));
     }
+    // The engines the installed copy wants and the tools here don't have.
+    let engines: Vec<String> = app
+        .engine_problems(&r.name)
+        .into_iter()
+        .map(|p| format!("{} {} (has {})", p.tool, p.range, p.have))
+        .collect();
+    if !engines.is_empty() {
+        let used: usize = spans.iter().map(|s| s.width()).sum();
+        let full = format!("   ⚠ needs {}", engines.join(", "));
+        let text = if used + full.chars().count() < width {
+            full
+        } else {
+            format!("   ⚠ engine mismatch: {}", engines.len())
+        };
+        spans.push(Span::styled(
+            text,
+            Style::new().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+        ));
+    }
     let line = Line::from(spans);
     if r.busy() || !r.outdated {
         line.style(Style::new().add_modifier(Modifier::DIM))
@@ -2121,7 +2140,11 @@ fn summary_lines(app: &App, width: usize) -> Vec<Line<'static>> {
 
 /// For the package under the cursor: what its installed copy and the lockfile say about it.
 /// `None` while it is being read.
-fn package_lines(info: Option<&crate::deps::info::Info>, width: usize) -> Vec<Line<'static>> {
+fn package_lines(
+    info: Option<&crate::deps::info::Info>,
+    tools: &std::collections::BTreeMap<String, semver::Version>,
+    width: usize,
+) -> Vec<Line<'static>> {
     use crate::deps::info::{InstallScripts, human_size};
     let dim = Style::new().fg(Color::DarkGray);
     let (cyan, yellow, red) = (
@@ -2170,19 +2193,34 @@ fn package_lines(info: Option<&crate::deps::info::Info>, width: usize) -> Vec<Li
     if !what.is_empty() {
         add(vec![Span::styled(what.join(" · "), cyan)]);
     }
-    // Where it runs.
-    let mut runs = Vec::new();
+    // Where it runs. Each engine is checked against the version installed here; only one that
+    // doesn't fit says what is installed.
+    let mut runs: Vec<Span<'static>> = Vec::new();
     if !i.engines.is_empty() {
-        let e: Vec<String> = i.engines.iter().map(|(k, v)| format!("{k} {v}")).collect();
-        runs.push(format!("engines: {}", e.join(", ")));
+        runs.push(Span::styled("engines: ", cyan));
+        for (n, (tool, range)) in i.engines.iter().enumerate() {
+            if n > 0 {
+                runs.push(Span::styled(", ", cyan));
+            }
+            let have = tools.get(tool);
+            match have.and_then(|v| crate::deps::overrides::satisfies(range, v).map(|ok| (v, ok))) {
+                Some((v, false)) => runs.push(Span::styled(
+                    format!("⚠ {tool} {range}, but {v} is installed"),
+                    yellow.add_modifier(Modifier::BOLD),
+                )),
+                // A fitting or unchecked engine is just listed.
+                _ => runs.push(Span::styled(format!("{tool} {range}"), cyan)),
+            }
+        }
+        runs.push(Span::styled(" · ", cyan));
     }
     if i.platform.is_empty() {
-        runs.push("platform: any".to_string());
+        runs.push(Span::styled("platform: any", cyan));
     } else {
         let p: Vec<String> = i.platform.iter().map(|(k, v)| format!("{k} {}", v.join(", "))).collect();
-        runs.push(format!("platform: {}", p.join("; ")));
+        runs.push(Span::styled(format!("platform: {}", p.join("; ")), cyan));
     }
-    add(vec![Span::styled(runs.join(" · "), cyan)]);
+    add(runs);
     match (&i.integrity, i.lockfile) {
         (Some(sum), Some(file)) => {
             // `sha512-` and enough of the hash to tell it apart.

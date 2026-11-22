@@ -87,7 +87,7 @@ depsu --cache .depsu-cache.json   # remember versions and scans between runs
 | `n` | Run `npm audit` / `bun audit` (whichever the project uses) |
 | `v` | Show / hide vulnerability findings |
 | `R` | Fetch the latest versions again, ignoring the cache |
-| `?` | Show / hide the details panel for the highlighted package: whether it is deprecated, its install scripts, installed version, size and file count, engines and platform (`os`, `cpu`, `libc`), the lockfile's integrity checksum, its dependencies and how they changed since the last commit, installed packages that use it, its peer dependencies with the versions installed, and its override summary. A package with an installed peer outside the range it declares is flagged in the list with `⚠ unmet peer: react ^18.0.0 (has 19.0.0)` |
+| `?` | Show / hide the details panel for the highlighted package: whether it is deprecated, its install scripts, installed version, size and file count, engines (checked against the node, npm and package manager versions installed here; a mismatch is also flagged in the list with `⚠ needs node >=20 (has 18.19.0)`) and platform (`os`, `cpu`, `libc`), the lockfile's integrity checksum, its dependencies and how they changed since the last commit, installed packages that use it, its peer dependencies with the versions installed, and its override summary. A package with an installed peer outside the range it declares is flagged in the list with `⚠ unmet peer: react ^18.0.0 (has 19.0.0)` |
 | `Shift+↑` / `Shift+↓` | Scroll the details panel. It keeps the same height for every package; its title shows which lines are in view when there are more |
 | `q` / `Esc` | Quit (press twice while an install is running) |
 

@@ -336,6 +336,58 @@ fn dir_size(dir: &Path) -> (u64, u64) {
     (bytes, files)
 }
 
+/// The versions of the tools `engines` can name that this machine runs for the project in `dir`:
+/// node, npm and the project's package manager. Run in `dir`, so version managers (asdf, nvm,
+/// volta) pick the version the project uses. Tools that don't answer are left out.
+pub fn tool_versions(dir: &Path, pm: &str) -> BTreeMap<String, Version> {
+    let mut tools = vec!["node", "npm"];
+    if !tools.contains(&pm) {
+        tools.push(pm);
+    }
+    tools
+        .into_iter()
+        .filter_map(|t| {
+            let out = Command::new(t).arg("--version").current_dir(dir).output().ok()?;
+            let text = String::from_utf8_lossy(&out.stdout);
+            let v = parse_tool_version(&text)?;
+            out.status.success().then(|| (t.to_string(), v))
+        })
+        .collect()
+}
+
+/// `v20.11.0`, `10.2.4\n`, `1.1.0-canary` → the version.
+fn parse_tool_version(text: &str) -> Option<Version> {
+    let t = text.trim().lines().next()?.trim().trim_start_matches('v');
+    Version::parse(t).ok()
+}
+
+/// An `engines` entry the tool installed here does not satisfy.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EngineProblem {
+    pub tool: String,
+    pub range: String,
+    pub have: Version,
+}
+
+/// The `engines` entries that the installed tools don't satisfy. Tools that aren't installed,
+/// or ranges that can't be read, are not reported.
+pub fn engine_problems(
+    engines: &BTreeMap<String, String>,
+    tools: &BTreeMap<String, Version>,
+) -> Vec<EngineProblem> {
+    engines
+        .iter()
+        .filter_map(|(tool, range)| {
+            let have = tools.get(tool)?;
+            (crate::deps::overrides::satisfies(range, have) == Some(false)).then(|| EngineProblem {
+                tool: tool.clone(),
+                range: range.clone(),
+                have: have.clone(),
+            })
+        })
+        .collect()
+}
+
 /// `1.2 MB`, `340 kB`, `12 B`: decimal units, as npm prints sizes.
 pub fn human_size(bytes: u64) -> String {
     match bytes {
@@ -473,6 +525,30 @@ mod tests {
         assert!(Lock::parse("pnpm-lock.yaml", v5).unwrap().entries.contains_key("@s/d"));
     }
 
+    #[test]
+    fn engines_are_checked_against_the_installed_tools() {
+        let tools: BTreeMap<String, Version> =
+            [("node".to_string(), Version::new(18, 19, 0)), ("npm".to_string(), Version::new(10, 2, 4))]
+                .into();
+        let engines: BTreeMap<String, String> = [
+            ("node".to_string(), "^18.18.0 || ^19.8.0 || >= 20.0.0".to_string()),
+            ("npm".to_string(), ">=11".to_string()),
+            ("pnpm".to_string(), ">=9".to_string()),
+            ("vscode".to_string(), "^1.80.0".to_string()),
+        ]
+        .into();
+        let p = engine_problems(&engines, &tools);
+        assert_eq!(
+            p,
+            vec![EngineProblem { tool: "npm".into(), range: ">=11".into(), have: Version::new(10, 2, 4) }],
+            "node fits; pnpm and vscode aren't installed"
+        );
+        let engines: BTreeMap<String, String> = [("node".to_string(), ">=20".to_string())].into();
+        assert_eq!(engine_problems(&engines, &tools)[0].have, Version::new(18, 19, 0));
+        assert_eq!(parse_tool_version("v20.11.0\n"), Some(Version::new(20, 11, 0)));
+        assert_eq!(parse_tool_version("10.2.4"), Some(Version::new(10, 2, 4)));
+        assert_eq!(parse_tool_version("not a version"), None);
+    }
     #[test]
     fn sizes_read_like_npm_prints_them() {
         assert_eq!(human_size(12), "12 B");

@@ -44,6 +44,8 @@ pub enum Event {
         generation: u64,
         info: crate::deps::info::Info,
     },
+    /// The versions of node, npm and the package manager installed here.
+    Tools(std::collections::BTreeMap<String, Version>),
     Scan {
         source: Source,
         result: Result<Report, String>,
@@ -689,6 +691,9 @@ pub struct App {
     info_pending: HashSet<String>,
     /// Bumped when the details read so far go stale.
     info_generation: u64,
+    /// The versions of node, npm and the package manager this machine runs for the project,
+    /// to check `engines` against. Empty until they've been asked.
+    pub tools: std::collections::BTreeMap<String, Version>,
     events_tx: Sender<Event>,
     /// Target version of each package being installed.
     install_targets: HashMap<String, Version>,
@@ -787,6 +792,14 @@ impl App {
             let (dir, tx) = (dir.clone(), tx.clone());
             thread::spawn(move || info_worker(dir, info_rx, tx));
         }
+        // Tests set the tool versions they need instead of running this machine's.
+        if !cfg!(test) {
+            // `node --version` can take a while behind a version manager's shim.
+            let (dir, tx) = (dir.clone(), tx.clone());
+            thread::spawn(move || {
+                let _ = tx.send(Event::Tools(crate::deps::info::tool_versions(&dir, pm.name())));
+            });
+        }
         // One install worker: package managers don't tolerate parallel installs.
         let worker_dir = dir.clone();
         thread::spawn(move || install_worker(worker_dir, pm, job_rx, tx));
@@ -870,6 +883,7 @@ impl App {
             info: HashMap::new(),
             info_pending: HashSet::new(),
             info_generation: 0,
+            tools: Default::default(),
             events_tx,
             install_targets: HashMap::new(),
             confirm_conflicts: None,
@@ -1238,6 +1252,14 @@ impl App {
         }
         self.info.get(&name).map(|(_, i)| i)
     }
+    /// The `engines` entries of the installed copy of `name` that the tools installed here
+    /// don't satisfy. Empty until its details and the tool versions are known.
+    pub fn engine_problems(&self, name: &str) -> Vec<crate::deps::info::EngineProblem> {
+        match self.info.get(name) {
+            Some((_, i)) => crate::deps::info::engine_problems(&i.engines, &self.tools),
+            None => Vec::new(),
+        }
+    }
     /// Has the details of every package read in the background, so they are there by the
     /// time the cursor gets to them.
     fn prefetch_info(&mut self) {
@@ -1285,6 +1307,11 @@ impl App {
                 }
                 Event::Tree { name, hits } => self.on_tree(name, hits),
                 Event::Dependents(map) => self.dependents = map,
+                Event::Tools(found) => {
+                    for (tool, v) in found {
+                        self.tools.entry(tool).or_insert(v);
+                    }
+                }
                 Event::Info { name, generation, info } => {
                     if generation == self.info_generation {
                         self.info_pending.remove(&name);
@@ -7121,6 +7148,9 @@ mod tests {
         .unwrap();
         // The files were written after the start: read again, as after an install.
         app.forget_info();
+        // This machine's tools, so the check doesn't depend on what the test runs on. (What
+        // is set first wins over what the background check finds later.)
+        app.tools.insert("node".into(), Version::new(16, 20, 0));
         app.show_info = true;
         cursor_to_name(&mut app, "a");
         buffer(&mut app, 140, 40);
@@ -7131,7 +7161,9 @@ mod tests {
             "⚠ deprecated: use b",
             "⚠ install scripts: postinstall: node setup.js",
             "installed 1.0.0 · ",
-            "engines: node >=18 · platform: os darwin",
+            "engines: ⚠ node >=18, but 16.20.0 is installed · platform: os darwin",
+            // The list warns about it on the package's row.
+            "⚠ needs node >=18 (has 16.20.0)",
             "integrity: sha512-0123456789ab… (package-lock.json)",
             "1 dependency: x ^1.0.0",
         ] {
@@ -7241,5 +7273,22 @@ mod tests {
         mouse(&mut app, MouseEventKind::Up(MouseButton::Left), x, y);
         assert!(app.log_focus, "the log opened");
         assert!(app.selection.is_none());
+    }
+    #[test]
+    fn a_fitting_engine_is_listed_plainly_and_not_flagged() {
+        let mut app = app_with_installed("2.0.0", &[], |_| {});
+        let a = app.dir.join("node_modules/a");
+        std::fs::create_dir_all(&a).unwrap();
+        std::fs::write(a.join("package.json"), r#"{"version":"1.0.0","engines":{"node":">=18"}}"#).unwrap();
+        app.forget_info();
+        app.tools.insert("node".into(), Version::new(20, 1, 0));
+        app.show_info = true;
+        cursor_to_name(&mut app, "a");
+        buffer(&mut app, 140, 40);
+        wait_until(&mut app, |app| app.info.get("a").is_some_and(|(_, i)| !i.engines.is_empty()));
+        let screen = render(&mut app, 140, 40).join("\n");
+        assert!(screen.contains("engines: node >=18 · platform: any"), "{screen}");
+        assert!(!screen.contains("20.1.0"), "the installed version isn't shown when it fits");
+        assert!(!screen.contains("⚠ needs"));
     }
 }
