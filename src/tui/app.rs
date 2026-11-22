@@ -1120,6 +1120,12 @@ impl App {
             .unwrap_or_else(|| self.dir.display().to_string())
     }
 
+    /// The checked-out Git branch (or the short hash when HEAD is detached), read from the
+    /// repository's HEAD file so it is cheap enough to ask on every redraw.
+    pub fn git_branch(&self) -> Option<String> {
+        git_branch(&self.dir)
+    }
+
     pub fn push_log(&mut self, msg: impl Into<String>) {
         self.log.push(msg.into());
         if self.log.len() > 200 {
@@ -4146,6 +4152,22 @@ fn install_worker(dir: PathBuf, pm: Pm, jobs: Receiver<Job>, tx: Sender<Event>) 
 }
 
 /// `1.2.3`, also written `v1.2.3` or `=1.2.3`.
+/// The branch `dir`'s repository has checked out. Handles `.git` files (worktrees, submodules).
+fn git_branch(dir: &std::path::Path) -> Option<String> {
+    let (root, dot_git) = dir.ancestors().map(|d| (d, d.join(".git"))).find(|(_, g)| g.exists())?;
+    let git_dir = if dot_git.is_file() {
+        let text = std::fs::read_to_string(&dot_git).ok()?;
+        root.join(text.trim().strip_prefix("gitdir:")?.trim())
+    } else {
+        dot_git
+    };
+    let head = std::fs::read_to_string(git_dir.join("HEAD")).ok()?;
+    let head = head.trim();
+    match head.strip_prefix("ref: ") {
+        Some(r) => Some(r.strip_prefix("refs/heads/").unwrap_or(r).to_string()),
+        None => Some(head.chars().take(7).collect()).filter(|h: &String| !h.is_empty()),
+    }
+}
 fn parse_version(text: &str) -> Option<Version> {
     Version::parse(text.trim().trim_start_matches(['v', '='])).ok()
 }
@@ -6666,5 +6688,18 @@ mod tests {
         let (x, y) = find(&buf, "group: ");
         click(&mut app, x, y);
         assert_ne!(app.group_by, GroupBy::Release, "g moved on to the next grouping");
+    }
+    #[test]
+    fn the_git_branch_is_read_from_head() {
+        let dir = std::env::temp_dir().join(format!("depsu-branch-{}", std::process::id()));
+        let sub = dir.join("a/b");
+        std::fs::create_dir_all(&sub).unwrap();
+        assert_eq!(git_branch(&sub), None, "no repository");
+        std::fs::create_dir_all(dir.join(".git")).unwrap();
+        std::fs::write(dir.join(".git/HEAD"), "ref: refs/heads/feat/mouse\n").unwrap();
+        assert_eq!(git_branch(&sub).as_deref(), Some("feat/mouse"));
+        std::fs::write(dir.join(".git/HEAD"), "0123456789abcdef\n").unwrap();
+        assert_eq!(git_branch(&sub).as_deref(), Some("0123456"), "detached");
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

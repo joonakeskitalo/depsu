@@ -1089,7 +1089,13 @@ fn header_lines(app: &App, width: u16) -> (Vec<Line<'static>>, Vec<Placed>) {
     }
     // Each part and the key a click on it presses.
     let mut info: Vec<(String, Option<char>)> = vec![
-        (app.project_name(), None),
+        (
+            match app.git_branch() {
+                Some(b) => format!("{} ({b})", app.project_name()),
+                None => app.project_name(),
+            },
+            None,
+        ),
         (app.pm.name().to_string(), None),
         (app.registry.clone(), None),
         (state, None),
