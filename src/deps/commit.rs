@@ -451,12 +451,13 @@ impl Plan {
         }
         self.body = self.changes_body.clone();
         if !self.fixes.is_empty() {
-            let lines: Vec<String> = self.fixes.iter().map(Fixed::line).collect();
+            let lines = fix_lines(self.fixes.iter());
             if !self.body.is_empty() {
                 self.body.push_str("\n\n");
             }
             self.body.push_str(&format!("Fixes:\n{}", lines.join("\n")));
         }
+        self.body = wrap(&self.body);
         self
     }
 }
@@ -471,10 +472,54 @@ pub fn body_for(plan: &Plan, title: &str) -> Option<String> {
     }
     let fixes = fixes_for(plan, title);
     if !fixes.is_empty() {
-        let lines: Vec<String> = fixes.iter().map(|f| f.line()).collect();
+        let lines = fix_lines(fixes.into_iter());
         parts.push(format!("Fixes:\n{}", lines.join("\n")));
     }
-    (!parts.is_empty()).then(|| parts.join("\n\n"))
+    (!parts.is_empty()).then(|| wrap(&parts.join("\n\n")))
+}
+/// Longest line of a commit body.
+const BODY_MAX: usize = 100;
+/// The lines of `fixes`, each distinct line once: the same vulnerability can be fixed through
+/// several packages.
+fn fix_lines<'a>(fixes: impl Iterator<Item = &'a Fixed>) -> Vec<String> {
+    let mut lines: Vec<String> = Vec::new();
+    for l in fixes.map(Fixed::line) {
+        if !lines.contains(&l) {
+            lines.push(l);
+        }
+    }
+    lines
+}
+/// Breaks lines longer than `BODY_MAX` characters at spaces. A list item's continuation lines
+/// are indented under its text.
+fn wrap(body: &str) -> String {
+    let mut out: Vec<String> = Vec::new();
+    for line in body.lines() {
+        if line.chars().count() <= BODY_MAX {
+            out.push(line.to_string());
+            continue;
+        }
+        let indent = if line.starts_with("- ") { "  " } else { "" };
+        let mut cur = String::new();
+        for word in line.split(' ') {
+            let used = cur.chars().count();
+            if !cur.is_empty() && used + 1 + word.chars().count() > BODY_MAX {
+                out.push(std::mem::take(&mut cur));
+                cur.push_str(indent);
+            } else if !cur.is_empty() {
+                cur.push(' ');
+            }
+            cur.push_str(word);
+            // A word longer than a line is cut.
+            while cur.chars().count() > BODY_MAX {
+                let head: String = cur.chars().take(BODY_MAX).collect();
+                cur = format!("{indent}{}", cur.chars().skip(BODY_MAX).collect::<String>());
+                out.push(head);
+            }
+        }
+        out.push(cur);
+    }
+    out.join("\n")
 }
 
 /// The title names every change with its versions.
@@ -696,6 +741,23 @@ mod tests {
         }
     }
 
+    #[test]
+    fn a_vulnerability_fixed_through_two_packages_is_listed_once() {
+        let p = plan_for(&[up("a", "1.0.0", "2.0.0"), up("b", "1.0.0", "2.0.0")])
+            .with_fixes(&[fixed("a", "SNYK-1"), fixed("b", "SNYK-1")]);
+        assert_eq!(p.body.matches("SNYK-1").count(), 1, "{}", p.body);
+        assert_eq!(body_for(&p, "x").unwrap().matches("SNYK-1").count(), 1);
+    }
+    #[test]
+    fn long_body_lines_are_wrapped_at_100_characters() {
+        let mut f = fixed("lodash", "SNYK-1");
+        f.title = "very long title ".repeat(12);
+        let p = plan_for(&[up("lodash", "4.17.15", "4.17.21")]).with_fixes(&[f]);
+        let body = body_for(&p, "x").unwrap();
+        assert!(body.lines().all(|l| l.chars().count() <= 100), "{body}");
+        assert!(body.lines().count() > 3, "{body}");
+        assert!(p.body.lines().all(|l| l.chars().count() <= 100));
+    }
     #[test]
     fn fixed_vulnerabilities_are_listed_in_the_body() {
         let p = plan_for(&[up("lodash", "4.17.15", "4.17.21")]).with_fixes(&[
