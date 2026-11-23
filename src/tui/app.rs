@@ -1322,6 +1322,17 @@ impl App {
         let _ = self.info_tx.send(InfoMsg::Reset { generation: self.info_generation });
         self.prefetch_info();
     }
+    /// Marks the "fetching the latest versions" log row as done.
+    fn finish_fetch_log(&mut self) {
+        if let Some(l) = self
+            .log
+            .iter_mut()
+            .rev()
+            .find(|l| l.starts_with("… fetching the latest versions of "))
+        {
+            *l = l.replacen("… fetching", "✔ fetched", 1);
+        }
+    }
     pub fn push_log(&mut self, msg: impl Into<String>) {
         self.log.push(msg.into());
         if self.log.len() > 200 {
@@ -1335,6 +1346,9 @@ impl App {
             match ev {
                 Event::Fetched { name, result } => {
                     self.pending = self.pending.saturating_sub(1);
+                    if self.pending == 0 {
+                        self.finish_fetch_log();
+                    }
                     match result {
                         Ok(latest) => {
                             self.cache_latest(&name, &latest);
