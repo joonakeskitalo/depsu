@@ -55,6 +55,26 @@ fn vuln_counts(r: &Row) -> String {
     format!("{} ({})", severities.join(", "), sources.join(", "))
 }
 
+/// Package and vulnerability totals as a bullet list.
+fn summary(app: &App) -> String {
+    let count = |s: &str| app.rows.iter().filter(|r| status(r) == s).count();
+    let mut out = String::from("## Summary\n\n");
+    out.push_str(&format!("- Packages: {}\n", app.rows.len()));
+    out.push_str(&format!("- Outdated: {}\n", count("outdated")));
+    out.push_str(&format!("- Up to date: {}\n", count("up to date")));
+    let vulns: Vec<&Vuln> = app.rows.iter().flat_map(|r| &r.vulns).collect();
+    let by = |s: Severity| vulns.iter().filter(|v| v.severity == s).count();
+    out.push_str(&format!(
+        "- Vulnerabilities: {} (critical {}, high {}, medium {}, low {})\n\n",
+        vulns.len(),
+        by(Severity::Critical),
+        by(Severity::High),
+        by(Severity::Medium),
+        by(Severity::Low)
+    ));
+    out
+}
+
 pub fn markdown(app: &App) -> String {
     let mut out = format!("# {}: dependencies\n\n", app.project_name());
     if let Some(date) = today() {
@@ -65,6 +85,7 @@ pub fn markdown(app: &App) -> String {
         app.pm.name(),
         app.registry
     ));
+    out.push_str(&summary(app));
     // Packages with findings come first, in a table of their own, worst first.
     let (mut vulnerable, others): (Vec<&Row>, Vec<&Row>) =
         app.rows.iter().partition(|r| !r.vulns.is_empty());
