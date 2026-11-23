@@ -1,0 +1,551 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Depsu - Dependency updates made easier</title>
+<meta name="description" content="depsu is a terminal UI for updating npm, yarn, pnpm and bun dependencies. The list stays open after an install. It shows override effects and checks vulnerabilities with Snyk and npm audit.">
+<style>
+:root{
+  --bg:#0d1117; --panel:#161b22; --panel2:#1c232c; --border:#2a313c;
+  --text:#d6dde6; --muted:#8b96a5; --accent:#a3adba;
+  --green:#4ade80; --yellow:#facc15; --red:#f87171; --orange:#fb923c; --blue:#60a5fa; --magenta:#c084fc;
+  --mono:ui-monospace,SFMono-Regular,Menlo,Consolas,"Liberation Mono",monospace;
+  --sans:system-ui,-apple-system,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+}
+*{box-sizing:border-box}
+html{scroll-behavior:smooth;scroll-padding-top:104px}
+body{margin:0;background:var(--bg);color:var(--text);font:16px/1.6 var(--sans)}
+a{color:var(--accent)}
+code,kbd,pre{font-family:var(--mono)}
+code{background:var(--panel2);padding:.1em .35em;border-radius:4px;font-size:.9em}
+kbd{background:var(--panel2);border:1px solid var(--border);border-bottom-width:2px;border-radius:5px;padding:.05em .45em;font-size:.85em;color:var(--text);white-space:nowrap}
+.wrap{max-width:1080px;margin:0 auto;padding:0 24px}
+html,body{overflow-x:clip}
+.split>*,.grid>*,.keys>*{min-width:0}
+header.nav{position:sticky;top:0;z-index:10;background:rgba(13,17,23,.88);backdrop-filter:blur(8px);border-bottom:1px solid var(--border)}
+header.nav .wrap{display:flex;align-items:center;gap:24px;height:56px}
+.logo{font:700 20px var(--mono);color:var(--accent);text-decoration:none}
+.nav nav{display:flex;gap:18px;margin-left:auto;font-size:14px;flex-wrap:wrap}
+.nav nav a{color:var(--muted);text-decoration:none}
+.nav nav a:hover{color:var(--text)}
+
+.hero{padding:72px 0 48px;text-align:center}
+.hero h1{font-size:clamp(34px,6vw,58px);line-height:1.1;margin:0 0 18px;letter-spacing:-.02em}
+.hero h1 span{color:var(--accent)}
+.hero p.lead{max-width:720px;margin:0 auto 28px;color:var(--muted);font-size:19px}
+.cta{display:flex;gap:12px;justify-content:center;flex-wrap:wrap;margin-bottom:44px}
+.btn{display:inline-block;padding:10px 20px;border-radius:8px;text-decoration:none;font-weight:600;border:1px solid var(--border);color:var(--text);background:var(--panel)}
+.btn.primary{background:var(--accent);color:#12171d;border-color:var(--accent)}
+.btn:hover{filter:brightness(1.12)}
+
+/* terminal */
+.term{background:#0a0e13;border:1px solid var(--border);border-radius:10px;overflow:hidden;text-align:left;box-shadow:0 20px 60px rgba(0,0,0,.45)}
+.term .bar{display:flex;align-items:center;gap:7px;padding:9px 14px;background:var(--panel);border-bottom:1px solid var(--border);font:12px var(--mono);color:var(--muted)}
+.term .bar i{width:11px;height:11px;border-radius:50%;background:#444;display:inline-block}
+.term .bar i:nth-child(1){background:#ff5f57}.term .bar i:nth-child(2){background:#febc2e}.term .bar i:nth-child(3){background:#28c840}
+.term .bar b{margin-left:8px;font-weight:400}
+.term pre{margin:0;padding:16px 18px;overflow-x:auto;font-size:13px;line-height:1.55;color:#cfd6df}
+.term pre.sel{border:1px solid var(--accent);margin:8px;border-radius:4px}
+.g{color:var(--green)}.y{color:var(--yellow)}.r{color:var(--red)}.o{color:var(--orange)}.c{color:var(--accent)}.b{color:var(--blue)}.m{color:var(--magenta)}.d{color:#6b7684}.w{color:#fff;font-weight:700}
+.rev{background:#243040;display:inline-block;width:100%}
+.dlg{border:1px solid var(--accent);border-radius:4px;padding:8px 12px;margin:2px 0;display:inline-block;background:#10161d;min-width:min(100%,480px)}
+
+section{padding:64px 0;border-top:1px solid var(--border)}
+section h2{font-size:clamp(26px,4vw,36px);margin:0 0 10px;letter-spacing:-.01em}
+section .sub{color:var(--muted);max-width:760px;margin:0 0 32px;font-size:17px}
+.eyebrow{font:600 12px var(--mono);text-transform:uppercase;letter-spacing:.12em;color:var(--accent);margin-bottom:8px}
+
+.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(min(100%,300px),1fr));gap:16px}
+.card{background:var(--panel);border:1px solid var(--border);border-radius:10px;padding:20px}
+.card h3{margin:0 0 6px;font-size:17px}
+.card p{margin:0;color:var(--muted);font-size:15px}
+.card .ic{font:700 20px var(--mono);color:var(--accent);margin-bottom:8px;display:block}
+
+.split{display:grid;grid-template-columns:1fr 1.15fr;gap:32px;align-items:center}
+.split.flip{grid-template-columns:1.15fr 1fr}
+.split.flip .text{order:2}
+@media(max-width:900px){.split,.split.flip{grid-template-columns:1fr}.split.flip .text{order:0}}
+.text h2{margin-top:0}
+.text ul{padding-left:20px;color:var(--muted)}
+.text li{margin:6px 0}
+.text li b,.text p b{color:var(--text)}
+.text p{color:var(--muted)}
+
+table{width:100%;border-collapse:collapse;font-size:15px}
+th,td{text-align:left;padding:9px 12px;border-bottom:1px solid var(--border);vertical-align:top}
+th{color:var(--muted);font-weight:600;font-size:13px;text-transform:uppercase;letter-spacing:.06em}
+td:first-child{white-space:nowrap}
+.tbl{background:var(--panel);border:1px solid var(--border);border-radius:10px;overflow:hidden;overflow-x:auto}
+.keys{display:grid;grid-template-columns:repeat(auto-fill,minmax(min(100%,330px),1fr));gap:0 28px}
+.keys div{display:flex;gap:14px;padding:9px 0;border-bottom:1px solid var(--border);font-size:15px}
+.keys div span:first-child{min-width:104px;flex:none}
+.keys div span:last-child{color:var(--muted)}
+
+.pm{display:flex;gap:10px;flex-wrap:wrap;margin:0 0 20px}
+.pm span{font:600 14px var(--mono);padding:6px 14px;border-radius:999px;background:var(--panel);border:1px solid var(--border)}
+
+.code{position:relative;background:#0a0e13;border:1px solid var(--border);border-radius:10px}
+.code pre{margin:0;padding:16px 18px;overflow-x:auto;font-size:14px}
+.code button{position:absolute;top:8px;right:8px;background:var(--panel2);color:var(--muted);border:1px solid var(--border);border-radius:6px;padding:3px 10px;font:12px var(--sans);cursor:pointer}
+.code button:hover{color:var(--text)}
+.steps{display:grid;gap:16px}
+.limits li{margin:8px 0;color:var(--muted)}
+footer{border-top:1px solid var(--border);padding:32px 0;color:var(--muted);font-size:14px;text-align:center}
+@media(max-width:640px){
+  body{font-size:15px}
+  .wrap{padding:0 16px}
+  header.nav .wrap{flex-direction:column;align-items:stretch;height:auto;gap:0;padding-top:8px;padding-bottom:0}
+  .nav nav{margin-left:0;flex-wrap:nowrap;overflow-x:auto;gap:4px;font-size:14px;padding:6px 0 8px;-webkit-overflow-scrolling:touch;scrollbar-width:none}
+  .nav nav::-webkit-scrollbar{display:none}
+  .nav nav a{flex:none;padding:6px 10px;border-radius:6px;white-space:nowrap}
+  .nav nav a:active{background:var(--panel2)}
+  .nav nav a:first-child{padding-left:0}
+  .logo{line-height:1.3}
+  .hero{padding:40px 0 32px}
+  .hero p.lead{font-size:16px}
+  .cta{margin-bottom:28px}
+  .btn{padding:9px 16px}
+  section{padding:44px 0}
+  section .sub{font-size:15px;margin-bottom:24px}
+  .term pre{font-size:11.5px;padding:12px}
+  .dlg{min-width:0}
+  .card{padding:16px}
+  th,td{padding:8px 10px}
+  td:first-child{white-space:normal}
+  .keys div{gap:10px}
+  .keys div span:first-child{min-width:84px}
+  .code pre{font-size:12.5px;padding:14px 12px}
+  .split,.split.flip{gap:24px}
+}
+</style>
+</head>
+<body>
+
+<header class="nav">
+  <div class="wrap">
+    <a class="logo" href="#top">depsu</a>
+    <nav>
+      <a href="#features">Features</a>
+      <a href="#overrides">Overrides</a>
+      <a href="#vulns">Vulnerabilities</a>
+      <a href="#details">Details</a>
+      <a href="#editing">Editing</a>
+      <a href="#git">Git</a>
+      <a href="#keys">Keys</a>
+      <a href="#install">Install</a>
+    </nav>
+  </div>
+</header>
+
+<main id="top">
+
+<!-- HERO -->
+<div class="hero">
+  <div class="wrap">
+    <h1>Dependency updates made easier</h1>
+    <p class="lead">depsu is a terminal UI for updating npm, yarn, pnpm and bun projects. It works like <code>npm-check-updates</code>, but the list stays open after an install. It also shows how your overrides affect each package and checks for vulnerabilities.</p>
+    <div class="cta">
+      <a class="btn primary" href="#install">Install depsu</a>
+      <a class="btn" href="#features">See the features</a>
+    </div>
+
+    <div class="term">
+      <div class="bar"><i></i><i></i><i></i><b>depsu</b></div>
+<pre><span class="c w"> depsu</span>  pnpm · https://registry.npmjs.org/ · <span class="y">3 outdated</span> · 12 up to date · <span class="r">snyk: 10 vulnerabilities (5 high+)</span>
+<span class="rev"><span class="d">○</span> lodash            <span class="r">✱</span>    dep <span class="y">^</span>4.17.15       → <span class="g">^4.18.1</span>   <span class="g">snyk fix: 4.18.1</span>               </span>
+<span class="d">     ├─</span> <span class="r">✱ high</span>     SNYK-JS-LODASH-1040724  Code Injection  <span class="d">· lodash@4.17.15  · CVE-2021-23337  · fixed in lodash 4.17.21</span>
+<span class="d">     └─</span> <span class="y">✱ medium</span>   SNYK-JS-LODASH-1018905  ReDoS  <span class="d">· lodash@4.17.15  · CVE-2020-28500  · fixed in lodash 4.17.21</span>
+<span class="d">○</span> react-dom         <span class="b">⚑</span>    dep <span class="y">^</span>18.2.0       → <span class="g">^19.0.0</span>
+<span class="d">·</span> zod                    dep <span class="y">^</span>3.23.8       <span class="g">✓ up to date</span></pre>
+    </div>
+  </div>
+</div>
+
+<!-- FEATURE OVERVIEW -->
+<section id="features">
+  <div class="wrap">
+    <div class="eyebrow">Features</div>
+    <h2>Everything in one list</h2>
+    <p class="sub">Browse outdated packages, install them one after another, and handle overrides, vulnerabilities, peers and commits without leaving the terminal.</p>
+    <div class="grid">
+      <div class="card"><span class="ic">▤</span><h3>Uses your package manager</h3><p>npm, yarn, pnpm or bun, detected from the project. Monorepos work because lockfiles are searched in parent directories.</p></div>
+      <div class="card"><span class="ic">⌁</span><h3>Uses your registry</h3><p>Reads <code>.npmrc</code>, <code>.yarnrc.yml</code> and <code>bunfig.toml</code>, including private registries, scopes and auth tokens.</p></div>
+      <div class="card"><span class="ic">^~</span><h3>Version range at a glance</h3><p>The prefix is colored: <span class="y">^</span> yellow, <span class="c">~</span> cyan, <span class="r">&gt;=</span> red. No prefix means pinned exactly.</p></div>
+      <div class="card"><span class="ic">☰</span><h3>Select, group, filter</h3><p>Group by release type, name prefix or dependency type. Filter by name. Select one package, a whole group, or all.</p></div>
+      <div class="card"><span class="ic">⚑</span><h3>Override aware</h3><p>Shows overridden packages, checks that an update fits the override, finds unneeded overrides, and updates or removes them.</p></div>
+      <div class="card"><span class="ic">✱</span><h3>Vulnerabilities</h3><p>Findings from Snyk, <code>npm audit</code> or <code>bun audit</code>, shown under the dependency that brings them in. Install the suggested fix with one key.</p></div>
+      <div class="card"><span class="ic">?</span><h3>Details panel</h3><p>Deprecation, install scripts, size, engines, platform, integrity checksum, dependents, peers and dependency changes.</p></div>
+      <div class="card"><span class="ic">⚠</span><h3>Peer dependency checks</h3><p>An update that needs other packages to change lists them and asks. Unmet peers can be fixed from a dialog.</p></div>
+      <div class="card"><span class="ic">⛔</span><h3>Blocked version handling</h3><p>For registries with a security policy, depsu checks downloads first and offers the newest version that can be installed.</p></div>
+      <div class="card"><span class="ic">±</span><h3>Edit, add, pin, delete</h3><p>Set any version, add packages, choose the pin type, delete packages and overrides, all from dialogs.</p></div>
+      <div class="card"><span class="ic">⎇</span><h3>Conventional commits</h3><p>Press <kbd>c</kbd> to commit <code>package.json</code> and the lockfile with a generated, editable message.</p></div>
+    </div>
+  </div>
+</section>
+
+<!-- INSTALL FLOW / PEERS -->
+<section id="install-flow">
+  <div class="wrap split">
+    <div class="text">
+      <div class="eyebrow">Installing</div>
+      <h2>Install, then keep going</h2>
+      <p>Select packages with <kbd>space</kbd>, or highlight one, and press <kbd>i</kbd>. The install runs in the background while you keep browsing.</p>
+      <ul>
+        <li><b>Peer dependencies.</b> If an update needs other installed packages to change, depsu lists them. <kbd>y</kbd> updates them too, <kbd>n</kbd> installs only what you picked, any other key cancels.</li>
+        <li><b>One install for mixed flags.</b> Packages that need different flags (dependency or dev dependency, exact or range) are written to <code>package.json</code> together and installed at once. If that fails, <code>package.json</code> is restored.</li>
+        <li><b>Your range prefix is kept.</b> <code>^</code>, <code>~</code> or none stays as it was.</li>
+        <li><b>Only what's shown.</b> <kbd>a</kbd> and <kbd>i</kbd> act on the packages currently visible, so a filter narrows what they touch.</li>
+      </ul>
+    </div>
+    <div class="term">
+      <div class="bar"><i></i><i></i><i></i><b>peer check</b></div>
+<pre><span class="d">○</span> eslint-plugin-react   dep <span class="y">^</span>7.33.0  → <span class="g">^7.37.0</span>
+<span class="d">○</span> eslint               dev <span class="y">^</span>8.57.0  → <span class="g">^9.0.0</span>
+<span class="dlg"><span class="w">Peer dependencies</span>
+Updating <span class="c">eslint</span> to 9.0.0 also needs:
+  <span class="y">eslint-plugin-react</span>  7.33.0 → 7.37.0
+  <span class="y">@typescript-eslint/parser</span>  6.0.0 → 8.0.0
+
+<span class="g">y</span> update them too   <span class="g">n</span> only eslint   <span class="d">any key: cancel</span></span></pre>
+    </div>
+  </div>
+</section>
+
+<!-- GROUPING / FILTER -->
+<section id="grouping">
+  <div class="wrap split flip">
+    <div class="text">
+      <div class="eyebrow">Organizing</div>
+      <h2>Group, filter, select</h2>
+      <p>Press <kbd>g</kbd> to cycle through the groupings: none, release type, name prefix, dependency type. Press <kbd>/</kbd> to filter by name.</p>
+      <ul>
+        <li><b>Release type:</b> patch, minor, major.</li>
+        <li><b>Dependency type:</b> dependencies, dev, optional, overrides.</li>
+        <li><b>Select</b> any package (outdated or not), a whole group on its header, or an override line.</li>
+        <li><b>Hide</b> up-to-date packages with <kbd>u</kbd>.</li>
+      </ul>
+    </div>
+    <div class="term">
+      <div class="bar"><i></i><i></i><i></i><b>group: release type</b></div>
+<pre><span class="c">group: release type</span>   <span class="d">filter: </span><span class="c">react</span>
+<span class="g">●</span> <span class="w">patch</span> <span class="d">(1)</span>
+  <span class="g">●</span> react-router       dep <span class="y">^</span>6.22.0   → <span class="g">^6.22.3</span>
+<span class="d">○</span> <span class="w">minor</span> <span class="d">(2)</span>
+  <span class="d">○</span> react-hook-form    dep <span class="y">^</span>7.48.0   → <span class="g">^7.54.2</span>
+  <span class="d">○</span> react-query        dep <span class="y">^</span>5.20.0   → <span class="g">^5.62.0</span>
+<span class="d">○</span> <span class="w">major</span> <span class="d">(1)</span>
+  <span class="d">○</span> react-dom          dep <span class="y">^</span>18.2.0   → <span class="g">^19.0.0</span></pre>
+    </div>
+  </div>
+</section>
+
+<!-- OVERRIDES -->
+<section id="overrides">
+  <div class="wrap">
+    <div class="eyebrow">Overrides</div>
+    <h2>See what your overrides really do</h2>
+    <p class="sub">Overrides come from <code>overrides</code> (npm, bun), <code>resolutions</code> (yarn, bun) or <code>pnpm.overrides</code> (pnpm). Press <kbd>o</kbd> to list them under each package.</p>
+
+    <div class="split">
+      <div class="term">
+        <div class="bar"><i></i><i></i><i></i><b>overrides: shown</b></div>
+<pre><span class="d">○</span> express    <span class="o">↳</span>   dep <span class="y">^</span>4.18.0  → <span class="g">^4.22.0</span>
+<span class="d">     ├─</span> qs <span class="d">→ override</span> <span class="y">^6.11.0</span>  <span class="g">⇢ ^6.14.1</span>  <span class="d">(via body-parser)</span>
+<span class="d">     └─</span> path-to-regexp <span class="d">→</span> <span class="y">0.1.12</span>
+<span class="d">○</span> react-dom  <span class="b">⚑</span>   dep <span class="y">^</span>18.2.0  → <span class="g">^19.0.0</span>
+<span class="d">○</span> typescript <span class="o">⚠</span>   dev <span class="y">~</span>5.3.0   → <span class="g">~5.7.0</span>  <span class="o">conflicts with override</span>
+<span class="d">○</span> semver     <span class="c">?</span>   dep <span class="y">^</span>7.5.0   → <span class="g">^7.6.0</span>  <span class="d">override can't be read</span>
+<span class="d">○</span> minimist         dep <span class="y">^</span>1.2.0   <span class="c">✂ may be removed</span></pre>
+      </div>
+      <div class="tbl">
+        <table>
+          <tr><th>Marker</th><th>Meaning</th></tr>
+          <tr><td><span class="b">⚑</span></td><td>The package itself is overridden, and the update is compatible.</td></tr>
+          <tr><td><span class="o">⚠</span></td><td>The update conflicts with its override.</td></tr>
+          <tr><td><span class="c">?</span></td><td>The override can't be interpreted (URL, alias, odd range).</td></tr>
+          <tr><td><span class="o">↳</span></td><td>An override applies somewhere in the package's installed dependency tree. Yellow if it forces a version outside what the parent declares.</td></tr>
+          <tr><td><span class="r">✱</span></td><td>A scan found vulnerabilities, colored by worst severity.</td></tr>
+          <tr><td><span class="c">✂</span></td><td>The override may no longer be needed.</td></tr>
+        </table>
+      </div>
+    </div>
+
+    <div class="grid" style="margin-top:32px">
+      <div class="card"><h3>Compatibility check</h3><p>npm needs an override on a direct dependency to match its spec exactly, or it fails with <code>EOVERRIDE</code>. yarn, pnpm and bun let the override win silently. depsu applies the right rule and asks for a second keypress before a conflicting update.</p></div>
+      <div class="card"><h3>Dependency tree walk</h3><p>Walks <code>node_modules</code>, including pnpm's symlinked layout, and lists every override that applies to a dependency at any depth, with the chain that leads to it.</p></div>
+      <div class="card"><h3>Update overrides</h3><p>Lines with a plain version or range show <code>⇢ new value</code>. Select them and press <kbd>i</kbd>. <code>package.json</code> is edited in place, keeping indentation, key order and the trailing newline.</p></div>
+      <div class="card"><h3>Overridden-only packages</h3><p>A package that is overridden but not a dependency gets its own <code>ovr</code> row at the bottom of the list. Update it like any other.</p></div>
+      <div class="card"><h3>Unneeded overrides</h3><p>Flagged <code>✂ may be removed</code> when nothing depends on the package, every dependent asks for the same spec, or every dependent already requires at least that version. Remove them with <kbd>d</kbd>.</p></div>
+      <div class="card"><h3>Pin a fix</h3><p>When a scan reports a vulnerable nested package with a fixed version, <kbd>p</kbd> adds an override to <code>^&lt;fixed version&gt;</code>. It asks for a second press and warns that forcing a version can break dependents.</p></div>
+    </div>
+  </div>
+</section>
+
+<!-- VULNS -->
+<section id="vulns">
+  <div class="wrap">
+    <div class="eyebrow">Vulnerabilities</div>
+    <h2>Find them. Fix them. From the same list.</h2>
+    <p class="sub">Findings appear under the direct dependency that brings them in, with severity, ID, CVE, the vulnerable package, the path to it, and what to do about it.</p>
+
+    <div class="term">
+      <div class="bar"><i></i><i></i><i></i><b>scan results</b></div>
+<pre><span class="c w"> depsu</span>  npm · <span class="y">2 outdated</span> · 14 up to date · <span class="r">snyk: 3 vulnerabilities (1 high+)</span>
+<span class="d">○</span> express   <span class="r">✱</span>   dep <span class="y">^</span>4.17.1   → <span class="g">^4.22.0</span>
+<span class="d">     ├─</span> <span class="r">✱ high</span>   SNYK-JS-QS-3153490  Prototype Pollution  <span class="d">· qs@6.7.0 · via express › body-parser › qs</span>
+<span class="d">     │</span>        <span class="g">⬆ fix: i installs express ^4.22.0</span> <span class="d">(brings qs 6.14.3)</span>
+<span class="d">     └─</span> <span class="y">✱ medium</span> <span class="d">[npm audit]</span> cookie  <span class="d">· cookie@0.4.0 · &lt;0.7.0</span>
+<span class="d">              </span><span class="g">⬆ fix: p overrides cookie to ^0.7.2</span>
+<span class="d">↻ npm audit (n) hasn't scanned this version</span></pre>
+    </div>
+
+    <div class="grid" style="margin-top:32px">
+      <div class="card"><h3>Snyk (<kbd>s</kbd>)</h3><p>Runs <code>snyk test --json --dev</code>. Works with any package manager. Needs the Snyk CLI and <code>snyk auth</code>. It sends your dependency list to Snyk and counts against your quota, so it never runs automatically.</p></div>
+      <div class="card"><h3>npm audit / bun audit (<kbd>n</kbd>)</h3><p>Runs the project's own audit command. No account needed. Findings are tagged <code>[npm audit]</code> or <code>[bun audit]</code> so both can show at once. Not available for yarn and pnpm.</p></div>
+      <div class="card"><h3>One-key fixes</h3><p>A fixable finding ends in green with the key that applies it: <kbd>i</kbd> installs the upgrade of the direct dependency, <kbd>p</kbd> overrides the nested package.</p></div>
+    </div>
+  </div>
+</section>
+
+<!-- DETAILS -->
+<section id="details">
+  <div class="wrap split flip">
+    <div class="text">
+      <div class="eyebrow">Details panel</div>
+      <h2>Know what you are installing</h2>
+      <p>Press <kbd>?</kbd> on any package. Everything comes from disk, so nothing is downloaded.</p>
+      <ul>
+        <li>Deprecation message and install scripts</li>
+        <li>Installed version, size and file count</li>
+        <li>Engines checked against your installed node, npm and package manager, plus <code>os</code>, <code>cpu</code>, <code>libc</code></li>
+        <li>Lockfile integrity checksum</li>
+        <li>Dependencies and how they changed since the last commit</li>
+        <li>Installed packages that use it, and peers with installed versions</li>
+        <li>Override summary</li>
+      </ul>
+      <p>Inline warnings appear in the list even when the panel is closed: <code class="o">⚠ needs node &gt;=20 (has 18.19.0)</code>, <code class="o">⚠ unmet peer</code>, <code class="o">⚠ no integrity checksum</code>.</p>
+    </div>
+    <div class="term">
+      <div class="bar"><i></i><i></i><i></i><b>selected: vite</b></div>
+<pre><span class="c">selected: vite</span>  <span class="d">lines 1-14 of 22</span>
+<span class="w">vite</span> 5.2.0 → <span class="g">6.0.3</span>
+ deprecated   <span class="g">no</span>
+ scripts      <span class="y">postinstall</span>
+ installed    5.2.0 · 2.4 MB · 312 files
+ engines      node <span class="g">^18 || ^20 || &gt;=22</span>  <span class="d">(has 20.11.0)</span>
+ platform     os: any  cpu: any
+ integrity    <span class="d">sha512-3Ft…q9A==</span>
+ depends on   esbuild, postcss, rollup  <span class="g">+1 since HEAD</span>
+ used by      @vitejs/plugin-react, vitest
+ peers        @types/node <span class="d">(18.19.0)</span>
+ overrides    rollup <span class="d">→</span> <span class="y">^4.22.4</span></pre>
+    </div>
+  </div>
+</section>
+
+<!-- EDITING -->
+<section id="editing">
+  <div class="wrap">
+    <div class="eyebrow">Editing</div>
+    <h2>Change anything from a dialog</h2>
+    <p class="sub">Every change goes through <code>package.json</code> and your package manager, with the same peer and blocked-version checks as <kbd>i</kbd>.</p>
+
+    <div class="grid">
+      <div class="card"><h3>Edit a version (<kbd>e</kbd>)</h3>
+        <p>Pre-filled with the current version, e.g. <code>^18.3.1</code>. Go older or newer and change the pin type. While you type, the dialog says whether that version is published and names the nearest ones if not.</p></div>
+      <div class="card"><h3>Add a package (<kbd>+</kbd>)</h3>
+        <p>Type <code>name</code> for latest, or <code>name@1.2.3</code>. Pick dependency, dev dependency or override with <kbd>Tab</kbd>. The registry is checked first and problems show in the dialog.</p></div>
+      <div class="card"><h3>Choose the pin (<kbd>P</kbd>)</h3>
+        <p>Exact (<kbd>e</kbd>), caret <code>^</code> (<kbd>c</kbd>), tilde <code>~</code> (<kbd>t</kbd>) or at least <code>&gt;=</code> (<kbd>m</kbd>). Letters are used because <code>^</code> and <code>~</code> are dead keys on Nordic keyboards.</p></div>
+      <div class="card"><h3>Delete (<kbd>d</kbd>)</h3>
+        <p>Removes checked packages and overrides in one go. A dialog lists what will be uninstalled, warns about installed packages that use them, and asks to confirm. Restore with <kbd>r</kbd>.</p></div>
+      <div class="card"><h3>Fix unmet peers (<kbd>f</kbd>)</h3>
+        <p>For a package marked <code class="o">⚠ unmet peer</code>, depsu looks up fitting versions: update the peers into the requested range, or move the package up or down to a version that accepts what is installed.</p></div>
+      <div class="card"><h3>Checksums (<kbd>I</kbd>)</h3>
+        <p>Adds a missing integrity checksum to <code>package-lock.json</code>, the one the registry publishes for the locked version. It is written only when the registry's file matches the lockfile's <code>resolved</code>.</p></div>
+    </div>
+
+    <div class="split" style="margin-top:32px">
+      <div class="term">
+        <div class="bar"><i></i><i></i><i></i><b>edit version</b></div>
+<pre><span class="dlg"><span class="w">Edit react-dom</span>
+Version  <span class="y">^</span><span class="c">18.3.1</span><span class="rev" style="width:auto"> </span>
+<span class="g">✓ 18.3.1 is published</span>
+
+<span class="g">Enter</span> install   <span class="d">Esc cancel</span></span>
+<span class="dlg"><span class="w">Edit react-dom</span>
+Version  <span class="y">^</span><span class="c">18.9.9</span>
+<span class="r">✗ not published.</span> <span class="d">Nearest: 18.3.1, 19.0.0</span></span></pre>
+      </div>
+      <div class="term">
+        <div class="bar"><i></i><i></i><i></i><b>blocked version</b></div>
+<pre><span class="dlg"><span class="w">Blocked by registry policy</span>
+<span class="y">colors@1.4.1</span> can't be downloaded (403).
+Newest older release that can: <span class="g">1.4.0</span>
+
+<span class="g">y</span> install 1.4.0 instead   <span class="g">n</span> install the rest only</span></pre>
+      </div>
+    </div>
+    <p class="sub" style="margin-top:20px;font-size:15px"><b>Blocked versions.</b> Registries with a security policy (JFrog Curation, Nexus Firewall and similar) list blocked versions but answer 403 on download. depsu checks every version before installing, tries up to 15 older releases, and offers the newest that works. The fallback is pinned exactly, because a range would resolve to the blocked version again.</p>
+  </div>
+</section>
+
+<!-- GIT -->
+<section id="git">
+  <div class="wrap split">
+    <div class="text">
+      <div class="eyebrow">Git</div>
+      <h2>Commit what you changed</h2>
+      <p>Press <kbd>c</kbd> to commit <code>package.json</code> and the lockfile. Other staged or modified files are left alone. Git hooks run, and if one fails its message is shown and nothing is committed.</p>
+      <ul>
+        <li><b>Conventional title</b> built from what changed since the last commit, shortened to fit 72 characters.</li>
+        <li><b>Body</b> lists every change the title doesn't already say.</li>
+        <li><b><code>Fixes:</code> section</b> lists vulnerabilities fixed this session, with ID, title and severity.</li>
+        <li><b>Checksum changes</b> from <kbd>I</kbd> are their own change.</li>
+        <li><b>Editable.</b> <kbd>Tab</kbd> switches between title and body. <kbd>Ctrl</kbd>+<kbd>S</kbd> commits from either.</li>
+      </ul>
+    </div>
+    <div class="term">
+      <div class="bar"><i></i><i></i><i></i><b>commit</b></div>
+<pre><span class="dlg"><span class="w">Commit</span>
+<span class="c">Title</span>
+chore: upgrade express 4.17.1 to 4.22.0, lodash 4.17.15 to 4.18.1
+
+<span class="d">Body</span>
+- upgrade express 4.17.1 to 4.22.0
+- upgrade lodash 4.17.15 to 4.18.1
+
+Fixes:
+- SNYK-JS-QS-3153490: Prototype Pollution (high)
+- SNYK-JS-LODASH-1040724: Code Injection (high)
+
+<span class="g">Enter</span> commit   <span class="g">Ctrl+S</span> commit   <span class="g">Tab</span> switch</span></pre>
+    </div>
+  </div>
+</section>
+
+<!-- REGISTRY -->
+<section id="registry">
+  <div class="wrap">
+    <div class="eyebrow">Registry and authentication</div>
+    <h2>Works with private registries</h2>
+    <p class="sub">For each package, depsu picks the registry the way npm does and sends the matching token. Tokens for a custom registry are never sent to <code>registry.npmjs.org</code> or <code>registry.yarnpkg.com</code>.</p>
+    <div class="pm"><span>npm</span><span>yarn</span><span>pnpm</span><span>bun</span></div>
+    <div class="grid">
+      <div class="card"><h3><code>.npmrc</code></h3><p>Project, then <code>~/.npmrc</code>. Supports <code>registry</code>, <code>@scope:registry</code>, <code>_authToken</code>, <code>_auth</code>, <code>username</code> with <code>_password</code>, and <code>${VAR}</code> or <code>${VAR:-default}</code>. <code>NPM_CONFIG_REGISTRY</code> overrides the default.</p></div>
+      <div class="card"><h3><code>bunfig.toml</code></h3><p>For bun projects, project then <code>~/.bunfig.toml</code>. Supports <code>[install] registry</code>, <code>[install.registry]</code> with url, token, username and password, and <code>[install.scopes]</code>.</p></div>
+      <div class="card"><h3><code>.yarnrc.yml</code></h3><p>For Yarn 2+, used instead of <code>.npmrc</code>, merged from <code>~/.yarnrc.yml</code> down to the nearest file. Supports <code>npmRegistryServer</code>, <code>npmAuthToken</code>, <code>npmAuthIdent</code>, scopes and per-registry entries, plus <code>YARN_NPM_*</code> variables.</p></div>
+      <div class="card"><h3>Package manager detection</h3><p>The <code>packageManager</code> field wins. Otherwise depsu looks for <code>bun.lock</code>, <code>pnpm-lock.yaml</code>, <code>yarn.lock</code> or <code>package-lock.json</code> in the project and its parents. Falls back to npm. Override with <code>--pm</code>.</p></div>
+      <div class="card"><h3>Same way as ncu</h3><p>Requests use the abbreviated (corgi) <code>Accept</code> header and stop reading once <code>dist-tags</code> has been seen, with a full-document retry on 404.</p></div>
+      <div class="card"><h3>What counts as outdated</h3><p>The lowest version of each range is compared with the registry's <code>latest</code> tag. Prereleases are ignored. <code>git</code>, <code>file:</code>, <code>workspace:</code>, <code>npm:</code> aliases, tags and <code>||</code> ranges are skipped.</p></div>
+    </div>
+  </div>
+</section>
+
+<!-- KEYS -->
+<section id="keys">
+  <div class="wrap">
+    <div class="eyebrow">Keyboard and mouse</div>
+    <h2>Hotkeys</h2>
+    <p class="sub">The part of the screen that takes the keys has a cyan border. While a dialog is open, everything behind it is dimmed.</p>
+    <div class="keys">
+      <div><span><kbd>↑</kbd> <kbd>↓</kbd> <kbd>j</kbd> <kbd>k</kbd></span><span>Move. <kbd>Home</kbd> and <kbd>End</kbd> jump to the ends.</span></div>
+      <div><span><kbd>,</kbd> <kbd>.</kbd></span><span>Page up and down, in the list and the log (or <kbd>PgUp</kbd> <kbd>PgDn</kbd>)</span></div>
+      <div><span><kbd>space</kbd></span><span>Select a package, a group or an override line</span></div>
+      <div><span><kbd>a</kbd></span><span>Select all or none of the shown packages</span></div>
+      <div><span><kbd>i</kbd> <kbd>Enter</kbd></span><span>Install selected or highlighted. On a finding, install its fix.</span></div>
+      <div><span><kbd>/</kbd></span><span>Filter by name. <kbd>Enter</kbd> keeps it, <kbd>Esc</kbd> clears it.</span></div>
+      <div><span><kbd>g</kbd></span><span>Group: none, release type, name prefix, dependency type</span></div>
+      <div><span><kbd>o</kbd></span><span>Show or hide override lines</span></div>
+      <div><span><kbd>u</kbd></span><span>Hide or show up-to-date packages</span></div>
+      <div><span><kbd>e</kbd></span><span>Edit the version of the highlighted package</span></div>
+      <div><span><kbd>+</kbd></span><span>Add a package</span></div>
+      <div><span><kbd>P</kbd></span><span>Choose the pin type</span></div>
+      <div><span><kbd>d</kbd></span><span>Delete packages or overrides. <kbd>r</kbd> restores.</span></div>
+      <div><span><kbd>f</kbd></span><span>Fix unmet peers</span></div>
+      <div><span><kbd>p</kbd></span><span>Pin a vulnerable nested dependency with an override</span></div>
+      <div><span><kbd>s</kbd></span><span>Scan with Snyk</span></div>
+      <div><span><kbd>n</kbd></span><span>Run <code>npm audit</code> or <code>bun audit</code></span></div>
+      <div><span><kbd>v</kbd></span><span>Show or hide vulnerability findings</span></div>
+      <div><span><kbd>c</kbd></span><span>Commit <code>package.json</code> and the lockfile</span></div>
+      <div><span><kbd>I</kbd></span><span>Add missing integrity checksums</span></div>
+      <div><span><kbd>R</kbd></span><span>Fetch the latest versions again, ignoring the cache</span></div>
+      <div><span><kbd>?</kbd></span><span>Details panel. <kbd>Shift</kbd>+<kbd>↑</kbd><kbd>↓</kbd> scrolls it.</span></div>
+      <div><span><kbd>q</kbd> <kbd>Esc</kbd></span><span>Quit (press twice while an install is running)</span></div>
+    </div>
+
+  </div>
+</section>
+
+<!-- INSTALL -->
+<section id="install">
+  <div class="wrap">
+    <div class="eyebrow">Get started</div>
+    <h2>Install and run</h2>
+    <p class="sub">depsu is written in Rust and needs a Rust toolchain to build.</p>
+    <div class="steps">
+      <div class="code"><button data-copy>Copy</button><pre><span class="d"># clone the repository</span>
+git clone https://github.com/joonakeskitalo/depsu.git
+cd depsu
+
+<span class="d"># build and install to ~/.local/bin (override with PREFIX=/usr/local)</span>
+make release
+make install
+
+<span class="d"># or</span>
+cargo install --path .</pre></div>
+      <div class="code"><button data-copy>Copy</button><pre><span class="d"># run in a project directory</span>
+depsu
+depsu --dir ../other-project
+depsu --pm pnpm                    <span class="d"># skip detection</span>
+depsu --cache .depsu-cache.json    <span class="d"># remember versions and scans between runs</span></pre></div>
+    </div>
+
+    <div class="tbl" style="margin-top:24px">
+      <table>
+        <tr><th>Option</th><th>Description</th></tr>
+        <tr><td><code>-C</code>, <code>--dir &lt;PATH&gt;</code></td><td>Project directory (default: current directory)</td></tr>
+        <tr><td><code>--pm &lt;NAME&gt;</code></td><td>Force the package manager: <code>npm</code>, <code>yarn</code>, <code>pnpm</code> or <code>bun</code></td></tr>
+        <tr><td><code>--cache &lt;FILE&gt;</code></td><td>JSON file for latest versions and Snyk / audit findings. One file can be shared by several projects: versions are shared, scan results are kept apart per project directory. A file that can't be parsed is left untouched and not used.</td></tr>
+        <tr><td><code>-h</code>, <code>--help</code> / <code>-V</code>, <code>--version</code></td><td>Help and version</td></tr>
+      </table>
+    </div>
+  </div>
+</section>
+
+<!-- LIMITS -->
+<section id="limits">
+  <div class="wrap">
+    <div class="eyebrow">Good to know</div>
+    <h2>Limitations</h2>
+    <ul class="limits">
+      <li>Only the <code>latest</code> dist-tag is considered. There is no <code>--target minor</code> or <code>patch</code>.</li>
+      <li>Yarn Classic's <code>.yarnrc</code> and overrides in <code>pnpm-workspace.yaml</code> are not read. Yarn Classic still gets its registry from <code>.npmrc</code>.</li>
+      <li>Override analysis reads <code>node_modules</code>, so it finds nothing with Yarn Plug'n'Play or before the first install.</li>
+      <li><code>npm audit</code> and <code>bun audit</code> findings need installed dependencies. Bun's fix plan was checked only with Bun 1.4.5, and older versions have no <code>bun audit</code>.</li>
+      <li>The unneeded-override check is a heuristic. Verify before removing.</li>
+      <li>Not tested on Windows.</li>
+    </ul>
+  </div>
+</section>
+
+</main>
+
+<footer>
+  <div class="wrap">depsu · an interactive dependency updater for npm projects</div>
+</footer>
+
+<script>
+document.querySelectorAll('[data-copy]').forEach(function(btn){
+  btn.addEventListener('click', function(){
+    var text = btn.nextElementSibling.innerText;
+    navigator.clipboard.writeText(text).then(function(){
+      btn.textContent = 'Copied';
+      setTimeout(function(){ btn.textContent = 'Copy'; }, 1500);
+    });
+  });
+});
+</script>
+</body>
+</html>
