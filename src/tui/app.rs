@@ -525,6 +525,10 @@ struct InstallItem {
 
 #[derive(Default)]
 struct Job {
+    /// Delete `node_modules` and install everything from the lockfile again.
+    reinstall: bool,
+    /// The rows a reinstall is for.
+    reinstalled: Vec<String>,
     /// Packages to uninstall, before anything else runs.
     uninstall: Vec<String>,
     items: Vec<InstallItem>,
@@ -725,6 +729,8 @@ pub struct App {
     /// Packages queued for uninstall, whose rows go away when the job succeeds.
     uninstalling: HashSet<String>,
     confirm_pin: bool,
+    /// `U` was pressed once: pressing it again reinstalls everything.
+    confirm_reinstall: bool,
     /// Override keys being added or removed, which call for a rescan.
     changed: HashSet<String>,
     /// False until the first key press: the cursor then stays at the top of the package list.
@@ -929,6 +935,7 @@ impl App {
             dependents: HashMap::new(),
             uninstalling: HashSet::new(),
             confirm_pin: false,
+            confirm_reinstall: false,
             changed: HashSet::new(),
             cursor_moved: false,
             tree_tx,
@@ -2229,6 +2236,7 @@ impl App {
         global.push(format!("? details: {}", if self.show_info { "on" } else { "off" }));
         global.push("g group".into());
         global.push("o overrides".into());
+        global.push("U reinstall all".into());
         scan.push("s snyk".into());
         if let Some(src) = audit::source_for(self.pm) {
             scan.push(format!("n {}", src.label()));
@@ -2456,6 +2464,9 @@ impl App {
         if !matches!(key.code, KeyCode::Char('d')) {
             self.confirm_unignore = None;
         }
+        if key.code != KeyCode::Char('U') {
+            self.confirm_reinstall = false;
+        }
         match key.code {
             KeyCode::Esc if !self.filter.is_empty() => {
                 self.filter.clear();
@@ -2511,6 +2522,7 @@ impl App {
             KeyCode::Char('p') => self.pin_selected(),
             KeyCode::Char('P') => self.ask_pin_type(),
             KeyCode::Char('x') => self.ignore_cursor(),
+            KeyCode::Char('U') => self.reinstall_all(),
             KeyCode::Char('s') => self.start_scan(Source::Snyk),
             KeyCode::Char('n') => self.start_scan(self.audit_source()),
             KeyCode::Char('?') => self.show_info = !self.show_info,
@@ -4010,6 +4022,40 @@ impl App {
     }
 
     /// Queues the installs of `plan` (name, version) and the override updates.
+    /// `U`: deletes `node_modules` and installs everything again from the lockfile. Asks for a
+    /// second press. Versions and `package.json` stay as they are.
+    fn reinstall_all(&mut self) {
+        if self.installing() {
+            self.push_log("Wait for the running install to finish before reinstalling.");
+            return;
+        }
+        if self.rows.is_empty() && !self.dir.join("node_modules").exists() {
+            self.push_log("Nothing to reinstall.");
+            return;
+        }
+        if !self.confirm_reinstall {
+            self.confirm_reinstall = true;
+            self.push_log(format!(
+                "♻ will delete node_modules and run `{} install` for the whole project. Press U again to confirm, any other key cancels.",
+                self.pm.name()
+            ));
+            return;
+        }
+        self.confirm_reinstall = false;
+        for r in self.rows.iter_mut() {
+            r.selected = false;
+            r.status = Status::Queued;
+            // The versions stay: nothing is moved to a newer one.
+            self.install_targets.insert(r.name.clone(), r.current.clone());
+        }
+        self.push_log(format!("… queued reinstall of all packages (`{} install`)", self.pm.name()));
+        let _ = self.jobs.send(Job {
+            reinstall: true,
+            reinstalled: self.rows.iter().map(|r| r.name.clone()).collect(),
+            ..Default::default()
+        });
+    }
+
     fn queue_install(&mut self, plan: Vec<(String, Version)>, ovr: Vec<(Override, String)>) {
         for (name, target) in &plan {
             if let Some(r) = self.rows.iter().find(|r| r.name == *name && !r.busy()) {
@@ -4862,6 +4908,7 @@ fn install_worker(dir: PathBuf, pm: Pm, jobs: Receiver<Job>, tx: Sender<Event>) 
             .iter()
             .map(|i| i.name.clone())
             .chain(job.uninstall.iter().cloned())
+            .chain(job.reinstalled.iter().cloned())
             .collect();
         let _ = tx.send(Event::InstallStarted {
             names: names.clone(),
@@ -5033,7 +5080,25 @@ fn install_with_manifest(
     Ok(())
 }
 
+/// Deletes `node_modules` (or the link to it) in `dir`. Nothing else is touched.
+fn remove_node_modules(dir: &std::path::Path) -> Result<(), String> {
+    let path = dir.join("node_modules");
+    let result = match std::fs::symlink_metadata(&path) {
+        Ok(m) if m.is_dir() => std::fs::remove_dir_all(&path),
+        Ok(_) => std::fs::remove_file(&path),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e),
+    };
+    result.map_err(|e| format!("could not delete {}: {e}", path.display()))
+}
+
 fn run_job(dir: &std::path::Path, pm: Pm, job: &Job) -> Result<(), String> {
+    if job.reinstall {
+        remove_node_modules(dir)?;
+        return run_pm(dir, pm, &["install".to_string()]).map_err(|e| {
+            format!("node_modules was deleted, but the install failed:\n{e}")
+        });
+    }
     if !job.uninstall.is_empty() {
         run_pm(dir, pm, &pm.uninstall_args(&job.uninstall))?;
     }
@@ -8180,5 +8245,71 @@ mod tests {
         limited.path = vec!["mid".into()];
         app.overrides = vec![limited];
         assert!(app.vuln_override(&nested(&app)).is_none());
+    }
+
+    #[test]
+    fn u_asks_twice_then_queues_a_reinstall_of_every_package() {
+        let (mut app, rx) = app_capturing_installs();
+        app.on_key(key('U'));
+        assert!(rx.try_recv().is_err(), "nothing runs on the first press");
+        assert!(app.log.iter().any(|l| l.contains("Press U again")));
+        app.on_key(key('U'));
+        let job = rx.try_recv().unwrap();
+        assert!(job.reinstall && job.items.is_empty() && job.edits.is_empty());
+        assert_eq!(job.reinstalled, ["a", "b"]);
+        assert!(app.rows.iter().all(|r| r.status == Status::Queued));
+    }
+
+    #[test]
+    fn another_key_cancels_the_reinstall() {
+        let (mut app, rx) = app_capturing_installs();
+        app.on_key(key('U'));
+        app.on_key(key('?'));
+        app.on_key(key('U'));
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn no_reinstall_while_an_install_runs() {
+        let (mut app, rx) = app_capturing_installs();
+        app.rows[0].status = Status::Installing;
+        app.on_key(key('U'));
+        app.on_key(key('U'));
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn a_finished_reinstall_leaves_the_versions_alone() {
+        let (mut app, _rx) = app_capturing_installs();
+        app.on_key(key('U'));
+        app.on_key(key('U'));
+        app.on_install_finished(vec!["a".into(), "b".into()], Vec::new(), Ok(()));
+        let a = row(&app, "a");
+        assert_eq!(a.current, Version::new(1, 0, 0));
+        assert!(a.outdated, "a is still behind the latest 2.0.0");
+        assert_eq!(a.status, Status::Idle);
+        assert!(app.log.iter().any(|l| l.contains("✔ done")));
+    }
+
+    #[test]
+    fn a_failed_reinstall_marks_the_rows_failed() {
+        let (mut app, _rx) = app_capturing_installs();
+        app.on_key(key('U'));
+        app.on_key(key('U'));
+        app.on_install_finished(vec!["a".into(), "b".into()], Vec::new(), Err("boom".into()));
+        assert_eq!(row(&app, "a").status, Status::Failed);
+    }
+
+    #[test]
+    fn only_node_modules_is_deleted() {
+        let dir = std::env::temp_dir().join(format!("depsu-reinstall-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        install(&dir, "a", "1.0.0");
+        std::fs::write(dir.join("package.json"), "{}").unwrap();
+        remove_node_modules(&dir).unwrap();
+        assert!(!dir.join("node_modules").exists());
+        assert!(dir.join("package.json").exists());
+        // Already gone is fine.
+        remove_node_modules(&dir).unwrap();
     }
 }
