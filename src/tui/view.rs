@@ -68,6 +68,8 @@ pub enum Child {
     Tree(usize),
     /// `Row::vulns[i]`: a Snyk finding.
     Vuln(usize),
+    /// `Row::ignored[i]`: a finding the `.snyk` policy ignores. Informational only.
+    Ignored(usize),
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -138,6 +140,7 @@ fn children(r: &Row, idx: usize, mode: Overrides, vulns: bool) -> Vec<Item> {
     // Security findings first: they matter more than where overrides apply.
     if vulns {
         kids.extend((0..r.vulns.len()).map(Child::Vuln));
+        kids.extend((0..r.ignored.len()).map(Child::Ignored));
     }
     if mode != Overrides::Off {
         if r.lists_own_overrides() {
@@ -157,6 +160,7 @@ fn children(r: &Row, idx: usize, mode: Overrides, vulns: bool) -> Vec<Item> {
                 Child::Own(i) => r.overrides[i].key(),
                 Child::Tree(i) => r.tree_hits[i].over.key(),
                 Child::Vuln(i) => format!("vuln:{}", r.vulns[i].id),
+                Child::Ignored(i) => format!("ignored:{}", r.ignored[i].id),
             },
         })
         .collect()
@@ -308,6 +312,7 @@ mod tests {
             tree_hits: Vec::new(),
             outdated: true,
             vulns: Vec::new(),
+            ignored: Vec::new(),
             snyk_fix: None,
             audit_fix: None,
             changed_from: None,

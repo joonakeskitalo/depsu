@@ -1887,7 +1887,7 @@ fn detail_lines(
     let o = match child {
         Child::Own(i) => r.overrides.get(i),
         Child::Tree(i) => r.tree_hits.get(i).map(|h| &h.over),
-        Child::Vuln(_) => None,
+        Child::Vuln(_) | Child::Ignored(_) => None,
     };
     let update = o.and_then(|o| app.update_target(o));
     // Selection mark, only on override lines that can be updated.
@@ -1962,6 +1962,28 @@ fn detail_lines(
             }
             (t, String::new(), severity_color(v.severity))
         }
+        Child::Ignored(i) => {
+            let v = &r.ignored[i];
+            let mut t = format!("⊘ {:<8} [{}] {}  {}", v.severity.label(), v.source.label(), v.id, v.title);
+            t.push_str(&format!("  · {}@{}", v.package, v.version));
+            if v.path.len() > 1 {
+                t.push_str(&format!(" via {}", v.path[..v.path.len() - 1].join(" > ")));
+            }
+            let why = match app.ignores.iter().find(|r| r.covers(v)) {
+                Some(rule) => {
+                    let until = rule
+                        .expires
+                        .as_deref()
+                        .and_then(|e| e.get(..10))
+                        .map(|d| format!(" until {d}"))
+                        .unwrap_or_default();
+                    let reason = if rule.reason.is_empty() { String::new() } else { format!(": {}", rule.reason) };
+                    format!("{until}{reason}")
+                }
+                None => String::new(),
+            };
+            (t, format!("  · ignored in .snyk{why}"), Color::DarkGray)
+        }
     };
 
     // The new value goes right after the override itself, before via/notes.
@@ -1985,6 +2007,7 @@ fn detail_lines(
     ));
     if let Child::Vuln(i) = child {
         spans.extend(ignore_spans(app, &r.vulns[i]));
+        spans.extend(override_spans(app, &r.vulns[i]));
         spans.extend(fix_spans(app, r, &r.vulns[i]));
     }
     if let Some(reason) = unneeded {
@@ -2053,6 +2076,25 @@ fn policy_lines(app: &App, id: &str, path: &str, width: usize) -> Vec<Line<'stat
         ],
         width,
     )
+}
+/// `fixed by override` on a finding whose vulnerable package an override already pins to a
+/// fixed version. A scan that still lists it means the override isn't what is installed yet.
+fn override_spans(app: &App, v: &crate::security::vuln::Vuln) -> Vec<Span<'static>> {
+    let Some(o) = app.vuln_override(v) else {
+        return Vec::new();
+    };
+    let (text, style) = if app.snyk.stale {
+        (
+            format!("  ✔ fixed by override {} → {}: scan again to confirm", o.name, o.value),
+            Style::new().fg(Color::Green),
+        )
+    } else {
+        (
+            format!("  ⚠ override {} → {} is set, but the last scan still lists this: reinstall, then scan again", o.name, o.value),
+            Style::new().fg(Color::Yellow),
+        )
+    };
+    vec![Span::styled(text, style)]
 }
 /// `ignored in .snyk` on a finding a `.snyk` rule covers.
 fn ignore_spans(app: &App, v: &crate::security::vuln::Vuln) -> Vec<Span<'static>> {
@@ -2471,6 +2513,14 @@ fn vuln_lines(app: &App, r: &AppRow, v: &crate::security::vuln::Vuln, width: usi
         }
         let why = if rule.reason.is_empty() { "no reason given".to_string() } else { rule.reason.clone() };
         spans.push(Span::styled(format!(" · on {} · {why}", rule.path), dim));
+        add(spans);
+    }
+    if let Some(o) = app.vuln_override(v) {
+        let mut spans = override_spans(app, v);
+        if let Some(first) = spans.first_mut() {
+            first.content = first.content.trim_start().to_string().into();
+        }
+        spans.push(Span::styled(format!(" · {}", o.source), dim));
         add(spans);
     }
     // What the keys do about it, as on the finding's line in the list.

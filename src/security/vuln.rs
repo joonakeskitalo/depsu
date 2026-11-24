@@ -155,8 +155,7 @@ pub struct Report {
     pub fixes: HashMap<String, Version>,
     /// Problems with some projects of a multi-project scan that didn't stop the others.
     pub warnings: Vec<String>,
-    /// Findings Snyk left out because the project's `.snyk` ignores them: ID and path, as in
-    /// a policy (`direct > .. > vulnerable`).
+    /// Findings Snyk left out because the project's `.snyk` ignores them.
     #[serde(default)]
-    pub ignored: Vec<(String, String)>,
+    pub ignored: Vec<Vuln>,
 }

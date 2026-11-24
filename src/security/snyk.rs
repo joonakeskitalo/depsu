@@ -37,6 +37,68 @@ fn strings(v: Option<&Value>) -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// One finding of Snyk's output. Needs the project's first hop in `from` to name the direct
+/// dependency.
+fn to_vuln(v: &Value) -> Option<Vuln> {
+    let from = strings(v.get("from"));
+    let (Some(first_hop), Some(id)) = (from.get(1), v.get("id").and_then(Value::as_str))
+    else {
+        return None;
+    };
+    let Some((direct, direct_version)) = split_pkg(first_hop) else {
+        return None;
+    };
+    let package = v
+        .get("packageName")
+        .and_then(Value::as_str)
+        .unwrap_or(direct);
+    let version = v.get("version").and_then(Value::as_str).unwrap_or("");
+    // `upgradePath` is `[false, "direct@fixed", .., "vulnerable@fixed"]` when upgrading
+    // the direct dependency fixes it, and empty or `[false]` when nothing does.
+    let up = strings_or_false(v.get("upgradePath"));
+    let upgrade_to = up
+        .get(1)
+        .and_then(|s| split_pkg(s))
+        .map(|(_, v)| v.to_string());
+    let upgrade_brings = (up.len() > 2)
+        .then(|| {
+            up.last()
+                .and_then(|s| split_pkg(s))
+                .map(|(_, v)| v.to_string())
+        })
+        .flatten();
+    let severity = v
+        .get("severityWithCritical")
+        .or_else(|| v.get("severity"))
+        .and_then(Value::as_str)
+        .map(Severity::parse)
+        .unwrap_or(Severity::Low);
+    Some(Vuln {
+        source: Source::Snyk,
+        id: id.to_string(),
+        title: v
+            .get("title")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string(),
+        severity,
+        package: package.to_string(),
+        version: version.to_string(),
+        direct: direct.to_string(),
+        direct_version: (!direct_version.is_empty()).then(|| direct_version.to_string()),
+        path: from[2..]
+            .iter()
+            .map(|s| split_pkg(s).map_or(s.as_str(), |(n, _)| n).to_string())
+            .collect(),
+        fixed_in: strings(v.get("fixedIn")),
+        upgrade_to,
+        upgrade_brings,
+        upgrade_major: false,
+        range: None,
+        fix_note: None,
+        cve: strings(v.get("identifiers").and_then(|i| i.get("CVE"))),
+    })
+}
 /// Parses the JSON printed by `snyk test --json`: one object, or an array of them when several
 /// projects were tested.
 pub fn parse(text: &str) -> Result<Report, String> {
@@ -60,95 +122,29 @@ pub fn parse(text: &str) -> Result<Report, String> {
         };
         parsed_any = true;
         for v in vulns {
-            let from = strings(v.get("from"));
-            let (Some(first_hop), Some(id)) = (from.get(1), v.get("id").and_then(Value::as_str))
-            else {
-                continue;
-            };
-            let Some((direct, direct_version)) = split_pkg(first_hop) else {
-                continue;
-            };
-            let package = v
-                .get("packageName")
-                .and_then(Value::as_str)
-                .unwrap_or(direct);
-            let version = v.get("version").and_then(Value::as_str).unwrap_or("");
-            if !seen.insert((
-                id.to_string(),
-                package.to_string(),
-                version.to_string(),
-                direct.to_string(),
+            let Some(vuln) = to_vuln(v) else { continue };
+            if seen.insert((
+                vuln.id.clone(),
+                vuln.package.clone(),
+                vuln.version.clone(),
+                vuln.direct.clone(),
             )) {
-                continue;
+                report.vulns.push(vuln);
             }
-            // `upgradePath` is `[false, "direct@fixed", .., "vulnerable@fixed"]` when upgrading
-            // the direct dependency fixes it, and empty or `[false]` when nothing does.
-            let up = strings_or_false(v.get("upgradePath"));
-            let upgrade_to = up
-                .get(1)
-                .and_then(|s| split_pkg(s))
-                .map(|(_, v)| v.to_string());
-            let upgrade_brings = (up.len() > 2)
-                .then(|| {
-                    up.last()
-                        .and_then(|s| split_pkg(s))
-                        .map(|(_, v)| v.to_string())
-                })
-                .flatten();
-            let severity = v
-                .get("severityWithCritical")
-                .or_else(|| v.get("severity"))
-                .and_then(Value::as_str)
-                .map(Severity::parse)
-                .unwrap_or(Severity::Low);
-            report.vulns.push(Vuln {
-                source: Source::Snyk,
-                id: id.to_string(),
-                title: v
-                    .get("title")
-                    .and_then(Value::as_str)
-                    .unwrap_or("")
-                    .to_string(),
-                severity,
-                package: package.to_string(),
-                version: version.to_string(),
-                direct: direct.to_string(),
-                direct_version: (!direct_version.is_empty()).then(|| direct_version.to_string()),
-                path: from[2..]
-                    .iter()
-                    .map(|s| split_pkg(s).map_or(s.as_str(), |(n, _)| n).to_string())
-                    .collect(),
-                fixed_in: strings(v.get("fixedIn")),
-                upgrade_to,
-                upgrade_brings,
-                upgrade_major: false,
-                range: None,
-                fix_note: None,
-                cve: strings(v.get("identifiers").and_then(|i| i.get("CVE"))),
-            });
         }
-
         // Findings the `.snyk` file ignores are not in `vulnerabilities`, only here.
         let ignored = doc
             .get("filtered")
             .and_then(|f| f.get("ignore"))
             .and_then(Value::as_array);
         for v in ignored.into_iter().flatten() {
-            let from = strings(v.get("from"));
-            let Some(id) = v.get("id").and_then(Value::as_str) else {
-                continue;
-            };
-            if from.len() < 2 {
-                continue;
-            }
-            let path = from[1..]
+            let Some(vuln) = to_vuln(v) else { continue };
+            if !report
+                .ignored
                 .iter()
-                .map(|s| split_pkg(s).map_or(s.as_str(), |(n, _)| n))
-                .collect::<Vec<_>>()
-                .join(" > ");
-            let entry = (id.to_string(), path);
-            if !report.ignored.contains(&entry) {
-                report.ignored.push(entry);
+                .any(|o| (&o.id, &o.package, &o.version, &o.direct, &o.path) == (&vuln.id, &vuln.package, &vuln.version, &vuln.direct, &vuln.path))
+            {
+                report.ignored.push(vuln);
             }
         }
         // `remediation.upgrade`: "name@installed" -> { upgradeTo: "name@suggested", .. }
@@ -386,17 +382,15 @@ mod tests {
     #[test]
     fn findings_ignored_by_the_policy_are_listed_apart() {
         let json = r#"{"vulnerabilities":[],"filtered":{"ignore":[
-            {"id":"SNYK-1","from":["proj@1.0.0","a@1.0.0","b@2.0.0","c@3.0.0"]},
-            {"id":"SNYK-1","from":["proj@1.0.0","a@1.0.0","b@2.0.0","c@3.0.0"]},
+            {"id":"SNYK-1","title":"T","packageName":"c","version":"3.0.0","from":["proj@1.0.0","a@1.0.0","b@2.0.0","c@3.0.0"]},
+            {"id":"SNYK-1","title":"T","packageName":"c","version":"3.0.0","from":["proj@1.0.0","a@1.0.0","b@2.0.0","c@3.0.0"]},
             {"id":"SNYK-2","from":["proj@1.0.0","@s/x@1.0.0"]}],"patch":[]}}"#;
         let r = parse(json).unwrap();
         assert!(r.vulns.is_empty());
-        assert_eq!(
-            r.ignored,
-            vec![
-                ("SNYK-1".to_string(), "a > b > c".to_string()),
-                ("SNYK-2".to_string(), "@s/x".to_string())
-            ]
-        );
+        assert_eq!(r.ignored.len(), 2);
+        assert_eq!(r.ignored[0].id, "SNYK-1");
+        assert_eq!(r.ignored[0].title, "T");
+        assert_eq!(crate::security::policy::path_of(&r.ignored[0]), "a > b > c");
+        assert_eq!(crate::security::policy::path_of(&r.ignored[1]), "@s/x");
     }
 }

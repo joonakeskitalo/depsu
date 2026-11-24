@@ -417,6 +417,9 @@ pub struct Row {
     /// Vulnerabilities (Snyk, npm audit, bun audit) in this dependency or anything it brings
     /// in, worst first.
     pub vulns: Vec<Vuln>,
+    /// Findings of this dependency that the project's `.snyk` ignores, as the last Snyk scan
+    /// of the session reported them. Kept in memory only.
+    pub ignored: Vec<Vuln>,
     /// The version Snyk suggests to fix them.
     pub snyk_fix: Option<Version>,
     /// The version `npm audit` / `bun audit` suggests to fix them.
@@ -641,7 +644,7 @@ pub struct App {
     pub ignore_prompt: Option<IgnorePrompt>,
     /// What the last Snyk scan of this session said `.snyk` ignores (ID and path). `None`
     /// until a scan ran, and again after `.snyk` changed.
-    policy_seen: Option<Vec<(String, String)>>,
+    policy_seen: Option<Vec<Vuln>>,
     /// The ignore `x` removes when pressed again: its ID and path.
     confirm_unignore: Option<(String, String)>,
     /// Vulnerabilities queued installs and overrides will fix, with the row name or override
@@ -1138,8 +1141,14 @@ impl App {
         let mut missing: HashSet<Source> = HashSet::new();
         let project = self.project_key();
         let project_scans = self.cache.scans(&project);
+        let ignored_seen = self.policy_seen.clone().unwrap_or_default();
         for r in self.rows.iter_mut() {
             r.vulns.clear();
+            r.ignored = ignored_seen
+                .iter()
+                .filter(|v| v.direct == r.name)
+                .cloned()
+                .collect();
             r.snyk_fix = None;
             r.audit_fix = None;
             r.unscanned.clear();
@@ -1248,6 +1257,7 @@ impl App {
                 compat: Compat::Ok,
                 tree_hits: Vec::new(),
                 vulns: Vec::new(),
+                ignored: Vec::new(),
                 snyk_fix: None,
                 audit_fix: None,
                 changed_from: None,
@@ -1562,6 +1572,7 @@ impl App {
             compat,
             tree_hits: Vec::new(),
             vulns: Vec::new(),
+            ignored: Vec::new(),
             snyk_fix: None,
             audit_fix: None,
             changed_from: None,
@@ -1967,10 +1978,10 @@ impl App {
             .iter()
             .flat_map(|r| &r.vulns)
             .any(|v| v.source == Source::Snyk && rule.covers(v));
-        let seen = self.policy_seen.as_ref().is_some_and(|s| {
-            s.iter()
-                .any(|(id, path)| *id == rule.id && (rule.path == "*" || rule.path == *path))
-        });
+        let seen = self
+            .policy_seen
+            .as_ref()
+            .is_some_and(|s| s.iter().any(|v| rule.covers(v)));
         if listed || seen {
             PolicyStatus::Needed
         } else if self.policy_seen.is_some() && !self.snyk.stale {
@@ -2097,7 +2108,7 @@ impl App {
         match child {
             Child::Own(i) => r.overrides.get(*i),
             Child::Tree(i) => r.tree_hits.get(*i).map(|h| &h.over),
-            Child::Vuln(_) => None,
+            Child::Vuln(_) | Child::Ignored(_) => None,
         }
     }
 
@@ -3480,6 +3491,20 @@ impl App {
         }
     }
 
+    /// The override that already forces the vulnerable package of `v` to a fixed version, if
+    /// there is one: a global override of a transitive dependency at or above what `p` would
+    /// set.
+    pub fn vuln_override(&self, v: &Vuln) -> Option<&Override> {
+        let fix = pin_target(v)?;
+        if self.direct.contains(&v.package) {
+            return None;
+        }
+        self.overrides
+            .iter()
+            .filter(|o| o.name == v.package && o.global() && o.range.is_none())
+            .find(|o| overrides::min_version(&o.value).is_some_and(|m| m >= fix))
+    }
+
     /// The finding under the cursor, with the index of its row.
     pub fn cursor_vuln(&self) -> Option<(usize, &Vuln)> {
         let Some(Item::Detail {
@@ -4501,6 +4526,7 @@ impl App {
     fn after_policy_change(&mut self, comments_lost: bool) {
         self.reload_ignores();
         self.policy_seen = None;
+        self.refresh_findings();
         self.rebuild_view();
         self.scan_mut(Source::Snyk).stale = true;
         if comments_lost {
@@ -8035,7 +8061,7 @@ mod tests {
     #[test]
     fn a_rule_snyk_applied_is_still_needed() {
         let mut app = app_with_rule("SNYK-1");
-        let report = Report { ignored: vec![("SNYK-1".into(), "a > b".into())], ..Report::default() };
+        let report = Report { ignored: vec![vuln("a", "1.0.0", "SNYK-1")], ..Report::default() };
         app.apply_scan(Source::Snyk, report, false);
         assert_eq!(app.policy_status(&rule(&app, "SNYK-1")), PolicyStatus::Needed);
         let (line, _) = line_and_colour(&mut app, "SNYK-1", "SNYK-1");
@@ -8047,7 +8073,9 @@ mod tests {
         let mut app = app_with_rule("GONE");
         policy::add(&app.dir, "KEPT", "x > y", "r", None).unwrap();
         app.reload_ignores();
-        let report = Report { ignored: vec![("KEPT".into(), "x > y".into())], ..Report::default() };
+        let mut kept = vuln("x", "1.0.0", "KEPT");
+        kept.path = vec!["y".into()];
+        let report = Report { ignored: vec![kept], ..Report::default() };
         app.apply_scan(Source::Snyk, report, false);
         app.rebuild_view();
         assert_eq!(app.policy_status(&rule(&app, "GONE")), PolicyStatus::Unneeded);
@@ -8084,5 +8112,73 @@ mod tests {
         let mut app = app_with_rule("GONE");
         app.apply_scan(Source::Snyk, Report::default(), true);
         assert_eq!(app.policy_status(&rule(&app, "GONE")), PolicyStatus::Unknown);
+    }
+
+    #[test]
+    fn findings_the_policy_ignores_are_listed_under_their_package() {
+        let mut app = app_with_rule("IGN");
+        let mut gone = vuln("a", "1.0.0", "IGN");
+        gone.title = "Hidden".into();
+        let report = Report { ignored: vec![gone], ..Report::default() };
+        app.apply_scan(Source::Snyk, report, false);
+        app.rebuild_view();
+        assert_eq!(row(&app, "a").ignored.len(), 1);
+        assert!(row(&app, "a").vulns.is_empty());
+        let (line, colour) = line_and_colour(&mut app, "IGN  Hidden", "⊘");
+        assert!(line.contains("ignored in .snyk: old"), "{line}");
+        assert_eq!(colour, Some(ratatui::style::Color::DarkGray));
+        // Informational: the cursor skips it.
+        assert!(!app.view.iter().enumerate().any(|(i, it)| {
+            matches!(it, Item::Detail { child: Child::Ignored(_), .. }) && app.selectable(i)
+        }));
+        // Changing the policy drops the list: it needs a new scan.
+        app.after_policy_change(false);
+        assert!(row(&app, "a").ignored.is_empty());
+    }
+
+    fn override_of(name: &str, value: &str) -> Override {
+        Override {
+            name: name.into(),
+            range: None,
+            value: value.into(),
+            source: "overrides",
+            path: Vec::new(),
+            loc: vec!["overrides".into(), name.into()],
+        }
+    }
+
+    fn nested(app: &App) -> Vuln {
+        app.rows.iter().flat_map(|r| &r.vulns).find(|v| v.id == "NESTED").unwrap().clone()
+    }
+
+    #[test]
+    fn an_override_at_the_fixed_version_is_said_to_fix_the_finding() {
+        let mut app = app_with_three_findings();
+        assert!(app.vuln_override(&nested(&app)).is_none());
+        app.overrides.push(override_of("qs", "^6.0.1"));
+        assert!(app.vuln_override(&nested(&app)).is_none(), "below the fix");
+        app.overrides.clear();
+        app.overrides.push(override_of("qs", "^6.0.4"));
+        assert!(app.vuln_override(&nested(&app)).is_some());
+        app.rebuild_view();
+        // The scan is current but still lists it: the override isn't in effect.
+        app.snyk.stale = false;
+        let (line, _) = line_and_colour(&mut app, "NESTED", "⚠");
+        assert!(line.contains("override qs → ^6.0.4 is set, but the last scan still lists this"), "{line}");
+        app.snyk.stale = true;
+        let (line, colour) = line_and_colour(&mut app, "NESTED", "✔");
+        assert!(line.contains("✔ fixed by override qs → ^6.0.4: scan again to confirm"), "{line}");
+        assert_eq!(colour, Some(ratatui::style::Color::Green));
+    }
+
+    #[test]
+    fn an_override_of_another_package_or_for_a_direct_dependency_does_not_count() {
+        let mut app = app_with_three_findings();
+        app.overrides.push(override_of("other", "^9.0.0"));
+        assert!(app.vuln_override(&nested(&app)).is_none());
+        let mut limited = override_of("qs", "^6.0.4");
+        limited.path = vec!["mid".into()];
+        app.overrides = vec![limited];
+        assert!(app.vuln_override(&nested(&app)).is_none());
     }
 }
