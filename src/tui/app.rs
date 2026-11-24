@@ -9,9 +9,10 @@ use crate::deps::package::{self, Dep, Kind, parse_spec};
 use crate::deps::peers;
 use crate::config::pm::Pm;
 use crate::registry::registry;
+use crate::security::policy::{self, Ignore};
 use crate::security::snyk;
 use crate::deps::tree::{Analyzer, Dependent, Hit};
-use crate::tui::view::{self, Child, GroupBy, Item, Overrides, REMOVED, Release, UNNEEDED};
+use crate::tui::view::{self, Child, GroupBy, Item, Overrides, POLICY, REMOVED, Release, UNNEEDED};
 use crate::security::vuln::{Report, Severity, Source, Vuln};
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::layout::Rect;
@@ -332,6 +333,32 @@ pub enum CommitField {
     Body,
 }
 
+/// The ignore `x` is about to add to `.snyk`.
+pub struct IgnorePrompt {
+    pub id: String,
+    pub title: String,
+    /// `*` or a path like `a > b`.
+    pub path: crate::tui::textfield::TextField,
+    pub reason: crate::tui::textfield::TextField,
+    pub expires: crate::tui::textfield::TextField,
+    /// The ID and path of the rule being edited, when this edits one that exists.
+    pub editing: Option<(String, String)>,
+    pub field: IgnoreField,
+    pub error: Option<String>,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum IgnoreField {
+    Reason,
+    Expires,
+    Path,
+}
+impl IgnoreField {
+    fn next(self, by: isize) -> Self {
+        let all = [Self::Reason, Self::Expires, Self::Path];
+        let i = all.iter().position(|f| *f == self).unwrap_or(0) as isize;
+        all[(i + by).rem_euclid(all.len() as isize) as usize]
+    }
+}
 /// What `d` is about to delete, waiting for the user to confirm.
 pub struct DeletePrompt {
     /// Packages to uninstall.
@@ -600,6 +627,11 @@ pub struct App {
     pub blocked_prompt: Option<BlockedPrompt>,
     /// The commit `c` proposes.
     pub commit_prompt: Option<CommitPrompt>,
+    /// The ignore rules in the project's `.snyk`.
+    pub ignores: Vec<Ignore>,
+    pub ignore_prompt: Option<IgnorePrompt>,
+    /// The ignore `x` removes when pressed again: its ID and path.
+    confirm_unignore: Option<(String, String)>,
     /// Vulnerabilities queued installs and overrides will fix, with the row name or override
     /// key of the job that fixes them.
     queued_fixes: Vec<(String, crate::deps::commit::Fixed)>,
@@ -826,6 +858,9 @@ impl App {
             delete_prompt: None,
             blocked_prompt: None,
             commit_prompt: None,
+            ignores: Vec::new(),
+            ignore_prompt: None,
+            confirm_unignore: None,
             queued_fixes: Vec::new(),
             session_fixes: Vec::new(),
             exact_once: HashSet::new(),
@@ -894,6 +929,7 @@ impl App {
             jobs,
         };
         app.add_placeholder_rows();
+        app.reload_ignores();
         if let Some(path) = cache_path {
             match Cache::load(&path) {
                 Ok(c) => {
@@ -1839,6 +1875,7 @@ impl App {
             self.show_vulns,
         );
         self.append_unneeded_section();
+        self.append_policy_section();
         self.append_removed_section();
         let pos = if self.cursor_moved {
             anchor.and_then(|a| self.view.iter().position(|it| anchor_of(it) == a))
@@ -1847,7 +1884,7 @@ impl App {
             // whatever happened to arrive first, such as the unneeded-overrides section.
             self.view.iter().position(|it| match it {
                 Item::Row { .. } => true,
-                Item::Header { label, .. } => label != UNNEEDED,
+                Item::Header { label, .. } => label != UNNEEDED && label != POLICY,
                 _ => false,
             })
         };
@@ -1882,6 +1919,35 @@ impl App {
             .extend(keys.into_iter().map(|key| Item::Override { key }));
     }
 
+    /// Lists the ignore rules of `.snyk`, expired ones too, so they can be edited or removed.
+    fn append_policy_section(&mut self) {
+        let needle = self.filter.trim().to_lowercase();
+        let rules: Vec<Item> = self
+            .ignores
+            .iter()
+            .filter(|r| {
+                needle.is_empty()
+                    || [&r.id, &r.path, &r.reason]
+                        .iter()
+                        .any(|t| t.to_lowercase().contains(&needle))
+            })
+            .map(|r| Item::Policy {
+                id: r.id.clone(),
+                path: r.path.clone(),
+            })
+            .collect();
+        if rules.is_empty() {
+            return;
+        }
+        self.view.push(Item::Header {
+            label: POLICY.to_string(),
+            members: Vec::new(),
+        });
+        self.view.extend(rules);
+    }
+    pub fn policy_rule(&self, id: &str, path: &str) -> Option<&Ignore> {
+        self.ignores.iter().find(|r| r.id == id && r.path == path)
+    }
     fn append_removed_section(&mut self) {
         let needle = self.filter.trim().to_lowercase();
         let names: Vec<String> = self
@@ -2129,6 +2195,19 @@ impl App {
             item.push("i install fix".into());
         }
         if let Some((_, v)) = self.cursor_vuln()
+            && v.source == Source::Snyk
+        {
+            item.push(if self.ignore_for(v).is_some() {
+                "x edit ignore".into()
+            } else {
+                "x ignore in .snyk".into()
+            });
+        }
+        if matches!(self.cursor_item(), Some(Item::Policy { .. })) {
+            item.push("x edit ignore".into());
+            item.push("d remove ignore".into());
+        }
+        if let Some((_, v)) = self.cursor_vuln()
             && self.vuln_pin_fix(v).is_some()
         {
             item.push("p pin fix as override".into());
@@ -2208,6 +2287,10 @@ impl App {
         }
         if self.commit_prompt.is_some() {
             self.on_commit_key(key);
+            return;
+        }
+        if self.ignore_prompt.is_some() {
+            self.on_ignore_key(key);
             return;
         }
         if self.version_edit.is_some() {
@@ -2325,6 +2408,9 @@ impl App {
         if key.code != KeyCode::Char('p') {
             self.confirm_pin = false;
         }
+        if !matches!(key.code, KeyCode::Char('d')) {
+            self.confirm_unignore = None;
+        }
         match key.code {
             KeyCode::Esc if !self.filter.is_empty() => {
                 self.filter.clear();
@@ -2379,6 +2465,7 @@ impl App {
             KeyCode::Char('i') | KeyCode::Enter => self.install_selected(),
             KeyCode::Char('p') => self.pin_selected(),
             KeyCode::Char('P') => self.ask_pin_type(),
+            KeyCode::Char('x') => self.ignore_cursor(),
             KeyCode::Char('s') => self.start_scan(Source::Snyk),
             KeyCode::Char('n') => self.start_scan(self.audit_source()),
             KeyCode::Char('?') => self.show_info = !self.show_info,
@@ -3289,7 +3376,7 @@ impl App {
                     self.rows[i].selected = !all;
                 }
             }
-            Item::Removed { .. } => {}
+            Item::Removed { .. } | Item::Policy { .. } => {}
             Item::Detail { .. } | Item::Override { .. } => {
                 let Some(o) = self.detail_override(&item) else {
                     return;
@@ -3431,7 +3518,7 @@ impl App {
                         ovr.push((o.clone(), u.value));
                     }
                 }
-                Some(Item::Removed { .. }) | None => {}
+                Some(Item::Removed { .. } | Item::Policy { .. }) | None => {}
             }
             idx.retain(|&i| self.rows[i].actionable());
         }
@@ -3519,6 +3606,9 @@ impl App {
 
     /// Asks before deleting the checked packages and overrides (or the item under the cursor).
     fn delete_selected(&mut self) {
+        if matches!(self.cursor_item(), Some(Item::Policy { .. })) {
+            return self.remove_policy_cursor();
+        }
         let (packages, overrides, _) = self.delete_targets();
         if packages.is_empty() && overrides.is_empty() {
             self.push_log(
@@ -4278,6 +4368,195 @@ impl App {
     /// Adds overrides that pin the vulnerable transitive packages of the checked packages (or
     /// of the one under the cursor) to the version the scanners say fixes them. Asks for a
     /// second press first.
+    // ---- the .snyk policy file --------------------------------------------------------------
+
+    /// The active ignore rule that covers `v`, if the project's `.snyk` has one.
+    pub fn ignore_for(&self, v: &Vuln) -> Option<&Ignore> {
+        let today = policy::today();
+        self.ignores.iter().find(|r| r.covers(v) && !r.expired(&today))
+    }
+
+    fn reload_ignores(&mut self) {
+        match policy::load(&self.dir) {
+            Ok(r) => self.ignores = r,
+            Err(e) => {
+                self.ignores.clear();
+                self.push_log(format!("✘ .snyk: {e}"));
+            }
+        }
+    }
+
+    /// `x` on a Snyk finding or on an ignore rule in the policy section: opens the dialog to
+    /// add an ignore, or to edit the one that covers the finding.
+    fn ignore_cursor(&mut self) {
+        if let Some(Item::Policy { id, path }) = self.cursor_item().cloned() {
+            let Some(rule) = self.policy_rule(&id, &path).cloned() else {
+                return;
+            };
+            // The title of a finding that has this ID, if the scan found it.
+            let title = self
+                .rows
+                .iter()
+                .flat_map(|r| &r.vulns)
+                .find(|v| v.id == id)
+                .map(|v| v.title.clone())
+                .unwrap_or_default();
+            return self.open_ignore(&rule.id, &title, &rule.path, Some(&rule));
+        }
+        let Some((_, v)) = self.cursor_vuln() else {
+            self.push_log("Put the cursor on a Snyk finding to ignore it in .snyk.");
+            return;
+        };
+        if v.source != Source::Snyk {
+            self.push_log("Only Snyk findings can be ignored: .snyk is Snyk's policy file.");
+            return;
+        }
+        let v = v.clone();
+        let rule = self.ignore_for(&v).cloned();
+        let path = rule.as_ref().map_or_else(|| policy::path_of(&v), |r| r.path.clone());
+        self.open_ignore(&v.id, &v.title, &path, rule.as_ref());
+    }
+
+    fn open_ignore(&mut self, id: &str, title: &str, path: &str, rule: Option<&Ignore>) {
+        let expires = match rule {
+            Some(r) => r.expires.as_deref().and_then(|e| e.get(..10)).unwrap_or("").to_string(),
+            None => policy::in_days(30),
+        };
+        self.ignore_prompt = Some(IgnorePrompt {
+            id: id.to_string(),
+            title: title.to_string(),
+            path: crate::tui::textfield::TextField::new(path),
+            reason: crate::tui::textfield::TextField::new(rule.map_or("", |r| r.reason.as_str())),
+            expires: crate::tui::textfield::TextField::new(expires),
+            editing: rule.map(|r| (r.id.clone(), r.path.clone())),
+            field: IgnoreField::Reason,
+            error: None,
+        });
+    }
+
+    /// `d` on an ignore rule: removes it from `.snyk` after a second press.
+    fn remove_policy_cursor(&mut self) {
+        let Some(Item::Policy { id, path }) = self.cursor_item().cloned() else {
+            return;
+        };
+        let key = (id.clone(), path.clone());
+        if self.confirm_unignore.as_ref() != Some(&key) {
+            self.push_log(format!(
+                "Will remove the ignore of {id} on {path} from .snyk. Press d again to confirm, any other key cancels."
+            ));
+            self.confirm_unignore = Some(key);
+            return;
+        }
+        self.confirm_unignore = None;
+        self.remove_ignore(&id, &path);
+    }
+
+    fn remove_ignore(&mut self, id: &str, path: &str) {
+        match policy::remove(&self.dir, id, path) {
+            Ok(lost) => {
+                self.push_log(format!("✔ removed the ignore of {id} from .snyk"));
+                self.after_policy_change(lost);
+            }
+            Err(e) => self.push_log(format!("✘ .snyk: {e}")),
+        }
+    }
+
+    fn after_policy_change(&mut self, comments_lost: bool) {
+        self.reload_ignores();
+        self.rebuild_view();
+        self.scan_mut(Source::Snyk).stale = true;
+        if comments_lost {
+            self.push_log("⚠ .snyk had comments, which rewriting the file dropped.");
+        }
+    }
+
+    fn on_ignore_key(&mut self, key: KeyEvent) {
+        let Some(p) = &mut self.ignore_prompt else {
+            return;
+        };
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let f = match p.field {
+            IgnoreField::Reason => &mut p.reason,
+            IgnoreField::Expires => &mut p.expires,
+            IgnoreField::Path => &mut p.path,
+        };
+        match key.code {
+            KeyCode::Esc => self.ignore_prompt = None,
+            KeyCode::Enter => self.submit_ignore(),
+            KeyCode::Char('d') if ctrl => {
+                if let Some((id, path)) = p.editing.clone() {
+                    self.ignore_prompt = None;
+                    self.remove_ignore(&id, &path);
+                }
+            }
+            KeyCode::Tab | KeyCode::Down => p.field = p.field.next(1),
+            KeyCode::BackTab | KeyCode::Up => p.field = p.field.next(-1),
+            _ => {
+                match key.code {
+                    KeyCode::Backspace => {
+                        f.backspace();
+                    }
+                    KeyCode::Delete => {
+                        f.delete();
+                    }
+                    KeyCode::Left => f.left(),
+                    KeyCode::Right => f.right(),
+                    KeyCode::Home => f.home(),
+                    KeyCode::End => f.end(),
+                    KeyCode::Char(c) if !ctrl => f.insert(c),
+                    _ => return,
+                }
+                p.error = None;
+            }
+        }
+    }
+
+    fn submit_ignore(&mut self) {
+        let Some(p) = &mut self.ignore_prompt else {
+            return;
+        };
+        let reason = p.reason.text().trim().to_string();
+        if reason.is_empty() {
+            p.error = Some("Give a reason: it is kept in .snyk for whoever reads it next.".into());
+            p.field = IgnoreField::Reason;
+            return;
+        }
+        let expires = match policy::parse_expiry(p.expires.text(), &policy::today()) {
+            Ok(e) => e,
+            Err(e) => {
+                p.error = Some(e);
+                p.field = IgnoreField::Expires;
+                return;
+            }
+        };
+        let path = p.path.text().trim().to_string();
+        if path.is_empty() {
+            p.error = Some("Give a path like `a > b`, or `*` for every path.".into());
+            p.field = IgnoreField::Path;
+            return;
+        }
+        let id = p.id.clone();
+        let old = p.editing.clone();
+        // A rule whose path changed moves: the old one goes, so none is left behind.
+        if let Some((oid, opath)) = old.filter(|(_, op)| *op != path)
+            && let Err(e) = policy::remove(&self.dir, &oid, &opath)
+        {
+            p.error = Some(e);
+            return;
+        }
+        match policy::add(&self.dir, &id, &path, &reason, expires.as_deref()) {
+            Ok(lost) => {
+                self.ignore_prompt = None;
+                self.push_log(format!(
+                    "✔ ignoring {id} in .snyk on {path}{}. Run Snyk again to see the effect.",
+                    expires.map(|e| format!(" until {e}")).unwrap_or_default()
+                ));
+                self.after_policy_change(lost);
+            }
+            Err(e) => p.error = Some(e),
+        }
+    }
+
     fn pin_selected(&mut self) {
         // On a finding with nothing checked: pin that finding's package.
         if !self.rows.iter().any(|r| r.selected)
@@ -4427,6 +4706,7 @@ fn anchor_of(item: &Item) -> (u8, String) {
         Item::Row { name, .. } => (1, name.clone()),
         Item::Override { key } => (3, key.clone()),
         Item::Removed { name } => (4, name.clone()),
+        Item::Policy { id, path } => (5, format!("{id}\u{0}{path}")),
         Item::Detail {
             row, key, child, ..
         } => (
@@ -7499,5 +7779,198 @@ mod tests {
         app.on_key(key('I'));
         wait_until(&mut app, |app| app.log.iter().any(|l| l == "No checksums added."));
         assert!(app.log.iter().any(|l| l.contains("npm keeps no checksum for git packages")), "{:?}", app.log);
+    }
+
+    // ---- .snyk ignores ------------------------------------------------------------------
+
+    #[test]
+    fn x_asks_for_a_reason_and_writes_the_ignore_to_snyk() {
+        let mut app = app_with_three_findings();
+        cursor_on_finding(&mut app, "NESTED");
+        app.on_key(key('x'));
+        assert!(app.ignore_prompt.is_some());
+        // No reason yet.
+        press(&mut app, KeyCode::Enter);
+        assert!(app.ignore_prompt.as_ref().unwrap().error.is_some());
+        assert!(!policy::file(&app.dir).exists());
+        type_text(&mut app, "not reachable");
+        press(&mut app, KeyCode::Enter);
+        assert!(app.ignore_prompt.is_none());
+        let rules = policy::load(&app.dir).unwrap();
+        assert_eq!(rules.len(), 1);
+        assert_eq!((rules[0].id.as_str(), rules[0].path.as_str()), ("NESTED", "a > mid > qs"));
+        assert_eq!(rules[0].reason, "not reachable");
+        assert!(rules[0].expires.is_some());
+        // The finding is marked, and the scan results are outdated.
+        let (line, _) = line_and_colour(&mut app, "NESTED", "⊘");
+        assert!(line.contains("⊘ ignored in .snyk until"), "{line}");
+        assert!(app.snyk.stale);
+    }
+
+    #[test]
+    fn the_ignore_can_cover_every_path_and_never_expire() {
+        let mut app = app_with_three_findings();
+        cursor_on_finding(&mut app, "NESTED");
+        app.on_key(key('x'));
+        type_text(&mut app, "why");
+        press(&mut app, KeyCode::Tab);
+        // Empty the pre-filled expiry.
+        for _ in 0..10 {
+            press(&mut app, KeyCode::Backspace);
+        }
+        press(&mut app, KeyCode::Tab);
+        for _ in 0..20 {
+            press(&mut app, KeyCode::Backspace);
+        }
+        type_text(&mut app, "*");
+        press(&mut app, KeyCode::Enter);
+        let rules = policy::load(&app.dir).unwrap();
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0].path, "*");
+        assert_eq!(rules[0].expires, None);
+        let v = app.rows.iter().flat_map(|r| &r.vulns).find(|v| v.id == "NESTED").unwrap().clone();
+        assert!(app.ignore_for(&v).is_some());
+    }
+
+    #[test]
+    fn a_bad_expiry_keeps_the_dialog_open() {
+        let mut app = app_with_three_findings();
+        cursor_on_finding(&mut app, "NESTED");
+        app.on_key(key('x'));
+        type_text(&mut app, "why");
+        press(&mut app, KeyCode::Tab);
+        type_text(&mut app, "x");
+        press(&mut app, KeyCode::Enter);
+        let p = app.ignore_prompt.as_ref().unwrap();
+        assert!(p.error.is_some());
+        assert_eq!(p.field, IgnoreField::Expires);
+        assert!(!policy::file(&app.dir).exists());
+        press(&mut app, KeyCode::Esc);
+        assert!(app.ignore_prompt.is_none());
+    }
+
+    fn cursor_on_policy(app: &mut App, id: &str) {
+        let pos = app
+            .view
+            .iter()
+            .position(|it| matches!(it, Item::Policy { id: i, .. } if i == id))
+            .expect("rule listed");
+        app.table.select(Some(pos));
+    }
+
+    #[test]
+    fn existing_ignores_are_listed_in_a_section() {
+        let mut app = app_with_three_findings();
+        assert!(!app.view.iter().any(|i| matches!(i, Item::Policy { .. })));
+        policy::add(&app.dir, "UPGRADE", "*", "old reason", Some("2999-01-01")).unwrap();
+        app.reload_ignores();
+        app.rebuild_view();
+        let (line, _) = line_and_colour(&mut app, "UPGRADE  Bad  · on *", "UPGRADE");
+        assert!(line.contains("until 2999-01-01") && line.contains("old reason"), "{line}");
+        let (header, _) = line_and_colour(&mut app, ".snyk ignores (1)", ".snyk");
+        assert!(header.contains("x edits"), "{header}");
+        // The filter narrows the section too.
+        app.filter = "nomatch".into();
+        app.rebuild_view();
+        assert!(!app.view.iter().any(|i| matches!(i, Item::Policy { .. })));
+    }
+
+    #[test]
+    fn x_on_an_ignored_finding_edits_its_rule() {
+        let mut app = app_with_three_findings();
+        policy::add(&app.dir, "UPGRADE", "*", "old", None).unwrap();
+        app.reload_ignores();
+        cursor_on_finding(&mut app, "UPGRADE");
+        app.on_key(key('x'));
+        let p = app.ignore_prompt.as_ref().unwrap();
+        assert_eq!((p.reason.text(), p.path.text(), p.expires.text()), ("old", "*", ""));
+        assert!(p.editing.is_some());
+    }
+
+    #[test]
+    fn a_rule_is_edited_from_the_policy_section() {
+        let mut app = app_with_three_findings();
+        policy::add(&app.dir, "UPGRADE", "*", "old", None).unwrap();
+        app.reload_ignores();
+        app.rebuild_view();
+        cursor_on_policy(&mut app, "UPGRADE");
+        assert!(app.hints().0.contains(&"x edit ignore".to_string()));
+        app.on_key(key('x'));
+        type_text(&mut app, " and more");
+        press(&mut app, KeyCode::Tab);
+        type_text(&mut app, "2999-05-06");
+        press(&mut app, KeyCode::Tab);
+        // Move the rule to a path of its own.
+        press(&mut app, KeyCode::Backspace);
+        type_text(&mut app, "a");
+        press(&mut app, KeyCode::Enter);
+        assert!(app.ignore_prompt.is_none());
+        let rules = policy::load(&app.dir).unwrap();
+        assert_eq!(rules.len(), 1, "the old path's rule is gone");
+        assert_eq!(rules[0].path, "a");
+        assert_eq!(rules[0].reason, "old and more");
+        assert_eq!(rules[0].expires.as_deref(), Some("2999-05-06T00:00:00.000Z"));
+        assert!(app.view.iter().any(|i| matches!(i, Item::Policy { path, .. } if path == "a")));
+    }
+
+    #[test]
+    fn d_on_a_rule_removes_it_after_a_second_press() {
+        let mut app = app_with_three_findings();
+        policy::add(&app.dir, "UPGRADE", "*", "old", None).unwrap();
+        app.reload_ignores();
+        app.rebuild_view();
+        cursor_on_policy(&mut app, "UPGRADE");
+        app.on_key(key('d'));
+        assert_eq!(policy::load(&app.dir).unwrap().len(), 1);
+        app.on_key(key('d'));
+        assert!(policy::load(&app.dir).unwrap().is_empty());
+        assert!(!app.view.iter().any(|i| matches!(i, Item::Policy { .. })));
+    }
+
+    #[test]
+    fn another_key_cancels_removing_a_rule() {
+        let mut app = app_with_three_findings();
+        policy::add(&app.dir, "UPGRADE", "*", "old", None).unwrap();
+        app.reload_ignores();
+        app.rebuild_view();
+        cursor_on_policy(&mut app, "UPGRADE");
+        app.on_key(key('d'));
+        app.on_key(key('?'));
+        app.on_key(key('d'));
+        assert_eq!(policy::load(&app.dir).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn ctrl_d_in_the_edit_dialog_removes_the_rule() {
+        let mut app = app_with_three_findings();
+        policy::add(&app.dir, "UPGRADE", "*", "old", None).unwrap();
+        app.reload_ignores();
+        cursor_on_finding(&mut app, "UPGRADE");
+        app.on_key(key('x'));
+        app.on_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL));
+        assert!(app.ignore_prompt.is_none());
+        assert!(policy::load(&app.dir).unwrap().is_empty());
+    }
+
+    #[test]
+    fn expired_ignores_do_not_count() {
+        let mut app = app_with_three_findings();
+        std::fs::write(
+            policy::file(&app.dir),
+            "version: v1.25.0\nignore:\n  UPGRADE:\n    - '*':\n        reason: r\n        expires: 2020-01-01T00:00:00.000Z\n",
+        )
+        .unwrap();
+        app.reload_ignores();
+        assert_eq!(app.ignores.len(), 1);
+        let v = app.rows[0].vulns.iter().find(|v| v.id == "UPGRADE").unwrap().clone();
+        assert!(app.ignore_for(&v).is_none());
+    }
+
+    #[test]
+    fn only_snyk_findings_can_be_ignored() {
+        let mut app = app_with_three_findings();
+        app.on_key(key('x'));
+        assert!(app.ignore_prompt.is_none());
+        assert!(!policy::file(&app.dir).exists());
     }
 }

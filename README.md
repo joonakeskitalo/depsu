@@ -84,6 +84,7 @@ depsu --cache .depsu-cache.json   # remember versions and scans between runs
 | `P` | Choose how the selected or highlighted packages are pinned: exact (`e`), caret `^` (`c`), tilde `~` (`t`) or at least `>=` (`m`). Letters are used because `^` and `~` are dead keys on Nordic keyboards. The version stays, `package.json` is edited and the install runs |
 | `p` | Pin a vulnerable transitive dependency to the fixed version a scan suggests, as an override (press twice to confirm) |
 | `s` | Scan with Snyk |
+| `x` | Ignore a Snyk finding in the project's `.snyk` file, or edit an existing ignore. On a finding, or on a rule in the `.snyk ignores` section of the list, a dialog asks for a reason (required), an expiry date (`YYYY-MM-DD`, pre-filled with 30 days for a new ignore, empty for none) and the path (the finding's own path like `a > b`, or `*` for every path). `Tab` switches fields; `Ctrl+D` removes the rule being edited. Findings a non-expired rule covers are tagged `⊘ ignored in .snyk`. The `.snyk ignores` section lists every rule with its ID, path, expiry (expired ones dimmed) and reason, and follows the `/` filter; `d` on a rule removes it after a second press. Other keys in `.snyk` are kept, but comments are lost when the file is rewritten (depsu says so in the log). Snyk applies the file on the next scan (`s`) |
 | `n` | Run `npm audit` / `bun audit` (whichever the project uses) |
 | `v` | Show / hide vulnerability findings |
 | `R` | Fetch the latest versions again, ignoring the cache |
@@ -303,7 +304,7 @@ Source layout:
 | `registry.rs`, `npmrc.rs`, `bunfig.rs`, `yarnrc.rs` | Registry access and configuration |
 | `pm.rs`, `package.rs`, `edit.rs` | Package manager detection and commands, `package.json` reading and editing |
 | `overrides.rs`, `tree.rs` | Override parsing, compatibility, unneeded detection, dependency tree walk |
-| `snyk.rs`, `audit.rs`, `vuln.rs` | Snyk CLI integration, `npm audit` / `bun audit` integration, and the finding type they share. `tests/fixtures/` holds real and hand-written output |
+| `snyk.rs`, `policy.rs`, `audit.rs`, `vuln.rs` | Snyk CLI integration, the `.snyk` ignore rules, `npm audit` / `bun audit` integration, and the finding type they share. `tests/fixtures/` holds real and hand-written output |
 
 ## Limitations
 

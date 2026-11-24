@@ -3,7 +3,7 @@ use crate::deps::overrides::{self, Compat, Override};
 use crate::deps::package::Kind;
 use crate::config::pm::Pm;
 use crate::deps::tree::{self, Hit};
-use crate::tui::view::{Child, GroupBy, Item, Overrides, Release, UNNEEDED};
+use crate::tui::view::{Child, GroupBy, Item, Overrides, POLICY, Release, UNNEEDED};
 use crate::security::vuln::{Severity, Source};
 use ratatui::Frame;
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -96,6 +96,7 @@ pub fn focus(app: &App) -> Focus {
         || app.delete_prompt.is_some()
         || app.blocked_prompt.is_some()
         || app.commit_prompt.is_some()
+        || app.ignore_prompt.is_some()
         || add_dialog
     {
         Focus::Dialog
@@ -247,6 +248,9 @@ pub fn draw(f: &mut Frame, app: &mut App) {
             Item::Header { label, members } => ListItem::new(header_line(app, label, members)),
             Item::Row { idx, .. } => ListItem::new(row_line(app, &app.rows[*idx], indent, name_w, body.width as usize)),
             Item::Removed { name } => ListItem::new(removed_line(app, name)),
+            Item::Policy { id, path } => {
+                ListItem::new(Text::from(policy_lines(app, id, path, body.width as usize)))
+            }
             Item::Override { key } => {
                 ListItem::new(Text::from(orphan_lines(app, key, body.width as usize)))
             }
@@ -280,6 +284,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     let info_title = match app.cursor_item() {
         Some(Item::Row { idx, .. }) => format!("selected: {}", app.rows[*idx].name),
         Some(Item::Removed { name }) => format!("selected: {name}"),
+        Some(Item::Policy { id, .. }) => format!("selected: {id}"),
         _ => match app.cursor_vuln() {
             Some((_, v)) => format!("selected: {} in {}", v.id, v.package),
             None => "selected".to_string(),
@@ -366,6 +371,9 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     }
     if let Some(e) = &app.version_edit {
         draw_version_edit(f, app, e);
+    }
+    if let Some(p) = &app.ignore_prompt {
+        draw_ignore_dialog(f, p);
     }
     if let Some(input) = &app.input
         && let crate::tui::app::InputPurpose::Add { add_as } = &input.purpose
@@ -493,6 +501,49 @@ fn draw_version_edit(f: &mut Frame, app: &App, e: &crate::tui::app::VersionEdit)
     draw_dialog(f, &format!("Version of {}", e.name), lines, width);
 }
 
+/// The ignore `x` adds to `.snyk`: reason, expiry and the paths it covers.
+fn draw_ignore_dialog(f: &mut Frame, p: &crate::tui::app::IgnorePrompt) {
+    use crate::tui::app::IgnoreField;
+    let width = f.area().width.saturating_sub(4).min(80);
+    let inner = (width as usize).saturating_sub(4);
+    let bold = Style::new().add_modifier(Modifier::BOLD);
+    let dim = Style::new().fg(Color::DarkGray);
+    let cyan_bold = Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD);
+    let indent = || Span::raw(" ".repeat(10));
+    let label = |t: &str, on: bool| Span::styled(format!("{t:<10}"), if on { cyan_bold } else { bold });
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    lines.extend(wrap(label("Finding", false), indent(), vec![Span::raw(format!("{}  {}", p.id, p.title))], inner));
+    lines.push(Line::default());
+    let on = |f: IgnoreField| p.field == f;
+    let reason = field_lines(&p.reason, on(IgnoreField::Reason), bold).into_iter().next().unwrap_or_default();
+    lines.extend(wrap(label("Reason", on(IgnoreField::Reason)), indent(), reason, inner));
+    let expires = field_lines(&p.expires, on(IgnoreField::Expires), bold).into_iter().next().unwrap_or_default();
+    lines.extend(wrap(label("Expires", on(IgnoreField::Expires)), indent(), expires, inner));
+    lines.push(Line::from(vec![indent(), Span::styled("YYYY-MM-DD, empty: never", dim)]));
+    let path = field_lines(&p.path, on(IgnoreField::Path), bold).into_iter().next().unwrap_or_default();
+    lines.extend(wrap(label("Path", on(IgnoreField::Path)), indent(), path, inner));
+    lines.push(Line::from(vec![indent(), Span::styled("`*` covers every path", dim)]));
+    lines.push(Line::default());
+    if let Some(err) = &p.error {
+        lines.extend(wrap(Span::raw(""), Span::raw("  "), vec![Span::styled(err.clone(), Style::new().fg(Color::Red))], inner));
+        lines.push(Line::default());
+    }
+    let key = |k: &str, t: &str| {
+        vec![
+            Span::styled(k.to_string(), Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+            Span::raw(format!(" {t}   ")),
+        ]
+    };
+    let mut keys = key("enter", "save to .snyk");
+    keys.extend(key("tab", "next field"));
+    if p.editing.is_some() {
+        keys.extend(key("ctrl+d", "remove"));
+    }
+    keys.extend(key("esc", "cancel"));
+    lines.push(Line::from(keys));
+    let title = if p.editing.is_some() { "Edit ignore in .snyk" } else { "Ignore in .snyk" };
+    draw_dialog(f, title, lines, width);
+}
 /// The commit `c` proposes: its title and body to edit, and which files.
 fn draw_commit_dialog(f: &mut Frame, p: &crate::tui::app::CommitPrompt) {
     use crate::tui::app::CommitField;
@@ -1351,6 +1402,14 @@ fn footer_lines(
             width,
         ));
     }
+    if app.ignore_prompt.is_some() {
+        return prompt(wrap_keys(
+            vec!["Ignore in .snyk:".cyan().bold()],
+            vec![hint("see the dialog above"), hint("enter save"), hint("esc cancel")],
+            "   ",
+            width,
+        ));
+    }
     if app.version_edit.is_some() {
         return prompt(wrap_keys(
             vec!["Edit the version:".cyan().bold()],
@@ -1546,6 +1605,11 @@ fn removed_line(app: &App, name: &str) -> Line<'static> {
 fn header_line(app: &App, label: &str, members: &[usize]) -> Line<'static> {
     if label == crate::tui::view::REMOVED && members.is_empty() {
         return Line::from(format!("✂ {label} ({})", app.removed.len()))
+            .style(Style::new().fg(Color::Magenta).add_modifier(Modifier::BOLD));
+    }
+    if label == POLICY && members.is_empty() {
+        let n = app.ignores.len();
+        return Line::from(format!("⊘ {label} ({n}), x edits, d removes"))
             .style(Style::new().fg(Color::Magenta).add_modifier(Modifier::BOLD));
     }
     if label == UNNEEDED && members.is_empty() {
@@ -1914,6 +1978,7 @@ fn detail_lines(
         Style::new().fg(color),
     ));
     if let Child::Vuln(i) = child {
+        spans.extend(ignore_spans(app, &r.vulns[i]));
         spans.extend(fix_spans(app, r, &r.vulns[i]));
     }
     if let Some(reason) = unneeded {
@@ -1941,6 +2006,52 @@ fn detail_lines(
 
 /// What fixes a finding. Fixes a key can apply stand out in green with the key to press;
 /// fixes depsu can't apply, or no fix at all, stay grey.
+/// An ignore rule of `.snyk` in the list: what it ignores, where, until when and why.
+fn policy_lines(app: &App, id: &str, path: &str, width: usize) -> Vec<Line<'static>> {
+    let Some(rule) = app.policy_rule(id, path) else {
+        return vec![Line::from(id.to_string())];
+    };
+    let expired = rule.expired(&crate::security::policy::today());
+    let color = if expired { Color::DarkGray } else { Color::Magenta };
+    let until = match rule.expires.as_deref().and_then(|e| e.get(..10)) {
+        Some(d) if expired => format!("expired {d}"),
+        Some(d) => format!("until {d}"),
+        None => "no expiry".to_string(),
+    };
+    let reason = if rule.reason.is_empty() { "no reason" } else { &rule.reason };
+    let title = app
+        .rows
+        .iter()
+        .flat_map(|r| &r.vulns)
+        .find(|v| v.id == id)
+        .map(|v| format!("  {}", v.title))
+        .unwrap_or_default();
+    wrap(
+        Span::styled("  ⊘ ", Style::new().fg(color)),
+        Span::raw("    "),
+        vec![Span::styled(
+            format!("{id}{title}  · on {path}  · {until}  · {reason}"),
+            Style::new().fg(color),
+        )],
+        width,
+    )
+}
+/// `ignored in .snyk` on a finding a `.snyk` rule covers.
+fn ignore_spans(app: &App, v: &crate::security::vuln::Vuln) -> Vec<Span<'static>> {
+    let Some(rule) = app.ignore_for(v) else {
+        return Vec::new();
+    };
+    let until = rule
+        .expires
+        .as_deref()
+        .and_then(|e| e.get(..10))
+        .map(|d| format!(" until {d}"))
+        .unwrap_or_default();
+    vec![Span::styled(
+        format!("  ⊘ ignored in .snyk{until}"),
+        Style::new().fg(Color::Magenta),
+    )]
+}
 fn fix_spans(app: &App, r: &AppRow, v: &crate::security::vuln::Vuln) -> Vec<Span<'static>> {
     let fixable = Style::new().fg(Color::Green).add_modifier(Modifier::BOLD);
     if let Some(to) = app.vuln_install_fix(r, v) {
@@ -2334,6 +2445,15 @@ fn vuln_lines(app: &App, r: &AppRow, v: &crate::security::vuln::Vuln, width: usi
     }
     if !facts.is_empty() {
         add(vec![Span::styled(facts.join(" · "), cyan)]);
+    }
+    if let Some(rule) = app.ignore_for(v) {
+        let mut spans = ignore_spans(app, v);
+        if let Some(first) = spans.first_mut() {
+            first.content = first.content.trim_start().to_string().into();
+        }
+        let why = if rule.reason.is_empty() { "no reason given".to_string() } else { rule.reason.clone() };
+        spans.push(Span::styled(format!(" · on {} · {why}", rule.path), dim));
+        add(spans);
     }
     // What the keys do about it, as on the finding's line in the list.
     let mut fix = fix_spans(app, r, v);

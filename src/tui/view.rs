@@ -116,6 +116,11 @@ pub enum Item {
     Override {
         key: String,
     },
+    /// An ignore rule of `.snyk`, in the policy section.
+    Policy {
+        id: String,
+        path: String,
+    },
     /// Override line nested under the package `rows[idx]`. It can hold the cursor only when
     /// the override can be updated (decided by the app).
     Detail {
@@ -164,6 +169,8 @@ pub const OVERRIDDEN: &str = "Overridden packages";
 /// Label of the section listing overrides that look unnecessary.
 pub const UNNEEDED: &str = "Unneeded overrides";
 pub const REMOVED: &str = "Removed this session";
+/// Label of the section listing the ignore rules in `.snyk`.
+pub const POLICY: &str = ".snyk ignores";
 
 /// Group label for a package name. Scoped packages group by scope; unscoped ones by the
 /// text before the first `-`, but only when at least two outdated packages share it.
@@ -321,6 +328,7 @@ mod tests {
                 Item::Detail { child, .. } => format!("  - {child:?}"),
                 Item::Override { key } => format!("  ✂ {key}"),
                 Item::Removed { name } => format!("  ↩ {name}"),
+                Item::Policy { id, .. } => format!("  ⊘ {id}"),
             })
             .collect()
     }
@@ -488,7 +496,7 @@ mod tests {
                     Item::Detail { child, last, .. } => {
                         format!("{child:?}{}", if *last { "$" } else { "" })
                     }
-                    Item::Header { .. } | Item::Override { .. } | Item::Removed { .. } => "H".into(),
+                    Item::Header { .. } | Item::Override { .. } | Item::Removed { .. } | Item::Policy { .. } => "H".into(),
                 })
                 .collect()
         };
@@ -511,7 +519,7 @@ mod tests {
                 .map(|i| match i {
                     Item::Row { name, .. } => name.clone(),
                     Item::Header { label, .. } => format!("# {label}"),
-                    Item::Detail { .. } | Item::Override { .. } | Item::Removed { .. } => "-".into(),
+                    Item::Detail { .. } | Item::Override { .. } | Item::Removed { .. } | Item::Policy { .. } => "-".into(),
                 })
                 .collect()
         };
