@@ -128,6 +128,29 @@ pub fn parse(text: &str) -> Result<Report, String> {
             });
         }
 
+        // Findings the `.snyk` file ignores are not in `vulnerabilities`, only here.
+        let ignored = doc
+            .get("filtered")
+            .and_then(|f| f.get("ignore"))
+            .and_then(Value::as_array);
+        for v in ignored.into_iter().flatten() {
+            let from = strings(v.get("from"));
+            let Some(id) = v.get("id").and_then(Value::as_str) else {
+                continue;
+            };
+            if from.len() < 2 {
+                continue;
+            }
+            let path = from[1..]
+                .iter()
+                .map(|s| split_pkg(s).map_or(s.as_str(), |(n, _)| n))
+                .collect::<Vec<_>>()
+                .join(" > ");
+            let entry = (id.to_string(), path);
+            if !report.ignored.contains(&entry) {
+                report.ignored.push(entry);
+            }
+        }
         // `remediation.upgrade`: "name@installed" -> { upgradeTo: "name@suggested", .. }
         if let Some(upgrades) = doc
             .get("remediation")
@@ -358,5 +381,22 @@ mod tests {
         assert_eq!(r.vulns.len(), 3);
         // a failing project doesn't hide the others, but is reported
         assert_eq!(r.warnings.len(), 1);
+    }
+
+    #[test]
+    fn findings_ignored_by_the_policy_are_listed_apart() {
+        let json = r#"{"vulnerabilities":[],"filtered":{"ignore":[
+            {"id":"SNYK-1","from":["proj@1.0.0","a@1.0.0","b@2.0.0","c@3.0.0"]},
+            {"id":"SNYK-1","from":["proj@1.0.0","a@1.0.0","b@2.0.0","c@3.0.0"]},
+            {"id":"SNYK-2","from":["proj@1.0.0","@s/x@1.0.0"]}],"patch":[]}}"#;
+        let r = parse(json).unwrap();
+        assert!(r.vulns.is_empty());
+        assert_eq!(
+            r.ignored,
+            vec![
+                ("SNYK-1".to_string(), "a > b > c".to_string()),
+                ("SNYK-2".to_string(), "@s/x".to_string())
+            ]
+        );
     }
 }

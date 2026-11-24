@@ -1609,7 +1609,13 @@ fn header_line(app: &App, label: &str, members: &[usize]) -> Line<'static> {
     }
     if label == POLICY && members.is_empty() {
         let n = app.ignores.len();
-        return Line::from(format!("⊘ {label} ({n}), x edits, d removes"))
+        let unneeded = app
+            .ignores
+            .iter()
+            .filter(|r| app.policy_status(r) == crate::tui::app::PolicyStatus::Unneeded)
+            .count();
+        let extra = if unneeded > 0 { format!(", {unneeded} no longer needed") } else { String::new() };
+        return Line::from(format!("⊘ {label} ({n}{extra}), x edits, d removes"))
             .style(Style::new().fg(Color::Magenta).add_modifier(Modifier::BOLD));
     }
     if label == UNNEEDED && members.is_empty() {
@@ -2026,13 +2032,25 @@ fn policy_lines(app: &App, id: &str, path: &str, width: usize) -> Vec<Line<'stat
         .find(|v| v.id == id)
         .map(|v| format!("  {}", v.title))
         .unwrap_or_default();
+    use crate::tui::app::PolicyStatus;
+    let (note, note_style) = match app.policy_status(rule) {
+        PolicyStatus::Needed => ("  ✔ still needed", Style::new().fg(Color::Green)),
+        PolicyStatus::Unneeded => (
+            "  ✂ no longer needed: Snyk finds nothing it covers, press d to remove",
+            Style::new().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+        ),
+        PolicyStatus::Unknown => ("  ? run Snyk (s) to check", Style::new().fg(Color::DarkGray)),
+    };
     wrap(
         Span::styled("  ⊘ ", Style::new().fg(color)),
         Span::raw("    "),
-        vec![Span::styled(
-            format!("{id}{title}  · on {path}  · {until}  · {reason}"),
-            Style::new().fg(color),
-        )],
+        vec![
+            Span::styled(
+                format!("{id}{title}  · on {path}  · {until}  · {reason}"),
+                Style::new().fg(color),
+            ),
+            Span::styled(note, note_style),
+        ],
         width,
     )
 }

@@ -346,6 +346,15 @@ pub struct IgnorePrompt {
     pub field: IgnoreField,
     pub error: Option<String>,
 }
+/// Whether an ignore rule of `.snyk` still has an effect.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PolicyStatus {
+    /// Snyk has no finding for it, or no scan has said so yet.
+    Unknown,
+    Needed,
+    /// A fresh scan has nothing the rule covers: it can be removed.
+    Unneeded,
+}
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum IgnoreField {
     Reason,
@@ -630,6 +639,9 @@ pub struct App {
     /// The ignore rules in the project's `.snyk`.
     pub ignores: Vec<Ignore>,
     pub ignore_prompt: Option<IgnorePrompt>,
+    /// What the last Snyk scan of this session said `.snyk` ignores (ID and path). `None`
+    /// until a scan ran, and again after `.snyk` changed.
+    policy_seen: Option<Vec<(String, String)>>,
     /// The ignore `x` removes when pressed again: its ID and path.
     confirm_unignore: Option<(String, String)>,
     /// Vulnerabilities queued installs and overrides will fix, with the row name or override
@@ -860,6 +872,7 @@ impl App {
             commit_prompt: None,
             ignores: Vec::new(),
             ignore_prompt: None,
+            policy_seen: None,
             confirm_unignore: None,
             queued_fixes: Vec::new(),
             session_fixes: Vec::new(),
@@ -1944,6 +1957,27 @@ impl App {
             members: Vec::new(),
         });
         self.view.extend(rules);
+    }
+    /// Whether a rule still does something: a finding it covers is there, or Snyk said it
+    /// left one out because of it. Without a Snyk scan since the last change to `.snyk` or to
+    /// the packages, only a finding already listed can tell.
+    pub fn policy_status(&self, rule: &Ignore) -> PolicyStatus {
+        let listed = self
+            .rows
+            .iter()
+            .flat_map(|r| &r.vulns)
+            .any(|v| v.source == Source::Snyk && rule.covers(v));
+        let seen = self.policy_seen.as_ref().is_some_and(|s| {
+            s.iter()
+                .any(|(id, path)| *id == rule.id && (rule.path == "*" || rule.path == *path))
+        });
+        if listed || seen {
+            PolicyStatus::Needed
+        } else if self.policy_seen.is_some() && !self.snyk.stale {
+            PolicyStatus::Unneeded
+        } else {
+            PolicyStatus::Unknown
+        }
     }
     pub fn policy_rule(&self, id: &str, path: &str) -> Option<&Ignore> {
         self.ignores.iter().find(|r| r.id == id && r.path == path)
@@ -4103,6 +4137,9 @@ impl App {
             .iter()
             .filter(|v| v.severity >= Severity::High)
             .count();
+        if source == Source::Snyk && !from_cache {
+            self.policy_seen = Some(report.ignored.clone());
+        }
         let scan = self.scan_mut(source);
         scan.status = ScanStatus::Done {
             total: report.vulns.len(),
@@ -4463,6 +4500,7 @@ impl App {
 
     fn after_policy_change(&mut self, comments_lost: bool) {
         self.reload_ignores();
+        self.policy_seen = None;
         self.rebuild_view();
         self.scan_mut(Source::Snyk).stale = true;
         if comments_lost {
@@ -7972,5 +8010,79 @@ mod tests {
         app.on_key(key('x'));
         assert!(app.ignore_prompt.is_none());
         assert!(!policy::file(&app.dir).exists());
+    }
+
+    fn rule(app: &App, id: &str) -> Ignore {
+        app.policy_rule(id, "*").unwrap().clone()
+    }
+
+    fn app_with_rule(id: &str) -> App {
+        let mut app = app_with_cache("1.0.0", |_| {});
+        policy::add(&app.dir, id, "*", "old", None).unwrap();
+        app.reload_ignores();
+        app.rebuild_view();
+        app
+    }
+
+    #[test]
+    fn a_rule_is_unknown_until_snyk_has_scanned() {
+        let mut app = app_with_rule("GONE");
+        assert_eq!(app.policy_status(&rule(&app, "GONE")), PolicyStatus::Unknown);
+        let (line, _) = line_and_colour(&mut app, "GONE", "GONE");
+        assert!(line.contains("? run Snyk (s) to check"), "{line}");
+    }
+
+    #[test]
+    fn a_rule_snyk_applied_is_still_needed() {
+        let mut app = app_with_rule("SNYK-1");
+        let report = Report { ignored: vec![("SNYK-1".into(), "a > b".into())], ..Report::default() };
+        app.apply_scan(Source::Snyk, report, false);
+        assert_eq!(app.policy_status(&rule(&app, "SNYK-1")), PolicyStatus::Needed);
+        let (line, _) = line_and_colour(&mut app, "SNYK-1", "SNYK-1");
+        assert!(line.contains("✔ still needed"), "{line}");
+    }
+
+    #[test]
+    fn a_rule_snyk_found_nothing_for_is_no_longer_needed() {
+        let mut app = app_with_rule("GONE");
+        policy::add(&app.dir, "KEPT", "x > y", "r", None).unwrap();
+        app.reload_ignores();
+        let report = Report { ignored: vec![("KEPT".into(), "x > y".into())], ..Report::default() };
+        app.apply_scan(Source::Snyk, report, false);
+        app.rebuild_view();
+        assert_eq!(app.policy_status(&rule(&app, "GONE")), PolicyStatus::Unneeded);
+        assert_eq!(
+            app.policy_status(app.policy_rule("KEPT", "x > y").unwrap()),
+            PolicyStatus::Needed
+        );
+        let (line, _) = line_and_colour(&mut app, "GONE", "GONE");
+        assert!(line.contains("✂ no longer needed"), "{line}");
+        let (header, _) = line_and_colour(&mut app, ".snyk ignores", ".snyk");
+        assert!(header.contains("1 no longer needed"), "{header}");
+    }
+
+    #[test]
+    fn a_rule_a_listed_finding_matches_is_needed_even_if_it_is_expired() {
+        let mut app = app_with_three_findings();
+        policy::add(&app.dir, "UPGRADE", "*", "r", None).unwrap();
+        app.reload_ignores();
+        assert_eq!(app.policy_status(&rule(&app, "UPGRADE")), PolicyStatus::Needed);
+    }
+
+    #[test]
+    fn editing_the_policy_makes_the_answer_unknown_until_the_next_scan() {
+        let mut app = app_with_rule("GONE");
+        app.apply_scan(Source::Snyk, Report::default(), false);
+        assert_eq!(app.policy_status(&rule(&app, "GONE")), PolicyStatus::Unneeded);
+        policy::add(&app.dir, "OTHER", "*", "r", None).unwrap();
+        app.after_policy_change(false);
+        assert_eq!(app.policy_status(&rule(&app, "GONE")), PolicyStatus::Unknown);
+    }
+
+    #[test]
+    fn results_read_from_the_cache_do_not_say_anything_about_the_policy() {
+        let mut app = app_with_rule("GONE");
+        app.apply_scan(Source::Snyk, Report::default(), true);
+        assert_eq!(app.policy_status(&rule(&app, "GONE")), PolicyStatus::Unknown);
     }
 }
