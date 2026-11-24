@@ -2855,7 +2855,7 @@ impl App {
             Err(e) => return self.push_log(format!("✘ Can't commit: {e}")),
         };
         if plan.files.is_empty() {
-            return self.push_log("Nothing to commit: package.json and the lockfile are unchanged.");
+            return self.push_log("Nothing to commit: package.json, the lockfile and .snyk are unchanged.");
         }
         self.filter_mode = false;
         self.pin_prompt = false;

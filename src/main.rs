@@ -40,7 +40,7 @@ KEYS:
     f              fix the unmet peers of the highlighted package
     I              add the registry's integrity checksum to package-lock.json for the
                    checked packages (or the highlighted one) the lockfile has none for
-    c              commit package.json and the lockfile, titled as a conventional
+    c              commit package.json, lockfile and .snyk, titled as a conventional
                    commit of the changes (e.g. 'chore: upgrade eslint 8.57.0 to 9.0.0')
     +              add a package as a dependency, dev dependency or override
     R              fetch the latest versions again (ignoring the cache)

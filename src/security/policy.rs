@@ -115,6 +115,13 @@ fn rules(map: &Mapping) -> Vec<Ignore> {
     out
 }
 
+/// The ignore rules in the text of a `.snyk` file. Text that does not parse has none.
+pub fn rules_from_text(text: &str) -> Vec<Ignore> {
+    match serde_yaml_ng::from_str::<Value>(text) {
+        Ok(Value::Mapping(m)) => rules(&m),
+        _ => Vec::new(),
+    }
+}
 /// The ignore rules in `dir/.snyk`. A missing file has none.
 pub fn load(dir: &Path) -> Result<Vec<Ignore>, String> {
     read_doc(dir).map(|(m, _)| rules(&m))

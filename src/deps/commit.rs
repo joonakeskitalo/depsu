@@ -33,6 +33,14 @@ pub enum Change {
     OverrideChange { name: String, from: String, to: String },
     /// The lockfile got the checksum of a package it had none for, at the same version.
     Integrity { name: String, version: String },
+    /// A vulnerability ignored in the `.snyk` policy. `path` is `*` or `a > b`.
+    IgnoreAdd { id: String, path: String },
+    /// The reason or the expiry of an ignore in `.snyk` changed.
+    IgnoreChange { id: String, path: String },
+    IgnoreRemove { id: String, path: String },
+}
+fn on_path(id: &str, path: &str) -> String {
+    if path == "*" { id.to_string() } else { format!("{id} on {path}") }
 }
 
 impl Change {
@@ -53,12 +61,15 @@ impl Change {
             Change::Integrity { name, version } => {
                 ("add the checksum of", format!("{name} {version}"), name.clone())
             }
+            Change::IgnoreAdd { id, path } => ("ignore", on_path(id, path), id.clone()),
+            Change::IgnoreChange { id, path } => ("update the ignore of", on_path(id, path), id.clone()),
+            Change::IgnoreRemove { id, path } => ("remove the ignore of", on_path(id, path), id.clone()),
         }
     }
 }
 
 /// The order kinds of change appear in a title.
-const VERBS: [&str; 9] = [
+const VERBS: [&str; 12] = [
     "upgrade",
     "downgrade",
     "add",
@@ -68,6 +79,9 @@ const VERBS: [&str; 9] = [
     "change the override of",
     "remove the override of",
     "add the checksum of",
+    "ignore",
+    "update the ignore of",
+    "remove the ignore of",
 ];
 
 /// `a`, `a and b`, `a, b and c`.
@@ -116,6 +130,15 @@ pub fn title(changes: &[Change]) -> String {
     };
     if let Some(t) = fits(phrase(true)).or_else(|| fits(phrase(false))) {
         return t;
+    }
+    let is_ignore = |c: &Change| {
+        matches!(
+            c,
+            Change::IgnoreAdd { .. } | Change::IgnoreChange { .. } | Change::IgnoreRemove { .. }
+        )
+    };
+    if changes.iter().all(is_ignore) {
+        return "chore: update the Snyk policy".to_string();
     }
     let overrides_only = changes.iter().all(|c| {
         matches!(
@@ -338,6 +361,30 @@ fn relative(path: &Path, base: &Path) -> String {
     out.to_string_lossy().into_owned()
 }
 
+/// What changed between two versions of a `.snyk` file.
+pub fn policy_changes(old: &str, new: &str) -> Vec<Change> {
+    use crate::security::policy::rules_from_text;
+    let (old, new) = (rules_from_text(old), rules_from_text(new));
+    let same = |a: &crate::security::policy::Ignore, b: &crate::security::policy::Ignore| {
+        a.id == b.id && a.path == b.path
+    };
+    let mut out = Vec::new();
+    for n in &new {
+        match old.iter().find(|o| same(o, n)) {
+            None => out.push(Change::IgnoreAdd { id: n.id.clone(), path: n.path.clone() }),
+            Some(o) if o.reason != n.reason || o.expires != n.expires => {
+                out.push(Change::IgnoreChange { id: n.id.clone(), path: n.path.clone() })
+            }
+            Some(_) => {}
+        }
+    }
+    for o in &old {
+        if !new.iter().any(|n| same(o, n)) {
+            out.push(Change::IgnoreRemove { id: o.id.clone(), path: o.path.clone() });
+        }
+    }
+    out
+}
 /// Looks at what changed since the last commit, and proposes the commit.
 pub fn prepare(dir: &Path, pm: Pm) -> Result<Plan, String> {
     let top = git(dir, &["rev-parse", "--show-toplevel"])
@@ -355,6 +402,10 @@ pub fn prepare(dir: &Path, pm: Pm) -> Result<Plan, String> {
     let mut files = vec!["package.json".to_string()];
     if let Some(l) = &lock {
         files.push(relative(l, &dir));
+    }
+    // The Snyk policy, when there is one now or at the last commit.
+    if dir.join(".snyk").exists() || git(&dir, &["cat-file", "-e", "HEAD:./.snyk"]).is_ok() {
+        files.push(".snyk".to_string());
     }
     let mut args = vec!["status", "--porcelain", "--"];
     args.extend(files.iter().map(String::as_str));
@@ -392,6 +443,10 @@ pub fn prepare(dir: &Path, pm: Pm) -> Result<Plan, String> {
     } else {
         changes(&old, &new, &old_lock, &new_lock, pm)
     };
+    if changed.iter().any(|f| f == ".snyk") {
+        let now = std::fs::read_to_string(dir.join(".snyk")).unwrap_or_default();
+        changes.extend(policy_changes(&at_head(".snyk").unwrap_or_default(), &now));
+    }
     // Checksums the lockfile got since the last commit (e.g. depsu's `I`).
     if let Some(l) = &lock {
         let rel = relative(l, &dir);
@@ -553,6 +608,22 @@ pub fn run(dir: &Path, plan: &Plan, title: &str, body: Option<&str>) -> Result<S
 mod tests {
     use super::*;
     use serde_json::json;
+    #[test]
+    fn policy_edits_become_changes() {
+        let a = "version: v1.25.0\nignore:\n  A:\n    - '*':\n        reason: r\n  B:\n    - '*':\n        reason: r\n";
+        let b = "version: v1.25.0\nignore:\n  A:\n    - '*':\n        reason: new\n  C:\n    - x > y:\n        reason: r\n";
+        let c = policy_changes(a, b);
+        assert_eq!(
+            c,
+            vec![
+                Change::IgnoreChange { id: "A".into(), path: "*".into() },
+                Change::IgnoreAdd { id: "C".into(), path: "x > y".into() },
+                Change::IgnoreRemove { id: "B".into(), path: "*".into() },
+            ]
+        );
+        assert_eq!(title(&c[..1]), "chore: update the ignore of A");
+        assert_eq!(title(&c[1..2]), "chore: ignore C on x > y");
+    }
 
     fn up(name: &str, from: &str, to: &str) -> Change {
         Change::Upgrade {
