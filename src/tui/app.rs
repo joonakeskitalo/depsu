@@ -649,6 +649,8 @@ pub struct App {
     /// What the last Snyk scan of this session said `.snyk` ignores (ID and path). `None`
     /// until a scan ran, and again after `.snyk` changed.
     policy_seen: Option<Vec<Vuln>>,
+    /// What the scan said about the rules an edit of `.snyk` left alone, until the next scan.
+    policy_carried: HashMap<(String, String), PolicyStatus>,
     /// The ignore `x` removes when pressed again: its ID and path.
     confirm_unignore: Option<(String, String)>,
     /// Vulnerabilities queued installs and overrides will fix, with the row name or override
@@ -882,6 +884,7 @@ impl App {
             ignores: Vec::new(),
             ignore_prompt: None,
             policy_seen: None,
+            policy_carried: HashMap::new(),
             confirm_unignore: None,
             queued_fixes: Vec::new(),
             session_fixes: Vec::new(),
@@ -1999,7 +2002,10 @@ impl App {
         } else if self.policy_seen.is_some() && !self.snyk.stale {
             PolicyStatus::Unneeded
         } else {
-            PolicyStatus::Unknown
+            self.policy_carried
+                .get(&(rule.id.clone(), rule.path.clone()))
+                .copied()
+                .unwrap_or(PolicyStatus::Unknown)
         }
     }
     pub fn policy_rule(&self, id: &str, path: &str) -> Option<&Ignore> {
@@ -4215,6 +4221,7 @@ impl App {
             .count();
         if source == Source::Snyk && !from_cache {
             self.policy_seen = Some(report.ignored.clone());
+            self.policy_carried.clear();
         }
         let scan = self.scan_mut(source);
         scan.status = ScanStatus::Done {
@@ -4575,7 +4582,28 @@ impl App {
     }
 
     fn after_policy_change(&mut self, comments_lost: bool) {
+        // Rules the edit did not touch keep what the last scan said about them, unless the
+        // edit was to a rule with the same ID, which can cover the same findings.
+        let before: Vec<(Ignore, PolicyStatus)> =
+            self.ignores.iter().map(|r| (r.clone(), self.policy_status(r))).collect();
         self.reload_ignores();
+        let touched: HashSet<String> = before
+            .iter()
+            .map(|(r, _)| r)
+            .filter(|r| !self.ignores.iter().any(|n| n.id == r.id && n.path == r.path && n == *r))
+            .chain(
+                self.ignores
+                    .iter()
+                    .filter(|n| !before.iter().any(|(r, _)| r.id == n.id && r.path == n.path && r == *n)),
+            )
+            .map(|r| r.id.clone())
+            .collect();
+        self.policy_carried = before
+            .into_iter()
+            .filter(|(r, st)| *st != PolicyStatus::Unknown && !touched.contains(&r.id))
+            .filter(|(r, _)| self.ignores.iter().any(|n| n.id == r.id && n.path == r.path))
+            .map(|(r, st)| ((r.id, r.path), st))
+            .collect();
         self.policy_seen = None;
         self.refresh_findings();
         self.rebuild_view();
@@ -8168,11 +8196,16 @@ mod tests {
     }
 
     #[test]
-    fn editing_the_policy_makes_the_answer_unknown_until_the_next_scan() {
+    fn editing_a_rule_keeps_the_answer_for_the_others_until_the_next_scan() {
         let mut app = app_with_rule("GONE");
         app.apply_scan(Source::Snyk, Report::default(), false);
         assert_eq!(app.policy_status(&rule(&app, "GONE")), PolicyStatus::Unneeded);
         policy::add(&app.dir, "OTHER", "*", "r", None).unwrap();
+        app.after_policy_change(false);
+        assert_eq!(app.policy_status(&rule(&app, "GONE")), PolicyStatus::Unneeded);
+        assert_eq!(app.policy_status(&rule(&app, "OTHER")), PolicyStatus::Unknown);
+        // A rule with the edited ID is not known any more.
+        policy::add(&app.dir, "GONE", "*", "new reason", None).unwrap();
         app.after_policy_change(false);
         assert_eq!(app.policy_status(&rule(&app, "GONE")), PolicyStatus::Unknown);
     }
