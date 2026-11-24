@@ -1009,7 +1009,12 @@ impl App {
                 self.events_tx.clone(),
             );
             thread::spawn(move || {
-                while let Some(name) = queue.lock().unwrap().pop_front() {
+                // The lock is taken in a statement of its own: in `while let` the guard
+                // would live through the body and the requests would run one at a time.
+                loop {
+                    let Some(name) = queue.lock().unwrap().pop_front() else {
+                        break;
+                    };
                     let result = registry::latest_version(&rc, &agent, &name);
                     if tx.send(Event::Fetched { name, result }).is_err() {
                         break;

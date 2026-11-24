@@ -141,9 +141,13 @@ Per-package, `depsu` picks the registry like npm does and sends the matching tok
   drops that setting and shows a warning in the log. `npmAlwaysAuth` is not needed: credentials
   are sent whenever they are configured.
 
-Versions are fetched the way `npm-check-updates` does it: the package document is requested with
-the abbreviated (corgi) `Accept` header and reading stops as soon as `dist-tags` has been seen,
-with a retry for the full document on a 404. Requests run 16 at a time.
+Versions are fetched with a small request per package, `/-/package/<name>/dist-tags`, which is read
+to the end so the connection goes back to the pool and the next request reuses it (no new TCP and
+TLS handshake). A registry that doesn't serve it (the request fails but the package document can be
+read) is asked for the document instead, the way `npm-check-updates` does it: the abbreviated (corgi)
+`Accept` header, reading stops as soon as `dist-tags` has been seen, with a retry for the full
+document on a 404. depsu remembers such a registry for the rest of the session. Requests run 16 at
+a time.
 
 **Blocked versions.** Registries with a security policy (JFrog Curation, Nexus Firewall and
 the like) list blocked versions but answer 403 when one is downloaded. Before an install, depsu
