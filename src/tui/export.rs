@@ -1,6 +1,7 @@
 //! Markdown export of the package versions and the vulnerability reports.
 use crate::tui::app::{App, Row, ScanStatus};
 use crate::security::vuln::{Severity, Source, Vuln};
+use std::collections::HashSet;
 use std::io::Write;
 use std::process::{Command, Stdio};
 
@@ -27,6 +28,29 @@ fn status(r: &Row) -> &'static str {
     }
 }
 
+/// The package's own overrides, e.g. `1.0.0` for a global one, `a > b@^1 → 1.0.0` for one
+/// limited to a parent or a version range, each followed by where it is set in `package.json`.
+fn overrides_of(r: &Row) -> String {
+    r.overrides
+        .iter()
+        .map(|o| {
+            let mut key = o.path.join(" > ");
+            if !key.is_empty() {
+                key.push_str(" > ");
+            }
+            if !o.path.is_empty() || o.range.is_some() {
+                key.push_str(&o.name);
+                if let Some(range) = &o.range {
+                    key.push('@');
+                    key.push_str(range);
+                }
+                key.push_str(" → ");
+            }
+            format!("{key}{} ({})", o.value, o.source)
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
 /// E.g. `1 critical, 2 high (snyk 2, npm audit 1)`.
 fn vuln_counts(r: &Row) -> String {
     let mut by_severity: Vec<(Severity, usize)> = Vec::new();
@@ -53,6 +77,58 @@ fn vuln_counts(r: &Row) -> String {
         .map(|(s, n)| format!("{} {n}", s.label()))
         .collect();
     format!("{} ({})", severities.join(", "), sources.join(", "))
+}
+
+type VulnKey = (String, String, String, String, Vec<String>);
+
+fn vuln_key(v: &Vuln) -> VulnKey {
+    (v.id.clone(), v.package.clone(), v.version.clone(), v.direct.clone(), v.path.clone())
+}
+
+/// Rows of a findings table. Findings whose key is in `ignored` are marked as ignored.
+fn vuln_table(out: &mut String, vulns: &[&Vuln], ignored: &HashSet<VulnKey>) {
+    out.push_str("| Severity | Package | Via | Issue | Fix |\n|---|---|---|---|---|\n");
+    for v in vulns {
+        let via = if v.path.is_empty() {
+            "direct".to_string()
+        } else {
+            format!("{} > {}", v.direct, v.path.join(" > "))
+        };
+        let id = if v.cve.is_empty() {
+            v.id.clone()
+        } else {
+            format!("{} ({})", v.id, v.cve.join(", "))
+        };
+        let note = if ignored.contains(&vuln_key(v)) { " (ignored in .snyk)" } else { "" };
+        out.push_str(&format!(
+            "| {} | {}@{} | {} | {}: {}{} | {} |\n",
+            v.severity.label(),
+            cell(&v.package),
+            cell(&v.version),
+            cell(&via),
+            cell(&id),
+            cell(&v.title),
+            note,
+            cell(&v.fix_summary())
+        ));
+    }
+}
+
+/// The Snyk findings as Snyk reports them without the `.snyk` policy: the ones listed above
+/// plus the ones the policy ignores. Only known after a Snyk scan of this session.
+fn snyk_without_policy(out: &mut String, app: &App) {
+    let mut ignored: Vec<&Vuln> = app.rows.iter().flat_map(|r| &r.ignored).collect();
+    ignored.retain(|v| v.source == Source::Snyk);
+    out.push_str("\n## Snyk report without .snyk policy\n\n");
+    if ignored.is_empty() {
+        out.push_str("The .snyk policy ignores no findings, or Snyk has not been run in this session.\n");
+        return;
+    }
+    let keys: HashSet<VulnKey> = ignored.iter().map(|v| vuln_key(v)).collect();
+    let applied = app.rows.iter().flat_map(|r| &r.vulns).filter(|v| v.source == Source::Snyk);
+    let mut all: Vec<&Vuln> = applied.chain(ignored).collect();
+    all.sort_by(|a, b| b.severity.cmp(&a.severity).then(a.package.cmp(&b.package)));
+    vuln_table(out, &all, &keys);
 }
 
 /// Package and vulnerability totals as a bullet list.
@@ -95,21 +171,35 @@ pub fn markdown(app: &App) -> String {
             .then(b.vulns.len().cmp(&a.vulns.len()))
             .then(a.name.cmp(&b.name))
     });
+    // The Overrides column is left out when the project has none.
+    let with_overrides = app.rows.iter().any(|r| !r.overrides.is_empty());
+    let header = |extra: &[&str]| {
+        let mut cols = vec!["Package", "Type", "Current", "Latest", "Status"];
+        cols.extend(extra);
+        if with_overrides {
+            cols.push("Overrides");
+        }
+        format!("| {} |\n|{}\n", cols.join(" | "), "---|".repeat(cols.len()))
+    };
+    let line = |r: &Row, extra: Option<String>| {
+        let mut cols = vec![
+            cell(&r.name),
+            r.kind.label().to_string(),
+            r.current.to_string(),
+            r.latest.to_string(),
+            status(r).to_string(),
+        ];
+        cols.extend(extra);
+        if with_overrides {
+            cols.push(cell(&overrides_of(r)));
+        }
+        format!("| {} |\n", cols.join(" | "))
+    };
     if !vulnerable.is_empty() {
         out.push_str("## Packages with vulnerabilities\n\n");
-        out.push_str(
-            "| Package | Type | Current | Latest | Status | Vulnerabilities |\n|---|---|---|---|---|---|\n",
-        );
+        out.push_str(&header(&["Vulnerabilities"]));
         for r in vulnerable {
-            out.push_str(&format!(
-                "| {} | {} | {} | {} | {} | {} |\n",
-                cell(&r.name),
-                r.kind.label(),
-                r.current,
-                r.latest,
-                status(r),
-                vuln_counts(r)
-            ));
+            out.push_str(&line(r, Some(vuln_counts(r))));
         }
         out.push_str("\n## Other packages\n\n");
     } else {
@@ -118,16 +208,9 @@ pub fn markdown(app: &App) -> String {
     if others.is_empty() {
         out.push_str("None.\n");
     } else {
-        out.push_str("| Package | Type | Current | Latest | Status |\n|---|---|---|---|---|\n");
+        out.push_str(&header(&[]));
         for r in others {
-            out.push_str(&format!(
-                "| {} | {} | {} | {} | {} |\n",
-                cell(&r.name),
-                r.kind.label(),
-                r.current,
-                r.latest,
-                status(r)
-            ));
+            out.push_str(&line(r, None));
         }
     }
     for (source, scan) in [(Source::Snyk, &app.snyk), (app.audit_source(), &app.audit)] {
@@ -147,30 +230,9 @@ pub fn markdown(app: &App) -> String {
             out.push_str("No known vulnerabilities.\n");
             continue;
         }
-        out.push_str("| Severity | Package | Via | Issue | Fix |\n|---|---|---|---|---|\n");
-        for v in vulns {
-            let via = if v.path.is_empty() {
-                "direct".to_string()
-            } else {
-                format!("{} > {}", v.direct, v.path.join(" > "))
-            };
-            let id = if v.cve.is_empty() {
-                v.id.clone()
-            } else {
-                format!("{} ({})", v.id, v.cve.join(", "))
-            };
-            out.push_str(&format!(
-                "| {} | {}@{} | {} | {}: {} | {} |\n",
-                v.severity.label(),
-                cell(&v.package),
-                cell(&v.version),
-                cell(&via),
-                cell(&id),
-                cell(&v.title),
-                cell(&v.fix_summary())
-            ));
-        }
+        vuln_table(&mut out, &vulns, &HashSet::new());
     }
+    snyk_without_policy(&mut out, app);
     out
 }
 

@@ -7100,6 +7100,39 @@ mod tests {
     }
 
     #[test]
+    fn the_report_shows_the_overrides_of_dependencies() {
+        let mut app = app_with_cache("1.0.0", |_| {});
+        std::fs::write(
+            app.dir.join("package.json"),
+            r#"{"name":"p","dependencies":{"a":"^1.0.0","b":"^1.0.0"},"overrides":{"b":"1.0.0","a":{"b":"1.0.0"}}}"#,
+        )
+        .unwrap();
+        app.reload_project();
+        let md = crate::tui::export::markdown(&app);
+        assert!(md.contains("| Package | Type | Current | Latest | Status | Overrides |"), "{md}");
+        assert!(md.contains("| a | dep | 1.0.0 | 1.0.0 | up to date |  |"), "{md}");
+        assert!(
+            md.contains("| b | dep | 1.0.0 | 1.0.0 | up to date | 1.0.0 (overrides), a > b → 1.0.0 (overrides) |"),
+            "{md}"
+        );
+    }
+    #[test]
+    fn the_report_lists_snyk_findings_without_the_policy() {
+        let mut app = app_with_cache("1.0.0", |c| {
+            c.set_findings("snyk", "a", "1.0.0", Findings { vulns: vec![vuln("a", "1.0.0", "KEPT-1")], fix: None });
+        });
+        let md = crate::tui::export::markdown(&app);
+        assert!(md.contains("## Snyk report without .snyk policy"), "{md}");
+        assert!(md.contains("ignores no findings"), "{md}");
+        app.rows.iter_mut().find(|r| r.name == "a").unwrap().ignored = vec![vuln("a", "1.0.0", "HIDDEN-1")];
+        let md = crate::tui::export::markdown(&app);
+        let full = &md[md.find("## Snyk report without .snyk policy").unwrap()..];
+        assert!(full.contains("KEPT-1") && full.contains("HIDDEN-1"), "{full}");
+        assert!(full.contains("(ignored in .snyk)"), "{full}");
+        let plain = &md[md.find("## Snyk report\n").unwrap()..md.find("## Snyk report without").unwrap()];
+        assert!(!plain.contains("HIDDEN-1"), "{plain}");
+    }
+    #[test]
     fn a_report_without_findings_has_a_single_package_table() {
         let app = app_with_cache("1.0.0", |_| {});
         let md = crate::tui::export::markdown(&app);
