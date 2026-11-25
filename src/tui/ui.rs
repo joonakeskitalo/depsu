@@ -2193,6 +2193,17 @@ fn rejected_span(who: &[String]) -> Option<Span<'static>> {
         )
     })
 }
+/// `⚠ overrides the range of mid@1.0.0 (wants ~6.7.0)` after an override that is outside what
+/// the packages it applies to declare. The override is limited to the package the finding is
+/// under (see `pin_where`), so these are the packages it changes, not unrelated ones.
+fn pin_conflict_span(who: &[String]) -> Option<Span<'static>> {
+    (!who.is_empty()).then(|| {
+        Span::styled(
+            format!("  ⚠ overrides the range of {}", who.join(", ")),
+            Style::new().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+        )
+    })
+}
 fn fix_spans(app: &App, r: &AppRow, v: &crate::security::vuln::Vuln) -> Vec<Span<'static>> {
     let fixable = Style::new().fg(Color::Green).add_modifier(Modifier::BOLD);
     if let Some(to) = app.vuln_install_fix(r, v) {
@@ -2209,7 +2220,7 @@ fn fix_spans(app: &App, r: &AppRow, v: &crate::security::vuln::Vuln) -> Vec<Span
             Span::raw("  "),
             Span::styled(format!("⬆ fix: p overrides {} to ^{to}{}", v.package, app.pin_where(v)), fixable),
         ];
-        spans.extend(rejected_span(&app.pin_fix_rejecters(v)));
+        spans.extend(pin_conflict_span(&app.pin_fix_rejecters(v)));
         spans.push(Span::styled(
             format!("  (upgrading {} doesn't bring it in)", r.name),
             Style::new().fg(Color::DarkGray),

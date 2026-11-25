@@ -5059,14 +5059,11 @@ impl App {
                 let who = self.pin_rejecters(&p.name, &p.version, p.scope.as_ref());
                 if !who.is_empty() {
                     rejected = true;
-                    let (it, they) = if who.len() == 1 { ("it", "a version it doesn't") } else { ("them", "a version they don't") };
+                    let it = if who.len() == 1 { "it" } else { "them" };
                     self.push_log(format!(
-                        "⚠ {} ^{} isn't accepted by {}: the override gives {it} {they} support, which can break {it}.",
-                        p.name,
+                        "⚠ ^{} is outside the range declared by {}, and the override applies to {it}: this can break {it}.",
                         p.version,
                         who.join(", "),
-                        it = it,
-                        they = they,
                     ));
                 }
             }
