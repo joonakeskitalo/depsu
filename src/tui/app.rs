@@ -1417,13 +1417,16 @@ impl App {
     }
     pub fn push_log(&mut self, msg: impl Into<String>) {
         self.log.push(msg.into());
-        if self.log.len() > 200 {
+        if self.log.len() > 1000 {
             self.log.remove(0);
         }
     }
 
     /// Applies all events produced by background threads.
     pub fn drain_events(&mut self) {
+        for line in crate::proxy::take_log() {
+            self.push_log(line);
+        }
         while let Ok(ev) = self.rx.try_recv() {
             match ev {
                 Event::Fetched { name, result } => {
@@ -5543,8 +5546,17 @@ fn run_pm(dir: &std::path::Path, pm: Pm, args: &[String]) -> Result<(), String> 
     if crate::config::pm::prefer_offline() {
         cache_args.extend(pm.offline_args(modern_yarn));
     }
+    let via_proxy = crate::proxy::active().filter(|_| pm == Pm::Npm);
     let mut cmd = Command::new(pm.program());
     cmd.args(args)
+        .args(via_proxy.iter().flat_map(|a| {
+            [
+                format!("--registry={}", a.registry_url),
+                // Tarball URLs of the real registry (in packuments and in the lockfile) are
+                // fetched through the proxy too.
+                format!("--replace-registry-host={}", a.upstream_host),
+            ]
+        }))
         .args(&cache_args)
         .envs(cache_env)
         .current_dir(dir)
@@ -5583,6 +5595,7 @@ fn run_pm(dir: &std::path::Path, pm: Pm, args: &[String]) -> Result<(), String> 
     if let Ok(mut p) = RUNNING_PM.lock() {
         *p = None;
     }
+    crate::proxy::restore_lockfiles(dir);
     // Leftover processes of the command may still hold the pipes; don't wait for them long.
     let grab = |rx: Receiver<String>| rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap_or_default();
     let (stdout, stderr) = (grab(out), grab(err));

@@ -1,5 +1,6 @@
 mod config;
 mod deps;
+mod proxy;
 mod registry;
 mod security;
 mod tui;
@@ -24,6 +25,9 @@ OPTIONS:
         --prefer-offline
                        Use cached packages without checking the registry for newer
                        metadata (npm, pnpm and Yarn 1; ignored by Yarn 2+ and bun)
+        --proxy-cache <DIR>
+                       Run npm through a caching registry proxy that depsu starts, and keep
+                       the downloaded packages and metadata in DIR (npm only)
         --cache <FILE> JSON file that remembers latest versions and scans between runs
     -h, --help         Print help
     -V, --version      Print version
@@ -70,6 +74,7 @@ fn main() -> Result<()> {
     let mut dir = PathBuf::from(".");
     let mut forced_pm = None;
     let mut cache_path: Option<PathBuf> = None;
+    let mut proxy_dir: Option<PathBuf> = None;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -102,6 +107,10 @@ fn main() -> Result<()> {
                 }
                 None => bail!("{arg} requires a value"),
             },
+            "--proxy-cache" => match args.next() {
+                Some(d) => proxy_dir = Some(std::path::absolute(&d)?),
+                None => bail!("{arg} requires a value"),
+            },
             "--prefer-offline" => config::pm::set_prefer_offline(),
             "--pm" => {
                 let v = args.next().unwrap_or_default();
@@ -132,8 +141,26 @@ fn main() -> Result<()> {
         };
         (rc, warnings)
     };
+    let mut notes = Vec::new();
+    if let Some(proxy_dir) = proxy_dir {
+        if pm != config::pm::Pm::Npm {
+            notes.push(format!("--proxy-cache only works with npm, not {}: ignored.", pm.name()));
+        } else {
+            let registry = rc.registry_for("x");
+            let auth = rc.auth_header(&registry);
+            match proxy::start(&proxy_dir, &registry, auth) {
+                Ok(a) => notes.push(format!(
+                    "Caching proxy {} for {} ({})",
+                    a.registry_url,
+                    registry,
+                    proxy_dir.display()
+                )),
+                Err(e) => bail!("{e}"),
+            }
+        }
+    }
     let mut app = tui::app::App::start(dir, pm, manifest.deps, rc, overrides, cache_path);
-    for w in warnings {
+    for w in warnings.into_iter().chain(notes) {
         app.push_log(w);
     }
     let mut terminal = ratatui::init();
