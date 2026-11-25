@@ -1763,6 +1763,13 @@ impl App {
                 {
                     self.push_log(format!("  {line}"));
                 }
+                // The cause goes last, where the collapsed log shows it. A refused package
+                // file is said by the search for another version below.
+                if forbidden.is_none()
+                    && let Some(cause) = install_failure_cause(&e)
+                {
+                    self.push_log(format!("✘ {}: {cause}", what.join(", ")));
+                }
             }
         }
         // A package that was added gets a row, like the others had from the start.
@@ -5462,6 +5469,37 @@ fn run_job(dir: &std::path::Path, pm: Pm, job: &Job) -> Result<(), String> {
             .map_err(|e| format!("package.json was updated, but the install failed:\n{e}"))?;
     }
     Ok(())
+}
+
+/// What a failed install's output says went wrong, when it is a registry refusing a request:
+/// `the registry refused GET https://…/lodash (403 Forbidden)`. Package managers word it in
+/// many ways: npm `E403` / `403 Forbidden - GET <url>` (or `Status 403 returned` when the
+/// body isn't JSON), pnpm `ERR_PNPM_FETCH_403`, yarn `Request failed "403 Forbidden"`, bun
+/// `GET <url> - 403`; and the same with 401 for credentials.
+fn install_failure_cause(output: &str) -> Option<String> {
+    for (code, what, hint) in [
+        ("403", "403 Forbidden", "it may block the package by a security policy, or you have no access to it"),
+        ("401", "401 Unauthorized", "check the registry credentials in .npmrc"),
+    ] {
+        let hit = output.lines().find(|l| {
+            l.contains(&format!("E{code}"))
+                || l.contains(&format!("{code} Forbidden"))
+                || l.contains(&format!("{code} Unauthorized"))
+                || l.contains(&format!("Status {code}"))
+                || l.contains(&format!("FETCH_{code}"))
+                || l.contains(&format!("- {code}"))
+        });
+        let Some(hit) = hit else { continue };
+        // The URL, from that line or another one naming the status.
+        let url = std::iter::once(hit)
+            .chain(output.lines().filter(|l| l.contains(code)))
+            .flat_map(|l| l.split(|c: char| c.is_whitespace() || c == '"' || c == '\''))
+            .find(|w| w.starts_with("http"))
+            .map(|u| u.trim_end_matches([':', ',', ')', '.', '\\']).to_string());
+        let target = url.map(|u| format!(" GET {u}")).unwrap_or_default();
+        return Some(format!("the registry refused{target} ({what}): {hint}"));
+    }
+    None
 }
 
 fn run_pm(dir: &std::path::Path, pm: Pm, args: &[String]) -> Result<(), String> {

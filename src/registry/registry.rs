@@ -61,6 +61,11 @@ fn small_dist_tags(
     tags.contains_key("latest").then_some(tags)
 }
 
+/// A 401: the registry wants credentials it didn't get or doesn't accept.
+const UNAUTHORIZED: &str = "unauthorized (401): check the registry credentials in .npmrc";
+/// A 403: the registry refuses the request, e.g. a security policy blocking the package.
+const FORBIDDEN: &str = "forbidden (403): the registry refuses it";
+
 pub fn latest_version(rc: &Npmrc, agent: &ureq::Agent, name: &str) -> Result<Version, String> {
     let registry = rc.registry_for(name);
     // Scoped names need the slash encoded, keeping the leading @: @scope%2fname
@@ -106,7 +111,8 @@ fn dist_tags(
     match req.call() {
         Ok(resp) => parse_dist_tags(resp.into_reader()).map_err(Failure::Other),
         Err(ureq::Error::Status(404, _)) => Err(Failure::NotFound),
-        Err(ureq::Error::Status(401 | 403, _)) => Err(Failure::Other("unauthorized".into())),
+        Err(ureq::Error::Status(401, _)) => Err(Failure::Other(UNAUTHORIZED.into())),
+        Err(ureq::Error::Status(403, _)) => Err(Failure::Other(FORBIDDEN.into())),
         Err(ureq::Error::Status(code, _)) => Err(Failure::Other(format!("HTTP {code}"))),
         Err(e) => Err(Failure::Other(e.to_string())),
     }
@@ -201,7 +207,8 @@ pub fn packument(rc: &Npmrc, agent: &ureq::Agent, name: &str) -> Result<Packumen
     match resp {
         Ok(r) => parse_packument(r.into_reader()),
         Err(ureq::Error::Status(404, _)) => Err(format!("{name} not found in {registry}")),
-        Err(ureq::Error::Status(401 | 403, _)) => Err(format!("{name}: unauthorized")),
+        Err(ureq::Error::Status(401, _)) => Err(format!("{name}: {UNAUTHORIZED}")),
+        Err(ureq::Error::Status(403, _)) => Err(format!("{name}: {FORBIDDEN}")),
         Err(ureq::Error::Status(code, _)) => Err(format!("{name}: HTTP {code}")),
         Err(e) => Err(format!("{name}: {e}")),
     }

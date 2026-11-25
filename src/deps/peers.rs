@@ -76,9 +76,14 @@ pub fn check(plan: &[(String, Version)], p: &Project) -> Report {
     // 1. Peers the new versions declare.
     for (name, to) in plan {
         let Some(doc) = fetch(name) else {
+            // Say why: a registry that refuses the package (403) refuses the install too.
+            let why = match (p.fetch)(name) {
+                Err(e) => format!(": {e}"),
+                Ok(_) => String::new(),
+            };
             report
                 .warnings
-                .push(format!("could not check the peer dependencies of {name}@{to}"));
+                .push(format!("could not check the peer dependencies of {name}@{to}{why}"));
             continue;
         };
         let Some(info) = doc.versions.get(to) else {
