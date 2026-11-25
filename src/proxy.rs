@@ -124,6 +124,37 @@ pub fn start(dir: &Path, registry: &str, auth: Option<String>) -> Result<Active,
     Ok(active)
 }
 
+/// Empties the proxy's cache directory `cache` (the directory stays). Returns how many
+/// entries were removed. The directory is whatever the user passed, so it is refused when it
+/// is where real files live: the project, a directory above it, the home directory, the root,
+/// or any directory that holds a `package.json` or `.git`.
+pub fn clear(cache: &Path, project: &Path) -> Result<usize, String> {
+    let Ok(cache) = cache.canonicalize() else {
+        return Ok(0); // not made yet
+    };
+    let home = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")).map(PathBuf::from);
+    let project = project.canonicalize().unwrap_or_else(|_| project.to_path_buf());
+    let refuse = cache.parent().is_none()
+        || project.starts_with(&cache)
+        || home.is_some_and(|h| h.canonicalize().is_ok_and(|h| h == cache))
+        || cache.join("package.json").exists()
+        || cache.join(".git").exists();
+    if refuse {
+        return Err(format!("won't empty {}: it doesn't look like a cache directory", cache.display()));
+    }
+    let mut removed = 0;
+    for entry in std::fs::read_dir(&cache).map_err(|e| format!("could not read {}: {e}", cache.display()))?.flatten() {
+        let path = entry.path();
+        let result = match entry.file_type() {
+            Ok(t) if t.is_dir() => std::fs::remove_dir_all(&path),
+            _ => std::fs::remove_file(&path),
+        };
+        result.map_err(|e| format!("could not remove {}: {e}", path.display()))?;
+        removed += 1;
+    }
+    Ok(removed)
+}
+
 /// npm may write the proxy's address into the lockfile as the place a package came from.
 /// That address means nothing outside this run, so it is turned back into the real registry.
 pub fn restore_lockfiles(dir: &Path) {
@@ -667,6 +698,30 @@ mod tests {
         let stored: Vec<_> = std::fs::read_dir(cache.0.join("registry.npmjs.org")).unwrap().flatten().map(|e| e.file_name()).collect();
         println!("{stored:?}");
         assert!(stored.iter().any(|n| n.to_string_lossy().ends_with(".tgz")));
+    }
+
+    #[test]
+    fn clearing_empties_the_cache_but_refuses_directories_with_real_files() {
+        let cache = tempdir::Dir::new();
+        let project = tempdir::Dir::new();
+        std::fs::create_dir_all(cache.0.join("registry.example")).unwrap();
+        std::fs::write(cache.0.join("registry.example").join("%2Fa.full"), "x").unwrap();
+        std::fs::write(cache.0.join("stray"), "x").unwrap();
+        assert_eq!(clear(&cache.0, &project.0), Ok(2));
+        assert_eq!(std::fs::read_dir(&cache.0).unwrap().count(), 0);
+        assert!(cache.0.exists());
+        // Not made yet: nothing to do.
+        assert_eq!(clear(&cache.0.join("none"), &project.0), Ok(0));
+        // The project, or a directory above it, is never emptied.
+        std::fs::write(project.0.join("package.json"), "{}").unwrap();
+        assert!(clear(&project.0, &project.0).is_err());
+        let inner = project.0.join("inner");
+        std::fs::create_dir_all(&inner).unwrap();
+        assert!(clear(&project.0, &inner).is_err());
+        assert!(project.0.join("package.json").exists());
+        // A directory with a package.json or .git of its own isn't a cache either.
+        std::fs::create_dir_all(cache.0.join(".git")).unwrap();
+        assert!(clear(&cache.0, &project.0).is_err());
     }
 
     #[test]

@@ -31,6 +31,9 @@ OPTIONS:
         --reset-cache  Forget what --cache remembers about this project (its scan results and
                        the latest versions) before starting. Other projects in the file stay.
                        Needs --cache. The package manager and proxy caches are not touched.
+        --clear-npm-cache
+                       Empty npm's cache before starting: the one given with --pm-cache,
+                       or else npm's own, and the one given with --proxy-cache. npm only.
         --cache <FILE> JSON file that remembers latest versions and scans between runs
     -h, --help         Print help
     -V, --version      Print version
@@ -79,6 +82,7 @@ fn main() -> Result<()> {
     let mut cache_path: Option<PathBuf> = None;
     let mut proxy_dir: Option<PathBuf> = None;
     let mut reset_cache = false;
+    let mut clear_npm_cache = false;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -116,6 +120,7 @@ fn main() -> Result<()> {
                 None => bail!("{arg} requires a value"),
             },
             "--reset-cache" => reset_cache = true,
+            "--clear-npm-cache" => clear_npm_cache = true,
             "--prefer-offline" => config::pm::set_prefer_offline(),
             "--pm" => {
                 let v = args.next().unwrap_or_default();
@@ -153,6 +158,16 @@ fn main() -> Result<()> {
         (rc, warnings)
     };
     let mut notes = Vec::new();
+    if clear_npm_cache {
+        if pm != config::pm::Pm::Npm {
+            bail!("--clear-npm-cache works with npm projects, this one uses {}", pm.name());
+        }
+        notes.push(config::pm::clean_npm_cache(&dir, config::pm::cache_dir()).map_err(anyhow::Error::msg)?);
+        if let Some(d) = &proxy_dir {
+            let n = proxy::clear(d, &dir).map_err(anyhow::Error::msg)?;
+            notes.push(format!("Cleared the proxy cache in {} ({n} entries)", d.display()));
+        }
+    }
     if let Some(proxy_dir) = proxy_dir {
         if pm != config::pm::Pm::Npm {
             notes.push(format!("--proxy-cache only works with npm, not {}: ignored.", pm.name()));

@@ -117,6 +117,31 @@ impl Pm {
     }
 }
 
+/// Arguments that empty npm's cache: the one in `cache` (`--pm-cache`), or else npm's own.
+pub fn npm_clean_args(cache: Option<&str>) -> Vec<String> {
+    let mut a: Vec<String> = ["cache", "clean", "--force"].iter().map(|s| s.to_string()).collect();
+    a.extend(cache.map(|d| format!("--cache={d}")));
+    a
+}
+/// Empties npm's cache with `npm cache clean`. Returns what was cleared, for the log.
+pub fn clean_npm_cache(dir: &Path, cache: Option<&str>) -> Result<String, String> {
+    let out = std::process::Command::new(Pm::Npm.program())
+        .args(npm_clean_args(cache))
+        .current_dir(dir)
+        .stdin(std::process::Stdio::null())
+        .output()
+        .map_err(|e| format!("could not run npm: {e}"))?;
+    if !out.status.success() {
+        return Err(format!(
+            "`npm cache clean` failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    Ok(match cache {
+        Some(d) => format!("Cleared the npm cache in {d}"),
+        None => "Cleared npm's own cache".to_string(),
+    })
+}
 static CACHE_DIR: std::sync::OnceLock<String> = std::sync::OnceLock::new();
 /// Sets the directory for the package manager's download cache (once, at startup).
 pub fn set_cache_dir(dir: String) {
@@ -165,6 +190,11 @@ mod tests {
         assert!(flags.is_empty());
         assert_eq!(env, [("YARN_CACHE_FOLDER".to_string(), "/c".to_string())]);
         assert_eq!(Pm::Bun.cache_setup("/c", false).1[0].0, "BUN_INSTALL_CACHE_DIR");
+    }
+    #[test]
+    fn npm_clean_uses_the_given_cache_or_its_own() {
+        assert_eq!(npm_clean_args(None), ["cache", "clean", "--force"]);
+        assert_eq!(npm_clean_args(Some("/c")), ["cache", "clean", "--force", "--cache=/c"]);
     }
     #[test]
     fn prefer_offline_is_passed_where_supported() {
