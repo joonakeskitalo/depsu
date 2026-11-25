@@ -170,6 +170,9 @@ fn main() -> Result<()> {
         } else {
             Vec::new()
         };
+        if pm == config::pm::Pm::Yarn {
+            config::yarnrc::merge_classic(&mut rc, &dir);
+        }
         (rc, warnings)
     };
     let mut notes = Vec::new();

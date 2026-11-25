@@ -235,8 +235,27 @@ impl Input {
 }
 
 pub enum InputPurpose {
-    /// A package to add to the project (`+`).
-    Add { add_as: AddAs },
+    /// A package to add to the project (`+`), and how its version is pinned (`PINS`).
+    Add { add_as: AddAs, pin: &'static str },
+}
+
+/// The ways a version can be pinned, as (prefix, label), in the order they are offered.
+pub const PINS: [(&str, &str); 4] = [("", "exact"), ("^", "^"), ("~", "~"), (">=", ">=")];
+/// The pin type `by` steps away from `pin` in `PINS`, wrapping around.
+fn step_pin(pin: &str, by: isize) -> &'static str {
+    let i = PINS.iter().position(|(p, _)| *p == pin).unwrap_or(0) as isize;
+    PINS[(i + by).rem_euclid(PINS.len() as isize) as usize].0
+}
+/// The pin type a letter picks, as in the `P` prompt. Letters, because `^` and `~` are dead
+/// keys on Nordic keyboards.
+fn pin_letter(code: KeyCode) -> Option<&'static str> {
+    match code {
+        KeyCode::Char('e') => Some(""),
+        KeyCode::Char('c') => Some("^"),
+        KeyCode::Char('t') => Some("~"),
+        KeyCode::Char('m') => Some(">="),
+        _ => None,
+    }
 }
 
 /// The version of a package being edited (`e`): what goes into `package.json`, with its pin
@@ -312,6 +331,8 @@ impl AddAs {
 struct Adding {
     kind: Kind,
     version: Version,
+    /// How the version is pinned in `package.json`, e.g. `^`, or `""` for exact.
+    prefix: &'static str,
     latest: Version,
 }
 
@@ -747,6 +768,10 @@ pub struct App {
     /// Packages queued for uninstall, whose rows go away when the job succeeds.
     uninstalling: HashSet<String>,
     confirm_pin: bool,
+    /// How the pin waiting for confirmation is pinned, e.g. `^`, or `""` for exact.
+    pin_prefix: &'static str,
+    /// The pin type picked with a letter while confirming, for the next round of `p`.
+    pin_choice: Option<&'static str>,
     /// `U` was pressed once: pressing it again reinstalls everything.
     confirm_reinstall: bool,
     /// Override keys being added or removed, which call for a rescan.
@@ -962,6 +987,8 @@ impl App {
             dependents: HashMap::new(),
             uninstalling: HashSet::new(),
             confirm_pin: false,
+            pin_prefix: "^",
+            pin_choice: None,
             confirm_reinstall: false,
             changed: HashSet::new(),
             cursor_moved: false,
@@ -2775,14 +2802,7 @@ impl App {
         }
         if self.pin_prompt {
             self.pin_prompt = false;
-            let prefix = match key.code {
-                KeyCode::Char('c') => Some("^"),
-                KeyCode::Char('t') => Some("~"),
-                KeyCode::Char('e') => Some(""),
-                KeyCode::Char('m') => Some(">="),
-                _ => None,
-            };
-            match prefix {
+            match pin_letter(key.code) {
                 Some(p) => self.set_range(p),
                 None => self.push_log("Pin type unchanged."),
             }
@@ -2804,6 +2824,15 @@ impl App {
             KeyCode::Char('i') | KeyCode::Enter
         ) {
             self.confirm_conflicts = None;
+        }
+        // While a pin waits for confirmation, a pin letter changes how it is pinned.
+        if self.confirm_pin
+            && let Some(prefix) = pin_letter(key.code)
+        {
+            self.confirm_pin = false;
+            self.pin_choice = Some(prefix);
+            self.pin_selected();
+            return;
         }
         if key.code != KeyCode::Char('p') {
             self.confirm_pin = false;
@@ -2885,6 +2914,7 @@ impl App {
             KeyCode::Char('+') => {
                 self.input = Some(Input::new(InputPurpose::Add {
                     add_as: AddAs::Dependency,
+                    pin: self.default_prefix(),
                 }))
             }
             KeyCode::Char('d') => self.delete_selected(),
@@ -3080,7 +3110,7 @@ impl App {
         match key.code {
             KeyCode::Esc => self.input = None,
             KeyCode::Enter => match &input.purpose {
-                InputPurpose::Add { add_as } => {
+                InputPurpose::Add { add_as, .. } => {
                     let (add_as, text) = (*add_as, input.text.clone());
                     self.submit_add(add_as, &text);
                 }
@@ -3090,10 +3120,14 @@ impl App {
                 input.error = None;
             }
             KeyCode::Tab | KeyCode::Down | KeyCode::BackTab | KeyCode::Up => {
-                let InputPurpose::Add { add_as } = &mut input.purpose;
+                let InputPurpose::Add { add_as, .. } = &mut input.purpose;
                 let by = if matches!(key.code, KeyCode::BackTab | KeyCode::Up) { -1 } else { 1 };
                 *add_as = add_as.step(by);
                 input.error = None;
+            }
+            KeyCode::Left | KeyCode::Right => {
+                let InputPurpose::Add { pin, .. } = &mut input.purpose;
+                *pin = step_pin(pin, if key.code == KeyCode::Left { -1 } else { 1 });
             }
             KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
                 input.text.push(c);
@@ -3662,10 +3696,13 @@ impl App {
                 None => return self.add_error(format!("{name} has no `latest` version.")),
             },
         };
-        self.input = None;
+        let prefix = match self.input.take() {
+            Some(Input { purpose: InputPurpose::Add { pin, .. }, .. }) => pin,
+            None => self.default_prefix(),
+        };
         let latest = doc.latest.clone().unwrap_or_else(|| version.clone());
         match add_as {
-            AddAs::Override => self.add_override(&name, &version, false),
+            AddAs::Override => self.add_override(&name, &version, prefix),
             AddAs::Dependency | AddAs::Dev => {
                 let kind = if add_as == AddAs::Dev { Kind::Dev } else { Kind::Prod };
                 self.adding.insert(
@@ -3673,6 +3710,7 @@ impl App {
                     Adding {
                         kind,
                         version: version.clone(),
+                        prefix,
                         latest,
                     },
                 );
@@ -3681,11 +3719,15 @@ impl App {
         }
     }
 
-    /// Adds an override that forces `name` to `version` everywhere in the dependency tree.
-    /// Forces `name` to `version` everywhere in the dependency tree with an override, `^version`
-    /// or exactly `version`. An existing override of it is changed instead.
-    fn add_override(&mut self, name: &str, version: &Version, exact: bool) {
-        let new = if exact { version.to_string() } else { format!("^{version}") };
+    /// How a new version is pinned unless chosen otherwise: exactly when the package manager
+    /// is set to save exact versions, with `^` otherwise.
+    pub fn default_prefix(&self) -> &'static str {
+        if self.rc.save_exact() { "" } else { "^" }
+    }
+    /// Forces `name` to `version` everywhere in the dependency tree with an override, pinned
+    /// with `prefix` (`""` for exact). An existing override of it is changed instead.
+    fn add_override(&mut self, name: &str, version: &Version, prefix: &str) {
+        let new = format!("{prefix}{version}");
         let (loc, change) = match self
             .overrides
             .iter()
@@ -3770,7 +3812,7 @@ impl App {
                     self.exact_once.insert(b.name.clone());
                     self.start_install(vec![(b.name, alt)], Vec::new());
                 } else {
-                    self.add_override(&b.name, &alt, true);
+                    self.add_override(&b.name, &alt, "");
                 }
             }
             return;
@@ -4531,9 +4573,9 @@ impl App {
                 if let Some(a) = self.adding.get(&name) {
                     items.push(InstallItem {
                         name: name.clone(),
-                        spec: if exact_now { target.to_string() } else { format!("^{target}") },
+                        spec: if exact_now { target.to_string() } else { format!("{}{target}", a.prefix) },
                         kind: a.kind,
-                        exact: exact_now,
+                        exact: exact_now || a.prefix.is_empty(),
                         old: None,
                     });
                 }
@@ -5299,12 +5341,15 @@ impl App {
         };
         if !self.confirm_pin {
             self.confirm_pin = true;
+            // A pin letter pressed while confirming chose the pin type; otherwise the default.
+            self.pin_prefix = self.pin_choice.take().unwrap_or_else(|| self.default_prefix());
+            let pin = self.pin_prefix;
             let names: Vec<String> = plan
                 .iter()
-                .map(|p| format!("{} → ^{}{}", p.name, p.version, pin_where(p.scope.as_ref())))
+                .map(|p| format!("{} → {pin}{}{}", p.name, p.version, pin_where(p.scope.as_ref())))
                 .collect();
             self.push_log(format!(
-                "📌 will set in package.json {key_name}: {}. Press p again to confirm, any other key cancels.",
+                "📌 will set in package.json {key_name}: {}. Press p again to confirm, e c t m to pin exactly, with ^, ~ or >= instead, any other key cancels.",
                 names.join("; ")
             ));
             // The installed packages that ask for a range the pinned version is outside of.
@@ -5315,8 +5360,8 @@ impl App {
                     rejected = true;
                     let it = if who.len() == 1 { "it" } else { "them" };
                     self.push_log(format!(
-                        "⚠ ^{} is outside the range declared by {}, and the override applies to {it}: this can break {it}.",
-                        p.version,
+                        "⚠ {} is outside the range declared by {}, and the override applies to {it}: this can break {it}.",
+                        format!("{pin}{}", p.version),
                         who.join(", "),
                     ));
                 }
@@ -5334,7 +5379,7 @@ impl App {
         let mut edits = Vec::new();
         let mut keys = Vec::new();
         for p in &plan {
-            let new = format!("^{}", p.version);
+            let new = format!("{}{}", self.pin_prefix, p.version);
             let (loc, change) = match &p.existing {
                 Some(o) => (
                     o.loc.clone(),
@@ -5364,7 +5409,7 @@ impl App {
             edits.push(change);
         }
         let what: Vec<String> =
-            plan.iter().map(|p| format!("{}@^{}{}", p.name, p.version, pin_where(p.scope.as_ref()))).collect();
+            plan.iter().map(|p| format!("{}@{}{}{}", p.name, self.pin_prefix, p.version, pin_where(p.scope.as_ref()))).collect();
         self.push_log(format!("… queued override {}", what.join(", ")));
         let _ = self.jobs.send(Job {
             items: Vec::new(),
@@ -6768,7 +6813,7 @@ mod tests {
         app.on_key(key('+'));
         type_text(&mut app, "lodash@4.17.20");
         press(&mut app, KeyCode::Tab); // dependency → dev dependency
-        assert!(matches!(&app.input, Some(Input { purpose: InputPurpose::Add { add_as: AddAs::Dev }, .. })));
+        assert!(matches!(&app.input, Some(Input { purpose: InputPurpose::Add { add_as: AddAs::Dev, .. }, .. })));
         press(&mut app, KeyCode::Enter);
         let jobs = settle(&mut app, &rx, "");
         assert_eq!(specs(&jobs), ["lodash@^4.17.20"]);
@@ -6856,7 +6901,7 @@ mod tests {
         app.on_key(key('+'));
         // Up from the first choice wraps to the last: override.
         press(&mut app, KeyCode::Up);
-        assert!(matches!(&app.input, Some(Input { purpose: InputPurpose::Add { add_as: AddAs::Override }, .. })));
+        assert!(matches!(&app.input, Some(Input { purpose: InputPurpose::Add { add_as: AddAs::Override, .. }, .. })));
         type_text(&mut app, "lodash@4.17.20");
         press(&mut app, KeyCode::Enter);
         let jobs = settle(&mut app, &rx, "");
@@ -6872,6 +6917,58 @@ mod tests {
         assert!(app.installing());
     }
 
+    #[test]
+    fn plus_saves_exact_versions_when_the_package_manager_is_set_to() {
+        let (mut app, rx) = offline_app();
+        let mut rc = Npmrc::default();
+        rc.merge_str("save-exact=true\n");
+        app.rc = Arc::new(rc);
+        app.on_key(key('+'));
+        press(&mut app, KeyCode::Up);
+        type_text(&mut app, "lodash@4.17.20");
+        press(&mut app, KeyCode::Enter);
+        let jobs = settle(&mut app, &rx, "");
+        assert_eq!(
+            jobs[0].edits,
+            [Change::Add {
+                loc: vec!["overrides".into(), "lodash".into()],
+                new: "4.17.20".into()
+            }]
+        );
+        app.on_install_finished(Vec::new(), Vec::new(), Ok(()));
+        // A dependency too.
+        app.on_key(key('+'));
+        type_text(&mut app, "lodash");
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(specs(&settle(&mut app, &rx, "")), ["lodash@4.17.21"]);
+    }
+    #[test]
+    fn plus_offers_the_pin_type() {
+        let (mut app, rx) = offline_app();
+        app.on_key(key('+'));
+        press(&mut app, KeyCode::Up);
+        // ^ by default, → moves to ~.
+        press(&mut app, KeyCode::Right);
+        type_text(&mut app, "lodash@4.17.20");
+        press(&mut app, KeyCode::Enter);
+        let jobs = settle(&mut app, &rx, "");
+        assert_eq!(
+            jobs[0].edits,
+            [Change::Add {
+                loc: vec!["overrides".into(), "lodash".into()],
+                new: "~4.17.20".into()
+            }]
+        );
+        app.on_install_finished(Vec::new(), Vec::new(), Ok(()));
+        // A dependency, ← from ^ is exact.
+        app.on_key(key('+'));
+        press(&mut app, KeyCode::Left);
+        type_text(&mut app, "lodash");
+        press(&mut app, KeyCode::Enter);
+        let jobs = settle(&mut app, &rx, "");
+        assert_eq!(specs(&jobs), ["lodash@4.17.21"]);
+        assert!(jobs[0].items[0].exact);
+    }
     #[test]
     fn npm_cannot_override_a_dependency_of_the_project() {
         let (mut app, _rx) = offline_app();
@@ -6894,6 +6991,12 @@ mod tests {
         assert!((top as i32 - (40 - 1 - bottom) as i32).abs() <= 1, "top {top}, bottom {bottom}");
         let body = screen[top..=bottom].join("\n");
         assert!(body.contains("Package  lodash█"));
+        assert!(body.contains("Pin      ○ exact   ● ^   ○ ~   ○ >="), "{body}");
+        // Clicking a pin choice picks it.
+        let y = (top + 1..bottom).find(|&y| screen[y].contains("Pin ")).unwrap() as u16;
+        let x = screen[y as usize].find("○ ~").map(|b| screen[y as usize][..b].chars().count()).unwrap() as u16;
+        click(&mut app, x + 2, y);
+        assert!(matches!(&app.input, Some(Input { purpose: InputPurpose::Add { pin: "~", .. }, .. })));
         assert!(body.contains("○ dependency"));
         assert!(body.contains("● dev dependency"));
         assert!(body.contains("○ dependency      dependencies"));
@@ -7100,6 +7203,20 @@ mod tests {
             }]
         );
 
+        // A pin letter while confirming changes the pin type and asks again.
+        app.on_key(key('p'));
+        app.on_key(key('t'));
+        assert!(app.log.iter().any(|l| l.contains("qs → ~6.0.4")), "{:?}", app.log);
+        assert!(rx.try_recv().is_err(), "still asking");
+        app.on_key(key('e'));
+        app.on_key(key('p'));
+        let job = rx.try_recv().expect("override queued");
+        assert!(matches!(&job.edits[..], [Change::Set { new, .. }] | [Change::Add { new, .. }] if new == "6.0.4"), "{:?}", job.edits);
+        // The next pin starts from the default again.
+        app.on_key(key('p'));
+        assert!(app.log.iter().rev().take(3).any(|l| l.contains("qs → ^6.0.4")), "{:?}", app.log);
+        app.on_key(key('z')); // cancels
+        assert!(rx.try_recv().is_err());
         // i on it explains that p is the way.
         app.on_key(key('i'));
         assert!(app.log.last().unwrap().contains("press p to override qs"), "{:?}", app.log.last());

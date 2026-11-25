@@ -46,6 +46,30 @@ fn files(dir: &Path) -> Vec<PathBuf> {
     out.into_iter().filter(|f| f.is_file()).collect()
 }
 
+/// Yarn 1 (`.yarnrc`, in the home directory then the project): reads `save-exact`, written
+/// as `save-exact true`. Yarn 1 also reads `.npmrc`; `.yarnrc` wins.
+pub fn merge_classic(rc: &mut Npmrc, dir: &Path) {
+    let mut paths = Vec::new();
+    if let Some(home) = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")) {
+        paths.push(Path::new(&home).join(".yarnrc"));
+    }
+    paths.push(dir.join(".yarnrc"));
+    for p in paths {
+        if let Ok(text) = std::fs::read_to_string(&p) {
+            merge_classic_str(rc, &text);
+        }
+    }
+}
+fn merge_classic_str(rc: &mut Npmrc, text: &str) {
+    for line in text.lines().map(str::trim) {
+        if let Some(v) = line.strip_prefix("save-exact")
+            && v.starts_with(char::is_whitespace)
+        {
+            let v = v.trim().trim_matches('"');
+            rc.set(crate::config::npmrc::SAVE_EXACT, v);
+        }
+    }
+}
 /// True if the project is configured through `.yarnrc.yml`, in `dir` or a parent directory
 /// (the home directory alone doesn't make a project a Yarn Modern one).
 pub fn is_yarn_modern(dir: &Path) -> bool {
@@ -94,6 +118,8 @@ struct Config {
     scopes: BTreeMap<String, Scope>,
     /// Normalised registry (`host/path`) to its credentials.
     registries: BTreeMap<String, Auth>,
+    /// `defaultSemverRangePrefix`: `""` saves exact versions.
+    range_prefix: Option<String>,
 }
 
 /// Loads the Yarn configuration for `dir`. Returns the settings and any problems found.
@@ -131,6 +157,7 @@ impl Config {
     /// Merges `other` into `self`; values in `other` win.
     fn overlay(&mut self, other: Config) {
         self.registry = other.registry.or(self.registry.take());
+        self.range_prefix = other.range_prefix.or(self.range_prefix.take());
         self.auth.overlay(other.auth);
         for (name, s) in other.scopes {
             let mine = self.scopes.entry(name).or_default();
@@ -143,6 +170,9 @@ impl Config {
     }
 
     fn apply(&self, rc: &mut Npmrc) {
+        if let Some(p) = &self.range_prefix {
+            rc.set(crate::config::npmrc::SAVE_EXACT, &p.is_empty().to_string());
+        }
         if let Some(r) = &self.registry {
             rc.set("registry", r);
         }
@@ -211,6 +241,8 @@ fn parse(text: &str) -> Result<(Config, Vec<String>), String> {
     let get = |m: &serde_yaml_ng::Mapping, k: &str| m.get(Value::String(k.to_string())).cloned();
 
     cfg.registry = text_of(get(root, "npmRegistryServer").as_ref(), "npmRegistryServer");
+    // Read as is: the empty string is the meaningful value here.
+    cfg.range_prefix = get(root, "defaultSemverRangePrefix").and_then(|v| v.as_str().map(String::from));
     cfg.auth = Auth {
         token: text_of(get(root, "npmAuthToken").as_ref(), "npmAuthToken"),
         ident: text_of(get(root, "npmAuthIdent").as_ref(), "npmAuthIdent"),
@@ -362,6 +394,17 @@ fn expand_from(
 mod tests {
     use super::*;
 
+    #[test]
+    fn reads_the_exact_version_setting() {
+        assert!(load_text("defaultSemverRangePrefix: \"\"\n").0.save_exact());
+        assert!(!load_text("defaultSemverRangePrefix: \"~\"\n").0.save_exact());
+        assert!(!load_text("npmRegistryServer: \"https://r.example\"\n").0.save_exact());
+        let mut rc = Npmrc::default();
+        merge_classic_str(&mut rc, "# comment\nsave-exact true\n");
+        assert!(rc.save_exact());
+        merge_classic_str(&mut rc, "save-exact false\n");
+        assert!(!rc.save_exact());
+    }
     fn load_text(text: &str) -> (Npmrc, Vec<String>) {
         let (cfg, warnings) = parse(text).unwrap();
         let mut rc = Npmrc::default();

@@ -6,6 +6,8 @@ use std::collections::HashMap;
 use std::path::Path;
 
 const DEFAULT_REGISTRY: &str = "https://registry.npmjs.org/";
+/// The `.npmrc` key for saving exact versions, which the other config readers set too.
+pub const SAVE_EXACT: &str = "save-exact";
 
 #[derive(Debug, Default)]
 pub struct Npmrc {
@@ -32,7 +34,19 @@ impl Npmrc {
                 rc.values.insert("registry".into(), v);
             }
         }
+        for var in ["NPM_CONFIG_SAVE_EXACT", "npm_config_save_exact"] {
+            if let Ok(v) = std::env::var(var)
+                && !v.is_empty()
+            {
+                rc.values.insert(SAVE_EXACT.into(), v);
+            }
+        }
         rc
+    }
+    /// Whether the package manager is set to save exact versions instead of `^` ranges
+    /// (`save-exact` in `.npmrc`, or its equivalent the other package managers' files set).
+    pub fn save_exact(&self) -> bool {
+        self.values.get(SAVE_EXACT).is_some_and(|v| v.trim() == "true")
     }
 
     pub fn set_scope_auth(&mut self, scope: &str, header: String) {
@@ -172,6 +186,12 @@ mod tests {
         r
     }
 
+    #[test]
+    fn reads_save_exact() {
+        assert!(rc("save-exact=true\n").save_exact());
+        assert!(!rc("save-exact=false\n").save_exact());
+        assert!(!rc("registry=https://a.example/\n").save_exact());
+    }
     #[test]
     fn default_and_scoped_registry() {
         let r = rc("registry=https://a.example/npm\n@acme:registry=https://b.example/\n# c\n");

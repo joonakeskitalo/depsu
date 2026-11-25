@@ -94,6 +94,10 @@ pub fn merge_str(rc: &mut Npmrc, text: &str) -> Result<(), toml::de::Error> {
     if let Some(reg) = install.get("registry") {
         apply(rc, None, reg);
     }
+    // `exact = true` saves exact versions, like `save-exact` in `.npmrc`.
+    if let Some(exact) = install.get("exact").and_then(Value::as_bool) {
+        rc.set(crate::config::npmrc::SAVE_EXACT, &exact.to_string());
+    }
     if let Some(scopes) = install.get("scopes").and_then(Value::as_table) {
         for (scope, v) in scopes {
             apply(rc, Some(scope.trim_start_matches('@')), v);
@@ -138,6 +142,14 @@ fn apply(rc: &mut Npmrc, scope: Option<&str>, v: &Value) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn reads_the_exact_version_setting() {
+        let mut rc = Npmrc::default();
+        merge_str(&mut rc, "[install]\nexact = true\n").unwrap();
+        assert!(rc.save_exact());
+        merge_str(&mut rc, "[install]\nexact = false\n").unwrap();
+        assert!(!rc.save_exact());
+    }
 
     #[test]
     fn table_form_with_env_token() {

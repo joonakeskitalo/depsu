@@ -384,9 +384,9 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         draw_ignore_dialog(f, p);
     }
     if let Some(input) = &app.input
-        && let crate::tui::app::InputPurpose::Add { add_as } = &input.purpose
+        && let crate::tui::app::InputPurpose::Add { add_as, pin } = &input.purpose
     {
-        let clicks = draw_add_dialog(f, app, input, *add_as);
+        let clicks = draw_add_dialog(f, app, input, *add_as, pin);
         app.targets.keys.extend(clicks);
     }
 }
@@ -1016,8 +1016,9 @@ fn draw_add_dialog(
     app: &App,
     input: &crate::tui::app::Input,
     add_as: crate::tui::app::AddAs,
+    pin: &str,
 ) -> Vec<(Rect, Vec<KeyEvent>)> {
-    use crate::tui::app::AddAs;
+    use crate::tui::app::{AddAs, PINS};
     let width = f.area().width.saturating_sub(4).min(72);
     let inner = (width as usize).saturating_sub(4);
     let dim = Style::new().fg(Color::DarkGray);
@@ -1057,6 +1058,23 @@ fn draw_add_dialog(
             Span::styled(note.to_string(), dim),
         ]));
     }
+    // How the version is pinned, one choice per option, with each option's column for clicks.
+    let mut pin_spans = vec![label("Pin")];
+    let mut pin_cols = Vec::new();
+    let mut col = 9u16;
+    for (prefix, name) in PINS {
+        let chosen = prefix == pin;
+        let style = if chosen {
+            Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+        } else {
+            Style::new()
+        };
+        let text = format!("{}{name}   ", if chosen { "● " } else { "○ " });
+        pin_cols.push((col, text.chars().count() as u16 - 3));
+        col += text.chars().count() as u16;
+        pin_spans.push(Span::styled(text, style));
+    }
+    lines.push(Line::from(pin_spans));
     lines.push(Line::default());
     if let Some(name) = &input.looking_up {
         lines.push(Line::from(Span::styled(format!("Looking up {name}…"), dim)));
@@ -1078,6 +1096,7 @@ fn draw_add_dialog(
     };
     let mut keys = key("enter", "add");
     keys.extend(key("tab ↑↓", "choose"));
+    keys.extend(key("←→", "pin"));
     keys.extend(key("esc", "cancel"));
     lines.push(Line::from(keys));
     let (rect, cut) = draw_dialog(f, "Add a package", lines, width);
@@ -1095,6 +1114,18 @@ fn draw_add_dialog(
             };
             let down = (i + AddAs::ALL.len() - at) % AddAs::ALL.len();
             clicks.push((r, vec![plain(KeyCode::Down); down]));
+        }
+        // The pin choices are on the line after them, each reached by moving right.
+        let at = PINS.iter().position(|(p, _)| *p == pin).unwrap_or(0);
+        for (i, (x, w)) in pin_cols.into_iter().enumerate() {
+            let r = Rect {
+                x: rect.x + 2 + x,
+                y: rect.y + 2 + 3 + AddAs::ALL.len() as u16,
+                width: w,
+                height: 1,
+            };
+            let right = (i + PINS.len() - at) % PINS.len();
+            clicks.push((r, vec![plain(KeyCode::Right); right]));
         }
     }
     clicks
@@ -2283,7 +2314,7 @@ fn fix_spans(app: &App, r: &AppRow, v: &crate::security::vuln::Vuln) -> Vec<Span
     if let Some(to) = app.vuln_pin_fix(v) {
         let mut spans = vec![
             Span::raw("  "),
-            Span::styled(format!("⬆ fix: p overrides {} to ^{to}{}", v.package, app.pin_where(v)), fixable),
+            Span::styled(format!("⬆ fix: p overrides {} to {}{to}{}", v.package, app.default_prefix(), app.pin_where(v)), fixable),
         ];
         spans.extend(pin_conflict_span(&app.pin_fix_rejecters(v)));
         spans.push(Span::styled(
