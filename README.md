@@ -215,7 +215,9 @@ the list, after the regular packages whatever the grouping. Its latest version i
 package. The row shows the lowest version its overrides name and is marked outdated when any of
 them can move to a newer one. Checking the row and pressing `i` rewrites those overrides in
 `package.json` and runs the install, the same as for the override lines under a package. Overrides
-whose value isn't a plain version or range (`$foo`, URLs, aliases) get no row.
+whose value isn't a plain version or range (`$foo`, URLs, aliases) get no row. A dependency that is
+overridden itself is listed in that section too, with its own overrides, besides its regular place
+in the list.
 
 **Pinning a fix.** When Snyk or the audit reports a vulnerable package below a direct dependency
 and lists a fixed version, `p` adds an override for it (`overrides`, `resolutions` or

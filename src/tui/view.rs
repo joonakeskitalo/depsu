@@ -102,6 +102,9 @@ pub enum Item {
     Row {
         idx: usize,
         name: String,
+        /// A dependency listed a second time, in the overridden-packages section, because it
+        /// is overridden itself.
+        repeat: bool,
     },
     /// A package uninstalled in this session, in the removed section; `r` restores it.
     Removed {
@@ -125,11 +128,20 @@ pub enum Item {
         /// Package name and override key: identity that survives list rebuilds.
         row: String,
         key: String,
+        /// Nested under a repeated row (see `Item::Row::repeat`).
+        repeat: bool,
     },
 }
 
-fn children(r: &Row, idx: usize, mode: Overrides, vulns: bool) -> Vec<Item> {
+/// The lines nested under a row. A repeated row only lists its own overrides.
+fn children(r: &Row, idx: usize, mode: Overrides, vulns: bool, repeat: bool) -> Vec<Item> {
     let mut kids: Vec<Child> = Vec::new();
+    if repeat {
+        if mode != Overrides::Off {
+            kids.extend((0..r.overrides.len()).map(Child::Own));
+        }
+        return nest(r, idx, kids, repeat);
+    }
     // Security findings first: they matter more than where overrides apply.
     if vulns {
         kids.extend((0..r.vulns.len()).map(Child::Vuln));
@@ -141,6 +153,9 @@ fn children(r: &Row, idx: usize, mode: Overrides, vulns: bool) -> Vec<Item> {
         }
         kids.extend((0..r.tree_hits.len()).map(Child::Tree));
     }
+    nest(r, idx, kids, repeat)
+}
+fn nest(r: &Row, idx: usize, kids: Vec<Child>, repeat: bool) -> Vec<Item> {
     let n = kids.len();
     kids.into_iter()
         .enumerate()
@@ -155,6 +170,7 @@ fn children(r: &Row, idx: usize, mode: Overrides, vulns: bool) -> Vec<Item> {
                 Child::Vuln(i) => format!("vuln:{}", r.vulns[i].id),
                 Child::Ignored(i) => format!("ignored:{}", r.ignored[i].id),
             },
+            repeat,
         })
         .collect()
 }
@@ -223,26 +239,36 @@ pub fn build(
     let (over, visible): (Vec<usize>, Vec<usize>) = visible
         .into_iter()
         .partition(|&i| rows[i].kind == Kind::Override);
-    // A package row followed by its nested override lines.
-    let item = |i: usize| {
+    // Overridden dependencies are listed there too, after their regular place in the list.
+    let mut again: Vec<usize> = visible
+        .iter()
+        .copied()
+        .filter(|&i| !rows[i].overrides.is_empty())
+        .collect();
+    again.sort_by(|&a, &b| rows[a].name.cmp(&rows[b].name));
+    // A package row followed by its nested lines.
+    let row_items = |i: usize, repeat: bool| {
         let mut v = vec![Item::Row {
             idx: i,
             name: rows[i].name.clone(),
+            repeat,
         }];
-        v.extend(children(&rows[i], i, ov, vulns));
+        v.extend(children(&rows[i], i, ov, vulns, repeat));
         v
     };
+    let item = |i: usize| row_items(i, false);
 
     let mut out = if mode == GroupBy::None {
         visible.into_iter().flat_map(item).collect()
     } else {
         grouped(rows, mode, visible, &item)
     };
-    if !over.is_empty() {
+    if !over.is_empty() || !again.is_empty() {
         out.push(Item::Header {
             label: OVERRIDDEN.to_string(),
-            members: over.clone(),
+            members: again.iter().chain(&over).copied().collect(),
         });
+        out.extend(again.into_iter().flat_map(|i| row_items(i, true)));
         out.extend(over.into_iter().flat_map(item));
     }
     out
@@ -516,13 +542,16 @@ mod tests {
                 })
                 .collect()
         };
-        assert_eq!(kinds(Overrides::Off), ["a", "b"]);
+        // `a` is overridden itself, so it is repeated in the overridden-packages section.
+        assert_eq!(kinds(Overrides::Off), ["a", "b", "H", "a"]);
         let full = kinds(Overrides::Full);
         // own override + all 7 tree hits, nested under `a`, none under `b`
-        assert_eq!(full.len(), 1 + 1 + 7 + 1);
+        assert_eq!(full.len(), 1 + 1 + 7 + 1 + 3);
         assert_eq!(full[1], "Own(0)");
         assert_eq!(full[8], "Tree(6)$");
         assert_eq!(full[9], "b");
+        // The repeated row only lists its own override.
+        assert_eq!(full[10..], ["H", "a", "Own(0)$"]);
     }
 
     #[test]

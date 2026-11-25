@@ -805,7 +805,9 @@ impl App {
         for o in &overrides {
             if parse_spec(&o.value).is_some() && !names.contains(&o.name) {
                 names.push_back(o.name.clone());
-                if !direct.contains(&o.name)
+                // A direct dependency whose spec isn't a plain version (`*`, `latest`, a URL) has
+                // no row of its own, so its overrides get one.
+                if !current.contains_key(&o.name)
                     && let Some((prefix, v)) = override_base(&overrides, &o.name)
                 {
                     current.insert(o.name.clone(), (Kind::Override, prefix, v));
@@ -2040,7 +2042,11 @@ impl App {
     fn sync_override_rows(&mut self) {
         let mut names: Vec<String> = Vec::new();
         for o in &self.overrides {
-            if !self.direct.contains(&o.name)
+            let has_dep_row = self
+                .root_deps
+                .iter()
+                .any(|(n, spec)| *n == o.name && parse_spec(spec).is_some());
+            if !has_dep_row
                 && !names.contains(&o.name)
                 && override_base(&self.overrides, &o.name).is_some()
             {
@@ -3843,7 +3849,7 @@ impl App {
         self.view
             .iter()
             .filter_map(|it| match it {
-                Item::Row { idx, .. } => Some(*idx),
+                Item::Row { idx, repeat: false, .. } => Some(*idx),
                 _ => None,
             })
             .collect()
@@ -5433,18 +5439,13 @@ fn respecced(spec: &str, prefix: &str) -> Option<String> {
 fn anchor_of(item: &Item) -> (u8, String) {
     match item {
         Item::Header { label, .. } => (0, label.clone()),
-        Item::Row { name, .. } => (1, name.clone()),
+        Item::Row { name, repeat, .. } => (1, format!("{}{name}", if *repeat { "\u{0}" } else { "" })),
         Item::Override { key } => (3, key.clone()),
         Item::Removed { name } => (4, name.clone()),
         Item::Policy { id, path } => (5, format!("{id}\u{0}{path}")),
         Item::Detail {
-            row, key, child, ..
-        } => (
-            2,
-            match child {
-                _ => format!("{row}\u{0}{key}"),
-            },
-        ),
+            row, key, repeat, ..
+        } => (2, format!("{}{row}\u{0}{key}", if *repeat { "\u{0}" } else { "" })),
     }
 }
 
@@ -5974,6 +5975,61 @@ mod tests {
         );
         app.drain_events();
         app
+    }
+    #[test]
+    fn a_direct_dependency_with_an_override_lists_it() {
+        let dir = std::env::temp_dir().join(format!("depsu-ovr-direct-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let manifest = serde_json::json!({
+            "dependencies": {"react-native-svg": "15.15.4", "react-native-worklets": "0.10.1"},
+            "overrides": {"websocket-driver": "^0.8.0", "form-data": "4.0.6", "react-native-worklets": "^0.10.1"}
+        });
+        let mut cache = Cache::default();
+        for (n, v) in [("react-native-svg", "15.15.4"), ("react-native-worklets", "0.10.1"), ("websocket-driver", "0.8.0"), ("form-data", "4.0.6")] {
+            cache.latest.insert(n.into(), v.into());
+        }
+        let path = dir.join("cache.json");
+        cache.save(&path).unwrap();
+        let deps = ["react-native-svg", "react-native-worklets"]
+            .iter()
+            .map(|n| Dep { name: n.to_string(), spec: manifest["dependencies"][n].as_str().unwrap().into(), kind: Kind::Prod })
+            .collect();
+        let mut app = App::start(
+            dir.clone(),
+            Pm::Npm,
+            deps,
+            Npmrc::load(&dir),
+            overrides::collect(&manifest, Pm::Npm),
+            Some(path),
+        );
+        app.drain_events();
+        let at = app
+            .view
+            .iter()
+            .position(|it| matches!(it, Item::Header { label, .. } if label == view::OVERRIDDEN))
+            .unwrap();
+        let names: Vec<String> = app.view[at + 1..]
+            .iter()
+            .filter_map(|it| match it {
+                Item::Row { name, .. } => Some(name.clone()),
+                Item::Detail { row, .. } => Some(format!("  {row}")),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            names,
+            ["react-native-worklets", "  react-native-worklets", "form-data", "websocket-driver"]
+        );
+        // Still in its regular place, and counted once.
+        assert!(app.view[..at].iter().any(|it| matches!(it, Item::Row { name, .. } if name == "react-native-worklets")));
+        assert_eq!(app.visible_rows().len(), 4);
+        // The cursor stays on the repeated copy across rebuilds.
+        let repeated = app.view.iter().position(|it| matches!(it, Item::Row { repeat: true, .. })).unwrap();
+        app.table.select(Some(repeated));
+        app.cursor_moved = true;
+        app.rebuild_view();
+        assert_eq!(app.table.selected(), Some(repeated));
+        std::fs::remove_dir_all(dir).unwrap();
     }
     fn row<'a>(app: &'a App, name: &str) -> &'a Row {
         app.rows.iter().find(|r| r.name == name).unwrap()
