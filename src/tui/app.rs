@@ -2053,6 +2053,58 @@ impl App {
         out
     }
 
+    /// The installed packages that an override of `name` to `version` would reach, but that
+    /// declare a range `version` is outside of: `body-parser@1.19.0 (wants ~6.7.0)`. With a
+    /// scope, only the packages it reaches.
+    fn pin_rejecters(&self, name: &str, version: &Version, scope: Option<&Scope>) -> Vec<String> {
+        let mut out: Vec<String> = self
+            .dependents_of(name)
+            .into_iter()
+            .filter(|d| match scope {
+                Some(s) if s.deep => d.direct == s.parent,
+                Some(s) => d.name == s.parent,
+                None => true,
+            })
+            .filter(|d| overrides::satisfies(&d.range, version) == Some(false))
+            .map(|d| {
+                let at = d.version.as_ref().map(|v| format!("@{v}")).unwrap_or_default();
+                format!("{}{at} (wants {})", d.name, d.range)
+            })
+            .collect();
+        out.sort();
+        out.dedup();
+        out
+    }
+    /// The installed packages that declare `name` as a peer in a range `to` is outside of:
+    /// upgrading `name` to `to` breaks them. (Packages that list it as a regular dependency
+    /// keep a copy of their own, so they aren't affected.)
+    pub fn upgrade_rejecters(&self, name: &str, to: &Version) -> Vec<String> {
+        let mut out: Vec<String> = self
+            .rows
+            .iter()
+            .filter(|r| r.name != name)
+            .flat_map(|r| {
+                r.peers
+                    .iter()
+                    .filter(|p| p.name == name && overrides::satisfies(&p.range, to) == Some(false))
+                    .map(move |p| {
+                        let have = r.installed.as_ref().unwrap_or(&r.current);
+                        format!("{}@{have} (peer {})", r.name, p.range)
+                    })
+            })
+            .collect();
+        out.sort();
+        out.dedup();
+        out
+    }
+    /// The dependents the fix `p` offers for `v` would force outside their range.
+    pub fn pin_fix_rejecters(&self, v: &Vuln) -> Vec<String> {
+        match self.vuln_pin_fix(v) {
+            Some(to) => self.pin_rejecters(&v.package, &to, self.pin_scope(v).as_ref()),
+            None => Vec::new(),
+        }
+    }
+
     pub fn removed_pkg(&self, name: &str) -> Option<&RemovedPkg> {
         self.removed.iter().find(|p| p.row.name == name)
     }
@@ -4944,9 +4996,30 @@ impl App {
                 "📌 will set in package.json {key_name}: {}. Press p again to confirm, any other key cancels.",
                 names.join("; ")
             ));
-            self.push_log(
-                "⚠ This forces a version the dependents didn't ask for and can break them. Test the app afterwards, then run Snyk and the audit again.",
-            );
+            // The installed packages that ask for a range the pinned version is outside of.
+            let mut rejected = false;
+            for p in &plan {
+                let who = self.pin_rejecters(&p.name, &p.version, p.scope.as_ref());
+                if !who.is_empty() {
+                    rejected = true;
+                    let (it, they) = if who.len() == 1 { ("it", "a version it doesn't") } else { ("them", "a version they don't") };
+                    self.push_log(format!(
+                        "⚠ {} ^{} isn't accepted by {}: the override gives {it} {they} support, which can break {it}.",
+                        p.name,
+                        p.version,
+                        who.join(", "),
+                        it = it,
+                        they = they,
+                    ));
+                }
+            }
+            if !rejected {
+                self.push_log(
+                    "⚠ This forces a version the dependents didn't ask for and can break them. Test the app afterwards, then run Snyk and the audit again.",
+                );
+            } else {
+                self.push_log("Test the app afterwards, then run Snyk and the audit again.");
+            }
             return;
         }
         self.confirm_pin = false;

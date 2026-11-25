@@ -1709,6 +1709,7 @@ fn row_line(app: &App, r: &AppRow, indent: usize, name_w: usize, width: usize) -
                 format!("   {label} fix: {}{fix}", r.prefix),
                 Style::new().fg(Color::Magenta),
             ));
+            spans.extend(rejected_span(&app.upgrade_rejecters(&r.name, fix)));
         }
     }
     // A scanner with results hasn't looked at the version installed now.
@@ -2158,24 +2159,38 @@ fn ignore_spans(app: &App, v: &crate::security::vuln::Vuln) -> Vec<Span<'static>
         Style::new().fg(Color::Magenta),
     )]
 }
+/// `⚠ not accepted by mid@1.0.0 (wants 6.0.0)` after a suggested fix that installed packages
+/// declare they don't support. Nothing when there are none.
+fn rejected_span(who: &[String]) -> Option<Span<'static>> {
+    (!who.is_empty()).then(|| {
+        Span::styled(
+            format!("  ⚠ not accepted by {}", who.join(", ")),
+            Style::new().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+        )
+    })
+}
 fn fix_spans(app: &App, r: &AppRow, v: &crate::security::vuln::Vuln) -> Vec<Span<'static>> {
     let fixable = Style::new().fg(Color::Green).add_modifier(Modifier::BOLD);
     if let Some(to) = app.vuln_install_fix(r, v) {
-        return vec![
+        let mut spans = vec![
             Span::raw("  "),
             Span::styled(format!("⬆ fix: i installs {} {}{to}", r.name, r.prefix), fixable),
-            Span::styled(format!("  ({})", v.fix_summary()), Style::new().fg(Color::DarkGray)),
         ];
+        spans.extend(rejected_span(&app.upgrade_rejecters(&r.name, &to)));
+        spans.push(Span::styled(format!("  ({})", v.fix_summary()), Style::new().fg(Color::DarkGray)));
+        return spans;
     }
     if let Some(to) = app.vuln_pin_fix(v) {
-        return vec![
+        let mut spans = vec![
             Span::raw("  "),
             Span::styled(format!("⬆ fix: p overrides {} to ^{to}{}", v.package, app.pin_where(v)), fixable),
-            Span::styled(
-                format!("  (upgrading {} doesn't bring it in)", r.name),
-                Style::new().fg(Color::DarkGray),
-            ),
         ];
+        spans.extend(rejected_span(&app.pin_fix_rejecters(v)));
+        spans.push(Span::styled(
+            format!("  (upgrading {} doesn't bring it in)", r.name),
+            Style::new().fg(Color::DarkGray),
+        ));
+        return spans;
     }
     vec![Span::styled(
         format!("  · {}", v.fix_summary()),
