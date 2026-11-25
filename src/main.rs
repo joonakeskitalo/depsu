@@ -49,7 +49,7 @@ KEYS:
     a              select all / none
     i, enter       install the selected packages (or the highlighted one, or the
                    fix of the highlighted vulnerability)
-    /              filter by name (enter keeps it, esc clears it)
+    /              filter by name, override or finding (enter keeps it, esc clears it)
     g              group by: none, release type, name prefix, dependency type
     o              show / hide the override lines under each package
     d              delete: uninstall the checked packages and remove the checked

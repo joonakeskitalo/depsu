@@ -81,7 +81,7 @@ depsu --cache .depsu-cache.json   # remember versions and scans between runs
 | `space` | Select a package (up to date or not), a whole group (on its header) or an override line |
 | `a` | Select all / none of the shown packages |
 | `i` / `Enter` | Install the selected packages, or the highlighted one. On a vulnerability finding, install the version that fixes it. If the update needs other installed packages to change (peer dependencies), depsu lists them and asks: `y` update them too, `n` install only what you picked, any other key cancels. Packages that would need different install flags (dependency vs dev dependency, exact vs range) are written into `package.json` together and installed with one `install`, so the package manager resolves them at once; if that fails, `package.json` is put back |
-| `/` | Filter by name. `Enter` keeps the filter, `Esc` clears it |
+| `/` | Filter by name, by an override (name, value, where it is set) or by a finding (ID, title, package, CVE, severity, scanner such as `snyk`). `Enter` keeps the filter, `Esc` clears it |
 | `g` | Group by: none → release type → name prefix → dependency type |
 | `o` | Show / hide the override lines under each package |
 | `d` | Delete the checked packages and overrides in one go, or the package or override under the cursor. A dialog lists what will be uninstalled and removed from `package.json`, warns about installed packages that use them, and asks `y` / `enter` to go ahead. Deleted packages can be restored with `r` |

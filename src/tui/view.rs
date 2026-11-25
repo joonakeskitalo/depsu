@@ -185,6 +185,24 @@ fn prefix_label(name: &str, counts: &HashMap<&str, usize>) -> String {
     }
 }
 
+/// Whether a row matches the (lowercase) filter: by its name, by one of its overrides (name,
+/// value, where it applies) or by one of its findings (id, title, package, CVE, severity,
+/// scanner). Findings a `.snyk` rule ignores count too.
+fn matches(row: &Row, needle: &str) -> bool {
+    let has = |t: &str| t.to_lowercase().contains(needle);
+    has(&row.name)
+        || row
+            .overrides
+            .iter()
+            .chain(row.tree_hits.iter().map(|h| &h.over))
+            .any(|o| has(&o.describe()) || has(&o.value) || has(o.source))
+        || row.vulns.iter().chain(&row.ignored).any(|v| {
+            [&v.id, &v.title, &v.package, &v.severity.label().to_string(), &v.source.label().to_string()]
+                .into_iter()
+                .chain(&v.cve)
+                .any(|t| has(t))
+        })
+}
 /// Builds the list. Up-to-date packages (shown only because they have overrides) are
 /// hidden unless `uptodate` is set; they sort after outdated ones.
 pub fn build(
@@ -198,7 +216,7 @@ pub fn build(
     let needle = filter.trim().to_lowercase();
     let mut visible: Vec<usize> = (0..rows.len())
         .filter(|&i| uptodate || rows[i].outdated)
-        .filter(|&i| needle.is_empty() || rows[i].name.to_lowercase().contains(&needle))
+        .filter(|&i| needle.is_empty() || matches(&rows[i], &needle))
         .collect();
     visible.sort_by_key(|&i| !rows[i].outdated); // stable: outdated first
     // Overridden packages that aren't dependencies go in a section of their own at the end.
@@ -546,5 +564,45 @@ mod tests {
         ));
         assert!(!hidden.contains(&"@babel/core".to_string()));
         assert_eq!(hidden.len(), 4);
+    }
+    #[test]
+    fn filter_also_matches_overrides_and_findings() {
+        use crate::security::vuln::{Severity, Source, Vuln};
+        let mut rows = sample();
+        let i = rows.iter().position(|r| r.name == "lodash").unwrap();
+        rows[i].tree_hits.push(hit("minimist", crate::deps::overrides::Compat::Ok));
+        let j = rows.iter().position(|r| r.name == "eslint").unwrap();
+        rows[j].vulns.push(Vuln {
+            source: Source::Snyk,
+            id: "SNYK-JS-FOO-123".into(),
+            title: "Prototype Pollution".into(),
+            severity: Severity::High,
+            package: "foo".into(),
+            version: "1.0.0".into(),
+            direct: "eslint".into(),
+            direct_version: None,
+            path: Vec::new(),
+            fixed_in: Vec::new(),
+            upgrade_to: None,
+            upgrade_brings: None,
+            upgrade_major: false,
+            range: None,
+            fix_note: None,
+            cve: vec!["CVE-2024-1".into()],
+        });
+        let names = |f: &str| {
+            let items = build(&rows, GroupBy::None, f, Overrides::Full, true, true);
+            items
+                .iter()
+                .filter_map(|it| match it {
+                    Item::Row { name, .. } => Some(name.clone()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(names("minimist"), ["lodash"]);
+        assert_eq!(names("snyk-js-foo"), ["eslint"]);
+        assert_eq!(names("pollution"), ["eslint"]);
+        assert_eq!(names("cve-2024"), ["eslint"]);
     }
 }
