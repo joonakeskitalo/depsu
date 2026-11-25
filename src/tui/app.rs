@@ -1872,14 +1872,14 @@ impl App {
                     r.status = Status::Failed;
                 }
                 self.push_log(format!("✘ failed {}:", what.join(", ")));
-                for line in e
-                    .lines()
-                    .rev()
-                    .take(6)
-                    .collect::<Vec<_>>()
-                    .into_iter()
-                    .rev()
-                {
+                // The whole output: npm puts the reason (e.g. an ERESOLVE tree) at the top, and
+                // only a pointer to its own log file at the end.
+                let lines: Vec<&str> = e.lines().map(str::trim_end).filter(|l| !l.is_empty()).collect();
+                let skipped = lines.len().saturating_sub(MAX_FAILURE_LINES);
+                if skipped > 0 {
+                    self.push_log(format!("  … {skipped} earlier line(s) left out"));
+                }
+                for line in &lines[skipped..] {
                     self.push_log(format!("  {line}"));
                 }
                 // The cause goes last, where the collapsed log shows it. A refused package
@@ -5680,6 +5680,8 @@ fn install_failure_cause(output: &str) -> Option<String> {
     None
 }
 
+/// How many lines of a failed package manager command's output go to the log.
+const MAX_FAILURE_LINES: usize = 300;
 /// How long one package manager command may run before depsu kills it. A command that never
 /// ends (a proxy that keeps retrying, a hung registry) would otherwise block every later job.
 const PM_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10 * 60);
@@ -5778,7 +5780,12 @@ fn run_pm(dir: &std::path::Path, pm: Pm, args: &[String]) -> Result<(), String> 
     if status.success() {
         return Ok(());
     }
-    let text = if stderr.trim().is_empty() { stdout } else { stderr };
+    let text = match (stderr.trim().is_empty(), stdout.trim().is_empty()) {
+        (true, _) => stdout,
+        (false, true) => stderr,
+        // Some tools report the reason on stdout and the details on stderr.
+        (false, false) => format!("{}\n{}", stdout.trim_end(), stderr),
+    };
     Err(format!(
         "`{} {}` exited with {}\n{}",
         pm.name(),
