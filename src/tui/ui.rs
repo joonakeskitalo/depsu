@@ -2066,7 +2066,9 @@ fn detail_lines(
             if let Some(cve) = v.cve.first() {
                 t.push_str(&format!("  · {cve}"));
             }
-            (t, String::new(), Style::new().fg(severity_color(v.severity)))
+            // A finding a `.snyk` rule covers is dimmed, even before a scan moves it away.
+            let color = if app.ignore_for(v).is_some() { Color::DarkGray } else { severity_color(v.severity) };
+            (t, String::new(), Style::new().fg(color))
         }
         Child::Ignored(i) => {
             let v = &r.ignored[i];
