@@ -1219,8 +1219,8 @@ fn header_lines(app: &App, width: u16) -> (Vec<Line<'static>>, Vec<Placed>) {
     if !app.show_vulns {
         info.push(("vulns hidden".to_string(), Some('v')));
     }
-    if app.show_overrides != Overrides::Off {
-        info.push((format!("overrides: {}", app.show_overrides.label()), Some('o')));
+    if app.show_overrides == Overrides::Off {
+        info.push(("overrides hidden".to_string(), Some('o')));
     }
     if !app.show_uptodate {
         info.push(("up-to-date hidden".to_string(), None));

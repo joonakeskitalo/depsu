@@ -870,7 +870,7 @@ impl App {
             pm,
             rows: Vec::new(),
             table: ListState::default(),
-            show_overrides: Overrides::Off,
+            show_overrides: Overrides::Full,
             show_uptodate: true,
             show_vulns: true,
             show_info: false,

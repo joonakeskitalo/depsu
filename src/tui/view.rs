@@ -49,13 +49,6 @@ impl Overrides {
             Overrides::Off => Overrides::Full,
         }
     }
-
-    pub fn label(self) -> &'static str {
-        match self {
-            Overrides::Off => "hidden",
-            Overrides::Full => "shown",
-        }
-    }
 }
 
 

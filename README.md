@@ -103,7 +103,7 @@ deprecation message and the checksum. Dependency changes compare with the lockfi
 (`git show`). The size is that of the installed copy, its own `node_modules` left out.
 ### Mouse
 - Click an item in the list to move the cursor to it. Click the mark (`○`, `●`) in front of a package or group to check it.
-- Click a key hint in the footer to press that key. Click a header item (`group: …`, `vulns hidden`, `overrides: …`, a scan result) to run its key. Click the `selected:` heading to toggle the details panel.
+- Click a key hint in the footer to press that key. Click a header item (`group: …`, `vulns hidden`, `overrides hidden`, a scan result) to run its key. Click the `selected:` heading to toggle the details panel.
 - Click the log at the bottom to expand it. The list stays visible above it: click a package to give the keys back to the list, click the log to return to it. The wheel scrolls whichever the pointer is over.
 - In dialogs, click the footer hints, a peer fix option or an `Add as` choice.
 - The wheel moves the cursor in the list and scrolls the details panel and the expanded log.
@@ -168,8 +168,8 @@ dist-tag. Prereleases are ignored. Specs that are not a plain version or range (
 ### Overrides
 
 Overrides come from `overrides` (npm, bun), `resolutions` (yarn, bun) or `pnpm.overrides` (pnpm).
-Only the field your package manager honours is read. By default they are hidden; press `o` to list
-them under each package.
+Only the field your package manager honours is read. They are listed under each package; press
+`o` to hide them.
 
 **Markers** next to a package name:
 
