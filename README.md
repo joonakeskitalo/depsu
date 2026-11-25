@@ -61,6 +61,8 @@ depsu --cache .depsu-cache.json   # remember versions and scans between runs
 |---|---|
 | `-C`, `--dir <PATH>` | Project directory (default: current directory) |
 | `--pm <NAME>` | Force the package manager: `npm`, `yarn`, `pnpm` or `bun` |
+| `--pm-cache <DIR>` | Keep the package manager's download cache in `DIR` (created if missing; a relative path is taken from where you start depsu). Passed as `--cache` to npm, `--store-dir` to pnpm, `--cache-folder` to Yarn 1, and as `YARN_CACHE_FOLDER` / `BUN_INSTALL_CACHE_DIR` to Yarn 2+ / bun |
+| `--prefer-offline` | Pass `--prefer-offline` to npm, pnpm and Yarn 1, so cached packages are used without asking the registry whether they are stale. Combine with `--pm-cache`. Yarn 2+ and bun have no such flag and ignore it |
 | `--cache <FILE>` | JSON file that stores the latest versions, and the Snyk / audit findings per project and package version. One file can be shared by several projects: latest versions are shared, scan results are kept apart per project directory. Read at start, updated as results arrive. A file that can't be parsed is left untouched and not used |
 | `-h`, `--help` / `-V`, `--version` | |
 

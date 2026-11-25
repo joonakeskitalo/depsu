@@ -5502,30 +5502,103 @@ fn install_failure_cause(output: &str) -> Option<String> {
     None
 }
 
-fn run_pm(dir: &std::path::Path, pm: Pm, args: &[String]) -> Result<(), String> {
-    match Command::new(pm.program())
-        .args(args)
-        .current_dir(dir)
-        .output()
-    {
-        Ok(o) if o.status.success() => Ok(()),
-        Ok(o) => {
-            let mut text = String::from_utf8_lossy(&o.stderr).into_owned();
-            if text.trim().is_empty() {
-                text = String::from_utf8_lossy(&o.stdout).into_owned();
-            }
-            Err(format!(
-                "`{} {}` exited with {}\n{}",
-                pm.name(),
-                args.join(" "),
-                o.status,
-                text.trim()
-            ))
-        }
-        Err(e) => Err(format!("could not run {}: {e}", pm.name())),
+/// How long one package manager command may run before depsu kills it. A command that never
+/// ends (a proxy that keeps retrying, a hung registry) would otherwise block every later job.
+const PM_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10 * 60);
+/// Process id of the package manager command running now, so quitting can stop it.
+static RUNNING_PM: std::sync::Mutex<Option<u32>> = std::sync::Mutex::new(None);
+/// Kills the running package manager command and the processes it started.
+pub fn kill_running_pm() {
+    if let Some(pid) = RUNNING_PM.lock().ok().and_then(|mut p| p.take()) {
+        kill_tree(pid);
     }
 }
-
+fn kill_tree(pid: u32) {
+    #[cfg(unix)]
+    {
+        // The command leads its own process group (see `run_pm`), so `-pid` reaches its children.
+        let _ = Command::new("kill").args(["-KILL", "--", &format!("-{pid}")]).output();
+    }
+    #[cfg(windows)]
+    {
+        let _ = Command::new("taskkill").args(["/F", "/T", "/PID", &pid.to_string()]).output();
+    }
+}
+fn read_all<R: std::io::Read + Send + 'static>(r: Option<R>) -> Receiver<String> {
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        let mut buf = Vec::new();
+        if let Some(mut r) = r {
+            let _ = r.read_to_end(&mut buf);
+        }
+        let _ = tx.send(String::from_utf8_lossy(&buf).into_owned());
+    });
+    rx
+}
+fn run_pm(dir: &std::path::Path, pm: Pm, args: &[String]) -> Result<(), String> {
+    let modern_yarn = pm == Pm::Yarn && crate::config::yarnrc::is_yarn_modern(dir);
+    let (mut cache_args, cache_env) = crate::config::pm::cache_dir()
+        .map(|d| pm.cache_setup(d, modern_yarn))
+        .unwrap_or_default();
+    if crate::config::pm::prefer_offline() {
+        cache_args.extend(pm.offline_args(modern_yarn));
+    }
+    let mut cmd = Command::new(pm.program());
+    cmd.args(args)
+        .args(&cache_args)
+        .envs(cache_env)
+        .current_dir(dir)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    #[cfg(unix)]
+    std::os::unix::process::CommandExt::process_group(&mut cmd, 0);
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| format!("could not run {}: {e}", pm.name()))?;
+    let pid = child.id();
+    if let Ok(mut p) = RUNNING_PM.lock() {
+        *p = Some(pid);
+    }
+    let (out, err) = (read_all(child.stdout.take()), read_all(child.stderr.take()));
+    let started = std::time::Instant::now();
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(st)) => break Ok(st),
+            Ok(None) if started.elapsed() > PM_TIMEOUT => {
+                kill_tree(pid);
+                let _ = child.kill();
+                let _ = child.wait();
+                break Err(format!(
+                    "`{} {}` was stopped after {} minutes without finishing",
+                    pm.name(),
+                    args.join(" "),
+                    PM_TIMEOUT.as_secs() / 60
+                ));
+            }
+            Ok(None) => thread::sleep(std::time::Duration::from_millis(100)),
+            Err(e) => break Err(format!("could not wait for {}: {e}", pm.name())),
+        }
+    };
+    if let Ok(mut p) = RUNNING_PM.lock() {
+        *p = None;
+    }
+    // Leftover processes of the command may still hold the pipes; don't wait for them long.
+    let grab = |rx: Receiver<String>| rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap_or_default();
+    let (stdout, stderr) = (grab(out), grab(err));
+    let status = status?;
+    if status.success() {
+        return Ok(());
+    }
+    let text = if stderr.trim().is_empty() { stdout } else { stderr };
+    Err(format!(
+        "`{} {}` exited with {}\n{}",
+        pm.name(),
+        args.join(" "),
+        status,
+        text.trim()
+    ))
+}
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -80,6 +80,27 @@ impl Pm {
         a
     }
 
+    /// Flags and environment variables that make the package manager keep its download cache in
+    /// `dir`. `modern_yarn` is Yarn 2+, which has no such flag and reads the environment instead.
+    pub fn cache_setup(self, dir: &str, modern_yarn: bool) -> (Vec<String>, Vec<(String, String)>) {
+        let env = |k: &str| vec![(k.to_string(), dir.to_string())];
+        match self {
+            Pm::Npm => (vec![format!("--cache={dir}")], Vec::new()),
+            Pm::Pnpm => (vec![format!("--store-dir={dir}")], Vec::new()),
+            Pm::Yarn if modern_yarn => (Vec::new(), env("YARN_CACHE_FOLDER")),
+            Pm::Yarn => (vec![format!("--cache-folder={dir}")], Vec::new()),
+            Pm::Bun => (Vec::new(), env("BUN_INSTALL_CACHE_DIR")),
+        }
+    }
+    /// Flags that make the package manager use cached packages without asking the registry
+    /// whether they are stale. Yarn 2+ and bun have no such flag.
+    pub fn offline_args(self, modern_yarn: bool) -> Vec<String> {
+        match self {
+            Pm::Npm | Pm::Pnpm => vec!["--prefer-offline".into()],
+            Pm::Yarn if !modern_yarn => vec!["--prefer-offline".into()],
+            _ => Vec::new(),
+        }
+    }
     pub fn uninstall_args(self, names: &[String]) -> Vec<String> {
         let mut a: Vec<String> = vec![if self == Pm::Npm { "uninstall" } else { "remove" }.into()];
         a.extend(names.iter().cloned());
@@ -96,6 +117,21 @@ impl Pm {
     }
 }
 
+static CACHE_DIR: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+/// Sets the directory for the package manager's download cache (once, at startup).
+pub fn set_cache_dir(dir: String) {
+    let _ = CACHE_DIR.set(dir);
+}
+pub fn cache_dir() -> Option<&'static str> {
+    CACHE_DIR.get().map(String::as_str)
+}
+static PREFER_OFFLINE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+pub fn set_prefer_offline() {
+    PREFER_OFFLINE.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+pub fn prefer_offline() -> bool {
+    PREFER_OFFLINE.load(std::sync::atomic::Ordering::Relaxed)
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -119,5 +155,23 @@ mod tests {
             Pm::Yarn.install_args(&s, Kind::Prod, true),
             ["add", "a@^1.0.0", "--exact"]
         );
+    }
+    #[test]
+    fn cache_dir_is_passed_the_way_each_manager_takes_it() {
+        assert_eq!(Pm::Npm.cache_setup("/c", false), (vec!["--cache=/c".to_string()], vec![]));
+        assert_eq!(Pm::Pnpm.cache_setup("/c", false).0, ["--store-dir=/c"]);
+        assert_eq!(Pm::Yarn.cache_setup("/c", false).0, ["--cache-folder=/c"]);
+        let (flags, env) = Pm::Yarn.cache_setup("/c", true);
+        assert!(flags.is_empty());
+        assert_eq!(env, [("YARN_CACHE_FOLDER".to_string(), "/c".to_string())]);
+        assert_eq!(Pm::Bun.cache_setup("/c", false).1[0].0, "BUN_INSTALL_CACHE_DIR");
+    }
+    #[test]
+    fn prefer_offline_is_passed_where_supported() {
+        assert_eq!(Pm::Npm.offline_args(false), ["--prefer-offline"]);
+        assert_eq!(Pm::Pnpm.offline_args(false), ["--prefer-offline"]);
+        assert_eq!(Pm::Yarn.offline_args(false), ["--prefer-offline"]);
+        assert!(Pm::Yarn.offline_args(true).is_empty());
+        assert!(Pm::Bun.offline_args(false).is_empty());
     }
 }

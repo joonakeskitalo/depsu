@@ -18,6 +18,12 @@ USAGE:
 OPTIONS:
     -C, --dir <PATH>   Project directory (default: current directory)
         --pm <NAME>    Force package manager: npm, yarn, pnpm or bun
+        --pm-cache <DIR>
+                       Keep the package manager's download cache in DIR (npm --cache,
+                       pnpm --store-dir, yarn cache folder, bun cache dir)
+        --prefer-offline
+                       Use cached packages without checking the registry for newer
+                       metadata (npm, pnpm and Yarn 1; ignored by Yarn 2+ and bun)
         --cache <FILE> JSON file that remembers latest versions and scans between runs
     -h, --help         Print help
     -V, --version      Print version
@@ -87,6 +93,16 @@ fn main() -> Result<()> {
                 Some(p) => cache_path = Some(p.into()),
                 None => bail!("{arg} requires a value"),
             },
+            "--pm-cache" => match args.next() {
+                Some(d) => {
+                    // Package managers run in the project directory, so the path must not be relative.
+                    let path = std::path::absolute(&d)?;
+                    std::fs::create_dir_all(&path)?;
+                    config::pm::set_cache_dir(path.to_string_lossy().into_owned());
+                }
+                None => bail!("{arg} requires a value"),
+            },
+            "--prefer-offline" => config::pm::set_prefer_offline(),
             "--pm" => {
                 let v = args.next().unwrap_or_default();
                 match config::pm::Pm::parse(&v) {
@@ -130,6 +146,8 @@ fn main() -> Result<()> {
         hook(info);
     }));
     let result = run(&mut terminal, &mut app);
+    // Don't leave a running install behind when quitting.
+    tui::app::kill_running_pm();
     let _ = std::io::stdout().execute(DisableMouseCapture);
     ratatui::restore();
     result
