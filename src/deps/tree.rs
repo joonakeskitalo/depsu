@@ -172,7 +172,7 @@ impl Analyzer {
                     via,
                     installed: installed.clone(),
                     requested: requested.clone(),
-                    risk: risk(o, requested),
+                    risk: risk_with(o, requested, installed.as_ref()),
                 });
             }
 
@@ -584,6 +584,20 @@ pub fn installed_version(dir: &Path, name: &str) -> Option<Version> {
         .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
         .and_then(|j| Version::parse(j.get("version")?.as_str()?).ok())
 }
+/// Like `risk`, but a value that can't be compared as written (`$name`, a range) is judged by
+/// the version that ended up installed.
+pub fn risk_with(o: &Override, requested: &str, installed: Option<&Version>) -> Compat {
+    let by_value = risk(o, requested);
+    let comparable = Version::parse(&o.value).is_ok() || o.value == requested;
+    if comparable {
+        return by_value;
+    }
+    match installed.and_then(|v| satisfies(requested, v)) {
+        Some(true) => Compat::Ok,
+        Some(false) => Compat::Conflict,
+        None => by_value,
+    }
+}
 pub fn risk(o: &Override, requested: &str) -> Compat {
     if o.value.starts_with('$') || o.value == requested {
         return Compat::Ok;
@@ -616,6 +630,27 @@ mod tests {
         let d = dir.join(pkg_path);
         std::fs::create_dir_all(&d).unwrap();
         std::fs::write(d.join("package.json"), json).unwrap();
+    }
+
+    #[test]
+    fn a_value_that_cannot_be_compared_is_judged_by_the_installed_version() {
+        let o = |value: &str| Override {
+            name: "qs".into(),
+            range: None,
+            value: value.into(),
+            source: "overrides",
+            path: Vec::new(),
+            loc: vec!["overrides".into(), "qs".into()],
+        };
+        let v = |s: &str| Version::parse(s).unwrap();
+        // Exact values are compared as written, whatever is installed.
+        assert_eq!(risk_with(&o("6.5.0"), "^6.0.0", Some(&v("1.0.0"))), Compat::Ok);
+        assert_eq!(risk_with(&o("$qs"), "^6.0.0", Some(&v("6.5.0"))), Compat::Ok);
+        assert_eq!(risk_with(&o("$qs"), "^6.0.0", Some(&v("5.0.0"))), Compat::Conflict);
+        assert_eq!(risk_with(&o("^5"), "^6.0.0", Some(&v("5.1.0"))), Compat::Conflict);
+        // Nothing installed to judge by: as before.
+        assert_eq!(risk_with(&o("$qs"), "^6.0.0", None), Compat::Ok);
+        assert_eq!(risk_with(&o("^5"), "^6.0.0", None), Compat::Unknown);
     }
 
     #[test]

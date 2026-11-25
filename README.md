@@ -31,7 +31,9 @@ Illustrative output:
   prefix or by dependency type (dependencies, dev dependencies, optional dependencies, overrides), and
   filter by name.
 - **Overrides.** Shows overridden packages, checks that an update is compatible with the override,
-  finds overrides that are probably no longer needed, and can update or remove them.
+  finds overrides that are probably no longer needed, and can update or remove them. An override that forces
+  a version outside the range the packages it reaches declare is marked `⚠` and lists them with the ranges
+  they accept.
 - **Vulnerabilities.** Lists vulnerabilities per dependency from Snyk, `npm audit` or `bun audit`,
   and installs the version they suggest.
 

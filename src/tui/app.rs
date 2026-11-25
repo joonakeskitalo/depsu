@@ -2092,27 +2092,79 @@ impl App {
         out
     }
 
+    /// What the installed packages an override reaches declare for the overridden package, set
+    /// against the override's value. An override limited to `a > b` reaches what `b` (or
+    /// everything below the direct dependency `b`) depends on. A value that isn't an exact
+    /// version (`$name`, a range) is compared by the version that is installed instead.
+    pub fn override_support(&self, o: &Override) -> OverrideSupport {
+        let parent = o.path.last().map(|p| overrides::split_name(p).0);
+        // The version the override sets, or for `$name` and ranges the one that is installed.
+        let value = Version::parse(&o.value)
+            .ok()
+            .or_else(|| self.rows.iter().find(|r| r.name == o.name).and_then(|r| r.installed.clone()));
+        let mut conflicts = Vec::new();
+        let mut ranges = std::collections::BTreeSet::new();
+        for d in self.dependents_of(&o.name) {
+            if let Some(p) = &parent
+                && d.name != *p
+                && d.direct != *p
+            {
+                continue;
+            }
+            if d.range.is_empty() {
+                continue;
+            }
+            ranges.insert(d.range.clone());
+            if let Some(v) = &value
+                && overrides::satisfies(&d.range, v) == Some(false)
+            {
+                let at = d.version.as_ref().map(|v| format!("@{v}")).unwrap_or_default();
+                conflicts.push(format!("{}{at} (wants {})", d.name, d.range));
+            }
+        }
+        conflicts.sort();
+        conflicts.dedup();
+        OverrideSupport { conflicts, ranges: ranges.into_iter().collect() }
+    }
     /// The installed packages that an override of `name` to `version` would reach, but that
     /// declare a range `version` is outside of: `body-parser@1.19.0 (wants ~6.7.0)`. With a
     /// scope, only the packages it reaches.
     fn pin_rejecters(&self, name: &str, version: &Version, scope: Option<&Scope>) -> Vec<String> {
-        let mut out: Vec<String> = self
-            .dependents_of(name)
-            .into_iter()
-            .filter(|d| match scope {
+        self.pin_support(name, Some(version), scope).conflicts
+    }
+    /// The ranges the installed packages that an override of `name` (limited to `scope`)
+    /// would reach declare for it, and which of them `version` is outside of.
+    fn pin_support(&self, name: &str, version: Option<&Version>, scope: Option<&Scope>) -> OverrideSupport {
+        let mut conflicts = Vec::new();
+        let mut ranges = std::collections::BTreeSet::new();
+        for d in self.dependents_of(name) {
+            let reached = match scope {
                 Some(s) if s.deep => d.direct == s.parent,
                 Some(s) => d.name == s.parent,
                 None => true,
-            })
-            .filter(|d| overrides::satisfies(&d.range, version) == Some(false))
-            .map(|d| {
+            };
+            if !reached || d.range.is_empty() {
+                continue;
+            }
+            ranges.insert(d.range.clone());
+            if let Some(v) = version
+                && overrides::satisfies(&d.range, v) == Some(false)
+            {
                 let at = d.version.as_ref().map(|v| format!("@{v}")).unwrap_or_default();
-                format!("{}{at} (wants {})", d.name, d.range)
-            })
-            .collect();
-        out.sort();
-        out.dedup();
-        out
+                conflicts.push(format!("{}{at} (wants {})", d.name, d.range));
+            }
+        }
+        conflicts.sort();
+        conflicts.dedup();
+        OverrideSupport { conflicts, ranges: ranges.into_iter().collect() }
+    }
+    /// The ranges the packages above the vulnerable package in `v` declare for it, which are
+    /// the versions of it they accept. Empty for a finding in a direct dependency itself.
+    pub fn accepted_ranges(&self, v: &Vuln) -> Vec<String> {
+        if v.package == v.direct {
+            return Vec::new();
+        }
+        self.pin_support(&v.package, None, self.pin_scope(v).as_ref()).ranges
     }
     /// The installed packages that declare `name` as a peer in a range `to` is outside of:
     /// upgrading `name` to `to` breaks them. (Packages that list it as a regular dependency
@@ -4604,6 +4656,13 @@ impl App {
             ..Default::default()
         });
     }
+}
+/// The ranges that the packages an override reaches declare for the overridden package.
+pub struct OverrideSupport {
+    /// The packages whose range the override's value is outside of: `body-parser@1.19.0 (wants ~6.7.0)`.
+    pub conflicts: Vec<String>,
+    /// Every range they declare, each once, i.e. the versions that would be supported.
+    pub ranges: Vec<String>,
 }
 /// An override that pins a vulnerable transitive package to a fixed version.
 struct Pin {
@@ -8865,5 +8924,157 @@ mod tests {
         let on_disk = Cache::load(&path).unwrap();
         let kept = on_disk.scans(&one.project_key()).and_then(|s| s.findings("snyk", "a", "1.0.0"));
         assert!(kept.is_some(), "the scan of the other project survived");
+    }
+
+    fn dependent(name: &str, version: &str, range: &str, direct: &str) -> Dependent {
+        Dependent {
+            name: name.into(),
+            version: Some(Version::parse(version).unwrap()),
+            range: range.into(),
+            direct: direct.into(),
+        }
+    }
+    #[test]
+    fn an_override_is_checked_against_what_its_dependents_declare() {
+        let (mut app, _rx) = app_capturing_installs();
+        app.dependents.insert(
+            "qs".into(),
+            vec![
+                dependent("body-parser", "1.19.0", "~6.7.0", "express"),
+                dependent("express", "4.17.1", "^6.0.0", "express"),
+                dependent("other", "1.0.0", "^5.0.0", "other"),
+            ],
+        );
+        // Everywhere: all three are reached, and 6.5.0 is outside two of the ranges.
+        let s = app.override_support(&ovr("qs", "6.5.0", "qs"));
+        assert_eq!(s.conflicts, ["body-parser@1.19.0 (wants ~6.7.0)", "other@1.0.0 (wants ^5.0.0)"]);
+        assert_eq!(s.ranges, ["^5.0.0", "^6.0.0", "~6.7.0"]);
+        // 6.7.1 is accepted by two of them; `other` wants 5.
+        assert_eq!(app.override_support(&ovr("qs", "6.7.1", "qs")).conflicts, ["other@1.0.0 (wants ^5.0.0)"]);
+        // Limited to express: its own dependents and everything below it, not `other`.
+        let mut below = ovr("qs", "6.7.1", "express>qs");
+        below.path = vec!["express".into()];
+        let s = app.override_support(&below);
+        assert!(s.conflicts.is_empty(), "{:?}", s.conflicts);
+        assert_eq!(s.ranges, ["^6.0.0", "~6.7.0"]);
+        // `$name` and ranges can't be compared: the ranges are shown, nothing conflicts.
+        let s = app.override_support(&ovr("qs", "$qs", "qs"));
+        assert!(s.conflicts.is_empty() && s.ranges.len() == 3);
+        // Nothing depends on it.
+        assert!(app.override_support(&ovr("none", "1.0.0", "none")).ranges.is_empty());
+    }
+    #[test]
+    fn a_conflicting_override_is_marked_and_lists_the_supported_ranges() {
+        let (mut app, _rx) = app_capturing_installs();
+        let i = app.rows.iter().position(|r| r.name == "b").unwrap();
+        app.rows[i].overrides = vec![ovr("b", "2.0.0", "b")];
+        app.show_overrides = Overrides::Full;
+        app.dependents.insert("b".into(), vec![dependent("a", "1.0.0", "^1.0.0", "a")]);
+        app.rebuild_view();
+        let screen = render(&mut app, 140, 40).join("\n");
+        assert!(screen.contains("conflicts with a@1.0.0 (wants ^1.0.0); dependents accept ^1.0.0"), "{screen}");
+        // The same override at a version the dependent accepts has no conflict.
+        app.rows[i].overrides = vec![ovr("b", "1.2.0", "b")];
+        app.rebuild_view();
+        let screen = render(&mut app, 140, 40).join("\n");
+        assert!(!screen.contains("conflicts with"), "{screen}");
+        assert!(screen.contains("dependents accept ^1.0.0"), "{screen}");
+    }
+
+    #[test]
+    fn a_finding_in_a_nested_package_lists_the_versions_its_dependents_accept() {
+        let (mut app, _rx) = app_capturing_installs();
+        let i = app.rows.iter().position(|r| r.name == "a").unwrap();
+        let mut v = vuln("a", "1.0.0", "QS-1");
+        v.package = "qs".into();
+        v.version = "6.5.0".into();
+        v.path = vec!["body-parser".into(), "qs".into()];
+        app.rows[i].vulns = vec![v.clone()];
+        app.dependents.insert(
+            "qs".into(),
+            vec![
+                dependent("body-parser", "1.19.0", "~6.7.0", "a"),
+                dependent("express", "4.17.1", "^6.0.0", "a"),
+                // Below another direct dependency: not what an override under `a` reaches.
+                dependent("elsewhere", "1.0.0", "^5.0.0", "b"),
+            ],
+        );
+        assert_eq!(app.accepted_ranges(&v), ["^6.0.0", "~6.7.0"]);
+        app.show_overrides = Overrides::Full;
+        app.rebuild_view();
+        let screen = render(&mut app, 160, 40).join("\n");
+        assert!(screen.contains("dependents accept ^6.0.0, ~6.7.0"), "{screen}");
+        assert!(!screen.contains("^5.0.0"), "{screen}");
+        // A finding in the direct dependency itself has no dependents' ranges to show.
+        assert!(app.accepted_ranges(&vuln("a", "1.0.0", "A-1")).is_empty());
+    }
+
+    /// The text colour of the screen cell where `needle` starts.
+    fn fg_at(app: &mut App, needle: &str) -> Option<ratatui::style::Color> {
+        let (w, h) = (160, 40);
+        let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(w, h)).unwrap();
+        term.draw(|f| crate::tui::ui::draw(f, app)).unwrap();
+        let buf = term.backend().buffer().clone();
+        for y in 0..h {
+            let line: Vec<String> = (0..w).map(|x| buf[(x, y)].symbol().to_string()).collect();
+            let text = line.concat();
+            if let Some(byte) = text.find(needle) {
+                let x = text[..byte].chars().count();
+                return Some(buf[(x as u16, y)].fg);
+            }
+        }
+        None
+    }
+    #[test]
+    fn a_version_the_dependents_dont_support_is_drawn_in_bright_red() {
+        use ratatui::style::Color;
+        let (mut app, _rx) = app_capturing_installs();
+        let i = app.rows.iter().position(|r| r.name == "b").unwrap();
+        app.rows[i].overrides = vec![ovr("b", "2.0.0", "b")];
+        app.show_overrides = Overrides::Full;
+        app.dependents.insert("b".into(), vec![dependent("a", "1.0.0", "^1.0.0", "a")]);
+        app.rebuild_view();
+        assert_eq!(fg_at(&mut app, "(conflicts with"), Some(Color::LightRed));
+        // The override itself keeps its colour; only the problem stands out.
+        assert_ne!(fg_at(&mut app, "overrides: b"), Some(Color::LightRed));
+        // An overridden package's own row says it, even where the override isn't listed under it.
+        app.rows[i].kind = Kind::Override;
+        app.show_overrides = Overrides::Off;
+        app.rebuild_view();
+        let screen = render(&mut app, 160, 40).join("\n");
+        assert!(screen.contains("⚠ unsupported by a@1.0.0 (wants ^1.0.0)"), "{screen}");
+        assert_eq!(fg_at(&mut app, "⚠ unsupported by"), Some(Color::LightRed));
+        // At a version `a` supports, nothing is shown.
+        app.rows[i].overrides = vec![ovr("b", "1.2.0", "b")];
+        app.rebuild_view();
+        let screen = render(&mut app, 160, 40).join("\n");
+        assert!(!screen.contains("unsupported by"), "{screen}");
+        // A `$name` or range value is judged by the version that is installed.
+        app.rows[i].overrides = vec![ovr("b", "$b", "b")];
+        app.rows[i].installed = Some(Version::new(2, 0, 0));
+        assert_eq!(app.override_support(&app.rows[i].overrides[0].clone()).conflicts, ["a@1.0.0 (wants ^1.0.0)"]);
+    }
+
+    #[test]
+    fn the_overrides_listed_under_a_package_show_unsupported_versions_in_bright_red() {
+        use ratatui::style::Color;
+        let (mut app, _rx) = app_capturing_installs();
+        let i = app.rows.iter().position(|r| r.name == "a").unwrap();
+        let over = ovr("qs", "$qs", "qs");
+        // `$qs` can't be compared as written; the installed 2.0.0 is outside what the parent wants.
+        let risk = crate::deps::tree::risk_with(&over, "^1.0.0", Some(&Version::new(2, 0, 0)));
+        assert_eq!(risk, Compat::Conflict);
+        app.rows[i].tree_hits = vec![Hit {
+            over,
+            via: vec!["body-parser".into(), "qs".into()],
+            installed: Some(Version::new(2, 0, 0)),
+            requested: "^1.0.0".into(),
+            risk,
+        }];
+        app.show_overrides = Overrides::Full;
+        app.rebuild_view();
+        let screen = render(&mut app, 160, 40).join("\n");
+        assert!(screen.contains("↳ qs → $qs via body-parser > qs (wants ^1.0.0, installed 2.0.0)"), "{screen}");
+        assert_eq!(fg_at(&mut app, "via body-parser"), Some(Color::LightRed));
     }
 }

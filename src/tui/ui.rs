@@ -1681,7 +1681,8 @@ fn row_line(app: &App, r: &AppRow, indent: usize, name_w: usize, width: usize) -
         Release::Minor => Color::Yellow,
         Release::Patch => Color::Green,
     };
-    let (marker, marker_w) = override_marker(r);
+    let conflict = r.overrides.iter().any(|o| !app.override_support(o).conflicts.is_empty());
+    let (marker, marker_w) = override_marker(r, conflict);
     let mut spans = vec![Span::raw(format!(
         "{mark} {}{:<w$} ",
         " ".repeat(indent),
@@ -1720,6 +1721,24 @@ fn row_line(app: &App, r: &AppRow, indent: usize, name_w: usize, width: usize) -
         spans.push(Span::styled(r.new_spec(), Style::new().fg(color)));
     } else {
         spans.push(Span::styled("✓ up to date", Style::new().fg(Color::Green)));
+    }
+    // The installed packages whose declared range the override's version is outside of.
+    let mut unsupported: Vec<String> = r
+        .overrides
+        .iter()
+        .flat_map(|o| app.override_support(o).conflicts)
+        .collect();
+    unsupported.sort();
+    unsupported.dedup();
+    if !unsupported.is_empty() {
+        let used: usize = spans.iter().map(|s| s.width()).sum();
+        let full = format!("   ⚠ unsupported by {}", unsupported.join(", "));
+        let text = if used + full.chars().count() < width {
+            full
+        } else {
+            format!("   ⚠ unsupported by {} package{}", unsupported.len(), if unsupported.len() == 1 { "" } else { "s" })
+        };
+        spans.push(Span::styled(text, conflict_style()));
     }
     // An overridden package whose overrides are limited to several other packages: say where.
     // (Limited to one, the name says it: `b > qs`.)
@@ -1827,7 +1846,7 @@ fn row_line(app: &App, r: &AppRow, indent: usize, name_w: usize, width: usize) -
                 let n = conflicts.len();
                 format!("   ⚠ {n} override{} outside the wanted range", if n == 1 { "" } else { "s" })
             };
-            spans.push(Span::styled(text, override_style(true)));
+            spans.push(Span::styled(text, conflict_style()));
         }
     }
     // A package the lockfile lists without a checksum can't be verified when installed. Shown
@@ -1901,6 +1920,16 @@ fn override_style(conflict: bool) -> Style {
     let s = Style::new().fg(OVERRIDE);
     if conflict { s.add_modifier(Modifier::BOLD) } else { s }
 }
+/// A version the packages above don't support: bold bright red. Text colour only, since a
+/// background has poor contrast on many terminal themes; the `⚠` in front and the bright
+/// shade tell it apart from the plain red of high severity.
+fn conflict_style() -> Style {
+    // Not dimmed with the rest of an up-to-date row.
+    Style::new()
+        .fg(Color::LightRed)
+        .add_modifier(Modifier::BOLD)
+        .remove_modifier(Modifier::DIM)
+}
 fn compat_style(c: Compat) -> Style {
     override_style(c == Compat::Conflict)
 }
@@ -1916,19 +1945,20 @@ fn compat_symbol(c: Compat) -> &'static str {
 /// Compact marker next to the name, visible even when the nested lists are hidden:
 /// ⚑/?/⚠ for overrides on the package itself, ↳ for overrides in its dependency tree
 /// (yellow when one forces a version outside what its parent declared).
-fn override_marker(r: &AppRow) -> (Vec<Span<'static>>, usize) {
+fn override_marker(r: &AppRow, conflict: bool) -> (Vec<Span<'static>>, usize) {
     let mut spans = Vec::new();
     let mut width = 0;
-    if !r.overrides.is_empty() && r.lists_own_overrides() {
-        spans.push(Span::styled(
-            compat_symbol(r.compat),
-            compat_style(r.compat),
-        ));
+    // An override that forces a version outside what its dependents declare is shown even where
+    // the override itself isn't listed under the package.
+    let c = if conflict { Compat::Conflict } else { r.compat };
+    if !r.overrides.is_empty() && (r.lists_own_overrides() || conflict) {
+        let style = if c == Compat::Conflict { conflict_style() } else { compat_style(c) };
+        spans.push(Span::styled(compat_symbol(c), style));
         width += 1;
     }
     if !r.tree_hits.is_empty() {
         let risky = r.tree_hits.iter().any(|h| h.risk == Compat::Conflict);
-        spans.push(Span::styled("↳", override_style(risky)));
+        spans.push(Span::styled("↳", if risky { conflict_style() } else { override_style(false) }));
         width += 1;
     }
     // ✱: Snyk found vulnerabilities, coloured by the worst severity.
@@ -1980,6 +2010,8 @@ fn detail_lines(
         Span::styled(format!("  ⇢ {}", u.value), Style::new().fg(color))
     });
 
+    // The parts of the line about a version the packages above don't support.
+    let (mut rest_alert, mut tail_alert) = (false, false);
     let (text, tail, color) = match child {
         Child::Own(i) => {
             let o = &r.overrides[i];
@@ -1989,6 +2021,7 @@ fn detail_lines(
             } else {
                 format!("  ({note})")
             };
+            tail_alert = c == Compat::Conflict;
             (
                 format!("{} {}", compat_symbol(c), o.describe()),
                 tail,
@@ -2007,6 +2040,7 @@ fn detail_lines(
                     tail = format!("  ⚠ outside {} wanted by the parent", h.requested);
                 }
             }
+            (rest_alert, tail_alert) = (h.risk == Compat::Conflict, !tail.is_empty());
             (format!("↳ {}", hit_text(h)), tail, color)
         }
         Child::Vuln(i) => {
@@ -2069,10 +2103,13 @@ fn detail_lines(
         Span::styled(head, color),
     ];
     spans.extend(new_value);
-    spans.push(Span::styled(format!("{rest}{tail}"), color));
+    let alert = |on: bool| if on { conflict_style() } else { color };
+    spans.push(Span::styled(rest, alert(rest_alert)));
+    spans.push(Span::styled(tail, alert(tail_alert)));
     if let Child::Vuln(i) = child {
         spans.extend(ignore_spans(app, &r.vulns[i]));
         spans.extend(override_spans(app, &r.vulns[i]));
+        spans.extend(accepted_span(app, &r.vulns[i]));
         spans.extend(fix_spans(app, r, &r.vulns[i]));
     }
     if app.show_info
@@ -2203,6 +2240,22 @@ fn pin_conflict_span(who: &[String]) -> Option<Span<'static>> {
             Style::new().fg(Color::Yellow).add_modifier(Modifier::BOLD),
         )
     })
+}
+/// `· dependents accept ^5.0.0, ~6.7.0` on a finding in a package that something else brings
+/// in: the versions of it that the packages above it declare they work with.
+fn accepted_span(app: &App, v: &crate::security::vuln::Vuln) -> Option<Span<'static>> {
+    let ranges = app.accepted_ranges(v);
+    if ranges.is_empty() {
+        return None;
+    }
+    let shown = match ranges.len() > 4 {
+        true => format!("{}, … +{}", ranges[..4].join(", "), ranges.len() - 4),
+        false => ranges.join(", "),
+    };
+    Some(Span::styled(
+        format!("  · dependents accept {shown}"),
+        Style::new().fg(Color::DarkGray),
+    ))
 }
 fn fix_spans(app: &App, r: &AppRow, v: &crate::security::vuln::Vuln) -> Vec<Span<'static>> {
     let fixable = Style::new().fg(Color::Green).add_modifier(Modifier::BOLD);
@@ -2339,8 +2392,44 @@ fn orphan_lines(app: &App, key: &str, width: usize) -> Vec<Line<'static>> {
     wrap(Span::raw("  "), Span::raw("      "), spans, width)
 }
 
-/// Compatibility of the update of `r` with its own override `o`, and a short explanation.
+/// What the packages an override reaches declare for the overridden package, as a note, and
+/// whether the override is outside what some of them declare:
+/// `conflicts with body-parser@1.19.0 (wants ~6.7.0); dependents accept ~6.7.0, ^6.0.0`.
+fn support_note(app: &App, o: &Override) -> (bool, String) {
+    fn some(items: &[String], max: usize) -> String {
+        match items.len() > max {
+            true => format!("{}, … +{}", items[..max].join(", "), items.len() - max),
+            false => items.join(", "),
+        }
+    }
+    let s = app.override_support(o);
+    if s.ranges.is_empty() {
+        return (false, String::new());
+    }
+    let accepted = format!("dependents accept {}", some(&s.ranges, 4));
+    if s.conflicts.is_empty() {
+        (false, accepted)
+    } else {
+        (true, format!("conflicts with {}; {accepted}", some(&s.conflicts, 3)))
+    }
+}
+/// Compatibility of `o` with what the packages it reaches declare, and of the update of `r`
+/// with its own override, with a short explanation of both.
 fn own_override_note(app: &App, r: &AppRow, o: &Override) -> (Compat, String) {
+    let (mut c, mut note) = update_note(app, r, o);
+    let (conflict, support) = support_note(app, o);
+    if conflict {
+        c = Compat::Conflict;
+    }
+    if !support.is_empty() {
+        if !note.is_empty() {
+            note.push_str("; ");
+        }
+        note.push_str(&support);
+    }
+    (c, note)
+}
+fn update_note(app: &App, r: &AppRow, o: &Override) -> (Compat, String) {
     // Overridden packages aren't dependencies, so there is no dependency spec to clash with.
     // `b > qs` already says where it applies.
     if r.kind == Kind::Override {
@@ -2382,15 +2471,24 @@ fn summary_lines(app: &App, width: usize) -> Vec<Line<'static>> {
     };
     let r = &app.rows[*idx];
     let mut spans: Vec<Span<'static>> = Vec::new();
-    for o in r.overrides.iter().filter(|_| r.lists_own_overrides()) {
+    // An override that isn't listed under its package is still told about when the packages it
+    // reaches declare something to compare it with.
+    for o in r
+        .overrides
+        .iter()
+        .filter(|o| r.lists_own_overrides() || !app.override_support(o).ranges.is_empty())
+    {
         let (c, note) = own_override_note(app, r, o);
         let mut text = format!("{} {}", compat_symbol(c), o.describe());
         if let Some(u) = app.update_target(o) {
             text.push_str(&format!(" ⇢ {}", u.value));
         }
+        spans.push(Span::styled(text, compat_style(c)));
         if !note.is_empty() {
-            text.push_str(&format!(" ({note})"));
+            let style = if c == Compat::Conflict { conflict_style() } else { compat_style(c) };
+            spans.push(Span::styled(format!(" ({note})"), style));
         }
+        let mut text = String::new();
         if let Some(u) = app.unneeded(o) {
             text.push_str(&format!(" ✂ may be removed: {}", u.reason(o)));
         }
