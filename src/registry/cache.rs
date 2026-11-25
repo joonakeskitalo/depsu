@@ -62,7 +62,18 @@ impl Cache {
     }
 
     /// Writes the cache through a temporary file, so an interrupted write can't corrupt it.
+    /// The file may have been written by another depsu since this one read it (one file can
+    /// serve several projects), so what is in it is kept and this cache's entries are laid
+    /// over it.
     pub fn save(&mut self, path: &Path) -> Result<()> {
+        if let Ok(mut disk) = Cache::load(path) {
+            disk.latest.append(&mut self.latest.clone());
+            for (project, scans) in std::mem::take(&mut self.projects) {
+                disk.projects.entry(project).or_default().merge(scans);
+            }
+            self.latest = disk.latest;
+            self.projects = disk.projects;
+        }
         self.format = FORMAT;
         if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
             std::fs::create_dir_all(dir)
@@ -88,6 +99,24 @@ impl Cache {
 }
 
 impl Scans {
+    /// Adds the entries of `other`; where both have one, `other`'s wins.
+    fn merge(&mut self, other: Scans) {
+        for (scanner, packages) in other.0 {
+            let mine = self.0.entry(scanner).or_default();
+            for (package, versions) in packages {
+                mine.entry(package).or_default().extend(versions);
+            }
+        }
+    }
+    /// A list of findings that belongs to a scan as a whole and not to one package version
+    /// (`kind` is `unlisted` or `ignored`). Stored as a scanner of its own, so that it fits
+    /// the file format and older depsu versions skip it.
+    pub fn extra(&self, scanner: &str, kind: &str) -> Option<&[Vuln]> {
+        self.findings(&format!("{scanner}:{kind}"), "", "").map(|f| f.vulns.as_slice())
+    }
+    pub fn set_extra(&mut self, scanner: &str, kind: &str, vulns: Vec<Vuln>) {
+        self.set_findings(&format!("{scanner}:{kind}"), "", "", Findings { vulns, fix: None });
+    }
     /// The findings of `scanner` for `package` at `version`, if that version was scanned.
     pub fn findings(&self, scanner: &str, package: &str, version: &str) -> Option<&Findings> {
         self.0.get(scanner)?.get(package)?.get(version)
@@ -173,6 +202,43 @@ mod tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
 
+    #[test]
+    fn saving_keeps_what_another_depsu_wrote_meanwhile() {
+        let path = std::env::temp_dir().join(format!("depsu-merge-cache-{}.json", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let mut mine = Cache::default();
+        mine.scans_mut("/p/a").set_findings("snyk", "lodash", "4.17.15", Findings::default());
+        // Another depsu scans project b and writes the file after this one has read it.
+        let mut other = Cache::default();
+        other.latest.insert("react".into(), "19.0.0".into());
+        other.scans_mut("/p/b").set_findings("snyk", "react", "18.0.0", Findings { vulns: vec![vuln("SNYK-B")], fix: None });
+        other.scans_mut("/p/a").set_findings("snyk", "lodash", "4.17.20", Findings::default());
+        other.save(&path).unwrap();
+        mine.latest.insert("lodash".into(), "4.17.21".into());
+        mine.save(&path).unwrap();
+        let back = Cache::load(&path).unwrap();
+        assert_eq!(back.latest["react"], "19.0.0");
+        assert_eq!(back.latest["lodash"], "4.17.21");
+        assert_eq!(back.scans("/p/b").unwrap().findings("snyk", "react", "18.0.0").unwrap().vulns[0].id, "SNYK-B");
+        let a = back.scans("/p/a").unwrap();
+        assert!(a.findings("snyk", "lodash", "4.17.15").is_some());
+        assert!(a.findings("snyk", "lodash", "4.17.20").is_some(), "versions scanned elsewhere stay");
+        std::fs::remove_file(path).unwrap();
+    }
+    #[test]
+    fn a_rescan_replaces_the_findings_of_that_version() {
+        let path = std::env::temp_dir().join(format!("depsu-rescan-cache-{}.json", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let mut first = Cache::default();
+        first.scans_mut("/p").set_findings("snyk", "a", "1.0.0", Findings { vulns: vec![vuln("OLD")], fix: None });
+        first.save(&path).unwrap();
+        let mut second = Cache::load(&path).unwrap();
+        second.scans_mut("/p").set_findings("snyk", "a", "1.0.0", Findings::default());
+        second.save(&path).unwrap();
+        let back = Cache::load(&path).unwrap();
+        assert!(back.scans("/p").unwrap().findings("snyk", "a", "1.0.0").unwrap().vulns.is_empty());
+        std::fs::remove_file(path).unwrap();
+    }
     #[test]
     fn a_missing_file_is_an_empty_cache() {
         let path = std::env::temp_dir().join("depsu-no-such-cache.json");

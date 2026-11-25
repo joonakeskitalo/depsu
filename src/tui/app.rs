@@ -1121,6 +1121,20 @@ impl App {
                 scans.set_findings(source.label(), &r.name, &version, Findings { vulns, fix });
             }
         }
+        // Findings in packages that have no row, and (Snyk) the ones `.snyk` ignored, belong to
+        // the scan as a whole. Without them the totals would change when depsu is reopened.
+        let listed: HashSet<&str> = self.rows.iter().map(|r| r.name.as_str()).collect();
+        let unlisted: Vec<Vuln> = report
+            .vulns
+            .iter()
+            .filter(|v| !listed.contains(v.direct.as_str()))
+            .cloned()
+            .collect();
+        let scans = self.cache.scans_mut(&project);
+        scans.set_extra(source.label(), "unlisted", unlisted);
+        if source == Source::Snyk {
+            scans.set_extra(source.label(), "ignored", report.ignored.clone());
+        }
         if !mismatched.is_empty() {
             self.push_log(format!(
                 "⚠ {} scanned other versions than depsu sees: {}. node_modules may be out of date with the lockfile, run an install.",
@@ -1216,6 +1230,10 @@ impl App {
             let project_scans = self.cache.scans(&project);
             let mut report = Report::default();
             let mut missing = 0;
+            let unlisted = project_scans.and_then(|s| s.extra(source.label(), "unlisted"));
+            let ignored = project_scans.and_then(|s| s.extra(source.label(), "ignored"));
+            report.vulns.extend(unlisted.unwrap_or_default().iter().cloned());
+            report.ignored = ignored.unwrap_or_default().to_vec();
             for r in &self.rows {
                 match r
                     .scanned_version()
@@ -1230,9 +1248,10 @@ impl App {
                     None => missing += 1,
                 }
             }
-            if missing == self.rows.len() {
+            if missing == self.rows.len() && unlisted.is_none() {
                 continue; // nothing cached for these versions
             }
+            let ignored = ignored.map(<[Vuln]>::to_vec);
             self.push_log(if missing == 0 {
                 format!("… {} results loaded from the cache", source.label())
             } else {
@@ -1242,6 +1261,13 @@ impl App {
                 )
             });
             self.apply_scan(source, report, true);
+            // What the scan showed as ignored by `.snyk`, as the scan itself would have set it.
+            if source == Source::Snyk
+                && let Some(ignored) = ignored
+            {
+                self.policy_seen = Some(ignored);
+                self.refresh_findings();
+            }
         }
         self.rebuild_view();
     }
@@ -8786,5 +8812,61 @@ mod tests {
         assert!(dir.join("package.json").exists());
         // Already gone is fine.
         remove_node_modules(&dir).unwrap();
+    }
+
+    /// Opens the project of `app` again with the same cache file, like quitting and restarting.
+    fn reopen(app: &mut App) -> App {
+        app.flush_cache();
+        let deps = ["a", "b"]
+            .iter()
+            .map(|n| Dep { name: n.to_string(), spec: "^1.0.0".into(), kind: Kind::Prod })
+            .collect();
+        let mut again = App::start(
+            app.dir.clone(),
+            Pm::Npm,
+            deps,
+            Npmrc::load(&app.dir),
+            Vec::new(),
+            app.cache_path.clone(),
+        );
+        again.drain_events();
+        again
+    }
+    #[test]
+    fn a_reopened_app_shows_what_the_scan_showed() {
+        let mut app = app_with_cache("1.0.0", |_| {});
+        let mut report = Report::default();
+        report.vulns = vec![
+            vuln("a", "1.0.0", "A-1"),
+            // A finding in a package that has no row.
+            vuln("workspace-pkg", "2.0.0", "W-1"),
+        ];
+        report.ignored = vec![vuln("b", "1.0.0", "B-IGNORED")];
+        app.apply_scan(Source::Snyk, report, false);
+        let before = app.snyk.status.clone();
+        let again = reopen(&mut app);
+        assert_eq!(again.snyk.status, before, "totals after reopening");
+        assert_eq!(row(&again, "b").ignored.len(), row(&app, "b").ignored.len(), "ignored findings");
+    }
+    #[test]
+    fn two_apps_sharing_a_cache_file_keep_each_others_scans() {
+        let mut one = app_with_cache("1.0.0", |_| {});
+        let path = one.cache_path.clone().unwrap();
+        // A second project, started from the same file before `one` scans.
+        let other_dir = one.dir.join("other");
+        std::fs::create_dir_all(&other_dir).unwrap();
+        let mut two = App::start(other_dir.clone(), Pm::Npm, Vec::new(), Npmrc::load(&other_dir), Vec::new(), Some(path.clone()));
+        two.drain_events();
+        let mut report = Report::default();
+        report.vulns = vec![vuln("a", "1.0.0", "A-1")];
+        one.apply_scan(Source::Snyk, report, false);
+        one.flush_cache();
+        // `two` saves later, from the copy it read at the start.
+        two.cache.latest.insert("zzz".into(), "1.0.0".into());
+        two.cache_dirty = true;
+        two.flush_cache();
+        let on_disk = Cache::load(&path).unwrap();
+        let kept = on_disk.scans(&one.project_key()).and_then(|s| s.findings("snyk", "a", "1.0.0"));
+        assert!(kept.is_some(), "the scan of the other project survived");
     }
 }
