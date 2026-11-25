@@ -651,6 +651,8 @@ pub struct App {
     /// Who committed each override (by key), and when.
     override_origins: HashMap<String, Origin>,
     pub ignore_prompt: Option<IgnorePrompt>,
+    /// The reason of the last ignore saved, offered again in the next new ignore. Not stored.
+    last_ignore_reason: String,
     /// What the last Snyk scan of this session said `.snyk` ignores (ID and path). `None`
     /// until a scan ran, and again after `.snyk` changed.
     policy_seen: Option<Vec<Vuln>>,
@@ -893,6 +895,7 @@ impl App {
             policy_origins: HashMap::new(),
             override_origins: HashMap::new(),
             ignore_prompt: None,
+            last_ignore_reason: String::new(),
             policy_seen: None,
             policy_carried: HashMap::new(),
             confirm_unignore: None,
@@ -5036,7 +5039,7 @@ impl App {
             id: id.to_string(),
             title: title.to_string(),
             path: crate::tui::textfield::TextField::new(path),
-            reason: crate::tui::textfield::TextField::new(rule.map_or("", |r| r.reason.as_str())),
+            reason: crate::tui::textfield::TextField::new(rule.map_or(self.last_ignore_reason.as_str(), |r| r.reason.as_str())),
             expires: crate::tui::textfield::TextField::new(expires),
             editing: rule.map(|r| (r.id.clone(), r.path.clone())),
             field: IgnoreField::Reason,
@@ -5178,6 +5181,7 @@ impl App {
         match policy::add(&self.dir, &id, &path, &reason, expires.as_deref()) {
             Ok(lost) => {
                 self.ignore_prompt = None;
+                self.last_ignore_reason = reason;
                 self.push_log(format!(
                     "✔ ignoring {id} in .snyk on {path}{}. Run Snyk again to see the effect.",
                     expires.map(|e| format!(" until {e}")).unwrap_or_default()
@@ -8653,6 +8657,21 @@ mod tests {
         assert!(app.ignore_prompt.is_none());
     }
 
+    #[test]
+    fn the_last_reason_is_offered_again_in_the_next_ignore() {
+        let mut app = app_with_three_findings();
+        cursor_on_finding(&mut app, "NESTED");
+        app.on_key(key('x'));
+        assert_eq!(app.ignore_prompt.as_ref().unwrap().reason.text(), "");
+        type_text(&mut app, "dev tool only");
+        press(&mut app, KeyCode::Enter);
+        assert!(app.ignore_prompt.is_none());
+        let other = app.rows.iter().flat_map(|r| &r.vulns).map(|v| v.id.clone()).find(|id| id != "NESTED").unwrap();
+        cursor_on_finding(&mut app, &other);
+        app.on_key(key('x'));
+        assert_eq!(app.ignore_prompt.as_ref().unwrap().reason.text(), "dev tool only");
+        press(&mut app, KeyCode::Esc);
+    }
     fn cursor_on_policy(app: &mut App, id: &str) {
         let pos = app
             .view
