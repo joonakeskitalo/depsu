@@ -238,7 +238,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     let name_w = app
         .rows
         .iter()
-        .map(|r| r.name.chars().count() + indent)
+        .map(|r| display_name(r).chars().count() + indent)
         .max()
         .unwrap_or(0)
         .clamp(16, 48);
@@ -1648,6 +1648,24 @@ fn header_line(app: &App, label: &str, members: &[usize]) -> Line<'static> {
         .style(Style::new().fg(color).add_modifier(Modifier::BOLD))
 }
 
+/// The packages the overrides of an overridden package are limited to, when every one of
+/// them is limited: `["b"]` for `b > qs`. Empty when one applies everywhere.
+fn override_scopes(r: &AppRow) -> Vec<String> {
+    if r.kind != Kind::Override || r.overrides.is_empty() || r.overrides.iter().any(|o| o.global()) {
+        return Vec::new();
+    }
+    let mut below: Vec<String> = r.overrides.iter().map(|o| o.path.join(" > ")).collect();
+    below.sort();
+    below.dedup();
+    below
+}
+/// The name in the list: `b > qs` for a package overridden only below `b`.
+fn display_name(r: &AppRow) -> String {
+    match override_scopes(r).as_slice() {
+        [one] => format!("{one} > {}", r.name),
+        _ => r.name.clone(),
+    }
+}
 fn row_line(app: &App, r: &AppRow, indent: usize, name_w: usize, width: usize) -> Line<'static> {
     let mark = match r.status {
         Status::Queued => "…",
@@ -1667,7 +1685,7 @@ fn row_line(app: &App, r: &AppRow, indent: usize, name_w: usize, width: usize) -
     let mut spans = vec![Span::raw(format!(
         "{mark} {}{:<w$} ",
         " ".repeat(indent),
-        r.name,
+        display_name(r),
         w = name_w - indent
     ))];
     spans.extend(marker);
@@ -1702,6 +1720,12 @@ fn row_line(app: &App, r: &AppRow, indent: usize, name_w: usize, width: usize) -
         spans.push(Span::styled(r.new_spec(), Style::new().fg(color)));
     } else {
         spans.push(Span::styled("✓ up to date", Style::new().fg(Color::Green)));
+    }
+    // An overridden package whose overrides are limited to several other packages: say where.
+    // (Limited to one, the name says it: `b > qs`.)
+    let below = override_scopes(r);
+    if below.len() > 1 {
+        spans.push(Span::styled(format!("   only below {}", below.join(", ")), override_style(false)));
     }
     for (label, fix) in [("snyk", &r.snyk_fix), ("audit", &r.audit_fix)] {
         if let Some(fix) = fix {
@@ -2307,18 +2331,14 @@ fn orphan_lines(app: &App, key: &str, width: usize) -> Vec<Line<'static>> {
 /// Compatibility of the update of `r` with its own override `o`, and a short explanation.
 fn own_override_note(app: &App, r: &AppRow, o: &Override) -> (Compat, String) {
     // Overridden packages aren't dependencies, so there is no dependency spec to clash with.
+    // `b > qs` already says where it applies.
     if r.kind == Kind::Override {
-        let note = if o.path.is_empty() {
-            String::new()
-        } else {
-            "only applies below another package".to_string()
-        };
-        return (Compat::Ok, note);
+        return (Compat::Ok, String::new());
     }
     let c = overrides::check(std::slice::from_ref(o), app.pm, &r.new_spec(), &r.latest);
     // Up-to-date packages have no pending update to be compatible with.
     let note = if !o.path.is_empty() {
-        "only applies below another package".to_string()
+        format!("only applies below {}", o.path.join(" > "))
     } else if !r.outdated {
         String::new()
     } else {

@@ -1202,6 +1202,7 @@ impl App {
             let scan = self.scan_mut(source);
             scan.stale = scan.deps_changed || missing.contains(&source);
         }
+        self.drop_contradicted_unneeded();
     }
 
     /// Shows the findings stored in the cache for the versions installed now.
@@ -1480,6 +1481,7 @@ impl App {
                 Event::Scan { source, result } => self.on_scan(source, result),
                 Event::Unneeded(found) => {
                     self.unneeded = found.into_iter().collect();
+                    self.drop_contradicted_unneeded();
                     self.rebuild_view();
                 }
                 Event::InstallStarted { names } => {
@@ -2042,11 +2044,12 @@ impl App {
             .extend(names.into_iter().map(|name| Item::Removed { name }));
     }
 
-    /// Installed packages that depend on `name`, one entry per name and version.
+    /// Installed packages that depend on `name`, one entry per name, version and the direct
+    /// dependency that brings it in.
     pub fn dependents_of(&self, name: &str) -> Vec<&Dependent> {
         let mut out: Vec<&Dependent> = Vec::new();
         for d in self.dependents.get(name).into_iter().flatten() {
-            if !out.iter().any(|o| o.name == d.name && o.version == d.version) {
+            if !out.iter().any(|o| o.name == d.name && o.version == d.version && o.direct == d.direct) {
                 out.push(d);
             }
         }
@@ -2214,6 +2217,24 @@ impl App {
         self.overrides.iter().find(|o| o.key() == key)
     }
 
+    /// A scan that lists the overridden package where the override applies proves it is
+    /// installed there, whatever the tree walk found: "nothing installed depends on it" is
+    /// dropped for such an override.
+    fn drop_contradicted_unneeded(&mut self) {
+        let used: HashSet<String> = self
+            .overrides
+            .iter()
+            .filter(|o| {
+                self.rows
+                    .iter()
+                    .flat_map(|r| r.vulns.iter().chain(&r.ignored))
+                    .any(|v| v.package == o.name && !v.path.is_empty() && o.path_applies(&chain_of(v)))
+            })
+            .map(Override::key)
+            .collect();
+        self.unneeded
+            .retain(|k, u| !(matches!(u, Unneeded::Unused) && used.contains(k)));
+    }
     /// Why the override looks unnecessary, if it does.
     pub fn unneeded(&self, o: &Override) -> Option<&Unneeded> {
         self.unneeded.get(&o.key())

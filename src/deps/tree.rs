@@ -32,6 +32,8 @@ struct Pkg {
     version: Option<Version>,
     /// (name, declared range) from `dependencies` and `optionalDependencies`.
     deps: Vec<(String, String)>,
+    /// (name, declared range) from `peerDependencies`, which npm 7+ installs too.
+    peers: Vec<(String, String)>,
 }
 
 pub struct Analyzer {
@@ -79,7 +81,13 @@ impl Analyzer {
                         }
                     }
                 }
+                let peers = json
+                    .get("peerDependencies")
+                    .and_then(|v| v.as_object())
+                    .map(|m| m.iter().map(|(k, v)| (k.clone(), v.as_str().unwrap_or("").to_string())).collect())
+                    .unwrap_or_default();
                 Pkg {
+                    peers,
                     version: json
                         .get("version")
                         .and_then(|v| v.as_str())
@@ -196,6 +204,10 @@ impl Analyzer {
             visited: HashSet::new(),
             requested: vec![Vec::new(); overrides.len()],
             budget: MAX_PROJECT_EDGES,
+            scopes: overrides
+                .iter()
+                .flat_map(|o| o.path.iter().map(|p| crate::deps::overrides::split_name(p).0))
+                .collect(),
         };
         let mut installed_any = false;
         for (dep, spec) in root_deps {
@@ -210,10 +222,11 @@ impl Analyzer {
                 version.as_ref(),
                 &mut st.requested,
             );
+            let chain = vec![dep.clone()];
             if let Some(c) = child
-                && st.visited.insert(c.clone())
+                && st.visited.insert(st.key(&c, &chain))
             {
-                self.usage_walk(&overrides, &c, &mut vec![dep.clone()], &mut st);
+                self.usage_walk(&overrides, &c, &mut chain.clone(), &mut st);
             }
         }
         if !installed_any {
@@ -237,7 +250,9 @@ impl Analyzer {
             return;
         }
         let pkg = self.pkg(dir);
-        for (dep, requested) in &pkg.deps {
+        // Peers count as uses too: the package manager installs them, and an override of one
+        // changes what the package gets.
+        for (dep, requested) in pkg.deps.iter().chain(&pkg.peers) {
             if st.budget == 0 {
                 return;
             }
@@ -252,13 +267,13 @@ impl Analyzer {
                 version.as_ref(),
                 &mut st.requested,
             );
+            chain.push(dep.clone());
             if let Some(c) = child
-                && st.visited.insert(c.clone())
+                && st.visited.insert(st.key(&c, chain))
             {
-                chain.push(dep.clone());
                 self.usage_walk(overrides, &c, chain, st);
-                chain.pop();
             }
+            chain.pop();
         }
     }
 }
@@ -282,11 +297,13 @@ impl Analyzer {
     pub fn dependents(&mut self, root_deps: &[(String, String)]) -> HashMap<String, Vec<Dependent>> {
         let dir = self.dir.clone();
         let mut out: HashMap<String, Vec<Dependent>> = HashMap::new();
-        let mut visited = HashSet::new();
+        // Visited per direct dependency: a package shared by two of them has dependents
+        // through both, which scoped overrides (and their warnings) tell apart.
+        let mut visited: HashSet<(PathBuf, String)> = HashSet::new();
         let mut budget = MAX_PROJECT_EDGES;
         for (dep, _) in root_deps {
             if let Some(c) = self.resolve(&dir, dep)
-                && visited.insert(c.clone())
+                && visited.insert((c.clone(), dep.clone()))
             {
                 self.dependents_walk(&c, dep, dep, 0, &mut visited, &mut budget, &mut out);
             }
@@ -299,7 +316,7 @@ impl Analyzer {
         name: &str,
         direct: &str,
         depth: usize,
-        visited: &mut HashSet<PathBuf>,
+        visited: &mut HashSet<(PathBuf, String)>,
         budget: &mut usize,
         out: &mut HashMap<String, Vec<Dependent>>,
     ) {
@@ -319,7 +336,7 @@ impl Analyzer {
                 direct: direct.to_string(),
             });
             if let Some(c) = self.resolve(dir, dep)
-                && visited.insert(c.clone())
+                && visited.insert((c.clone(), direct.to_string()))
             {
                 self.dependents_walk(&c, dep, direct, depth + 1, visited, budget, out);
             }
@@ -444,10 +461,24 @@ struct AuditWalk {
 }
 
 struct UsageWalk {
-    visited: HashSet<PathBuf>,
+    /// A package is walked again when it is reached below other packages that overrides are
+    /// limited to: `b > qs` must see the `qs` of a `mid` that `a` and `b` share, also when
+    /// `mid` was first reached through `a`.
+    visited: HashSet<(PathBuf, Vec<String>)>,
+    /// The packages overrides are limited to.
+    scopes: HashSet<String>,
     /// Per override: the range declared by each dependent edge the override applies to.
     requested: Vec<Vec<String>>,
     budget: usize,
+}
+
+impl UsageWalk {
+    /// What tells two visits of `dir` apart: the packages on `chain` that overrides are limited to.
+    fn key(&self, dir: &Path, chain: &[String]) -> (PathBuf, Vec<String>) {
+        let mut scopes: Vec<String> = chain.iter().filter(|c| self.scopes.contains(*c)).cloned().collect();
+        scopes.dedup();
+        (dir.to_path_buf(), scopes)
+    }
 }
 
 /// Notes the declared range of an edge `parent chain -> dep` for every override applying to it.

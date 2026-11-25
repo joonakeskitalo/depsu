@@ -107,7 +107,7 @@ pub fn collect(manifest: &Value, pm: Pm) -> Vec<Override> {
 }
 
 /// Splits `name@range` (the name may start with `@scope/`).
-fn split_name(key: &str) -> (String, Option<String>) {
+pub fn split_name(key: &str) -> (String, Option<String>) {
     match key.get(1..).and_then(|r| r.find('@')) {
         Some(i) => (key[..=i].to_string(), Some(key[i + 2..].to_string())),
         None => (key.to_string(), None),
