@@ -262,6 +262,8 @@ fn pin_letter(code: KeyCode) -> Option<&'static str> {
 /// type, e.g. `^18.3.1`.
 pub struct VersionEdit {
     pub name: String,
+    /// The override being edited, or `None` for the dependency `name` itself.
+    pub over: Option<Override>,
     pub field: crate::tui::textfield::TextField,
     /// The package's published versions, once the registry answered.
     pub doc: Option<Result<registry::Packument, String>>,
@@ -2637,6 +2639,9 @@ impl App {
         {
             item.push("p pin fix as override".into());
         }
+        if self.cursor_override_editable() {
+            item.push("e set override".into());
+        }
         if let Some(Item::Row { idx, .. }) = self.cursor_item()
             && self.rows[*idx].kind != Kind::Override
             && !self.rows[*idx].busy()
@@ -3480,17 +3485,26 @@ impl App {
     /// Opens the version of the package under the cursor for editing, pre-filled with what it
     /// has now, and looks up which versions are published.
     fn ask_version(&mut self) {
+        // On an override line: edit that override.
+        if let Some(item) = self.cursor_item().cloned()
+            && let Some(o) = self.detail_override(&item).cloned()
+        {
+            return self.ask_override_version(o);
+        }
         let Some(Item::Row { idx, .. }) = self.cursor_item() else {
-            self.push_log("Put the cursor on a package to edit its version.");
+            self.push_log("Put the cursor on a package or an override to edit its version.");
             return;
         };
         let r = &self.rows[*idx];
         if r.kind == Kind::Override {
-            self.push_log(format!(
-                "{} isn't a dependency of the project: its version comes from its overrides.",
-                r.name
-            ));
-            return;
+            // A package that is only overridden: edit its override, when there is one choice.
+            return match r.overrides.as_slice() {
+                [o] => self.ask_override_version(o.clone()),
+                _ => self.push_log(format!(
+                    "{} has several overrides: put the cursor on the one to edit.",
+                    r.name
+                )),
+            };
         }
         if r.busy() {
             return;
@@ -3499,10 +3513,53 @@ impl App {
         let name = r.name.clone();
         self.version_edit = Some(VersionEdit {
             name: name.clone(),
+            over: None,
             field: crate::tui::textfield::TextField::new(format!("{}{now}", r.prefix)),
             doc: None,
             error: None,
         });
+        self.fetch_version_doc(name);
+    }
+    /// Whether `e` under the cursor edits an override: an override line, or the row of a
+    /// package that is only overridden, through a single override.
+    fn cursor_override_editable(&self) -> bool {
+        let Some(item) = self.cursor_item() else { return false };
+        let o = match item {
+            Item::Row { idx, .. } if self.rows[*idx].kind == Kind::Override => match self.rows[*idx].overrides.as_slice() {
+                [o] => o,
+                _ => return false,
+            },
+            _ => match self.detail_override(item) {
+                Some(o) => o,
+                None => return false,
+            },
+        };
+        !self.override_busy(o) && !(self.pm == Pm::Npm && o.global() && self.direct.contains(&o.name))
+    }
+    /// Opens the `e` dialog for the value of override `o`, pre-filled with what it has now.
+    fn ask_override_version(&mut self, o: Override) {
+        if self.override_busy(&o) {
+            return;
+        }
+        // npm requires a global override of a dependency to equal the dependency's spec.
+        if self.pm == Pm::Npm && o.global() && self.direct.contains(&o.name) {
+            return self.push_log(format!(
+                "{} is a dependency of the project: npm needs its override to equal its version in package.json. Press e on the package to change both.",
+                o.name
+            ));
+        }
+        let name = o.name.clone();
+        self.version_edit = Some(VersionEdit {
+            name: name.clone(),
+            field: crate::tui::textfield::TextField::new(o.value.clone()),
+            over: Some(o),
+            doc: None,
+            error: None,
+        });
+        self.fetch_version_doc(name);
+    }
+    /// Looks up the published versions of `name` for the `e` dialog.
+    fn fetch_version_doc(&self, name: String) {
         let (fetch, tx) = (self.fetcher.clone(), self.events_tx.clone());
         thread::spawn(move || {
             let result = fetch(&name);
@@ -3577,7 +3634,11 @@ impl App {
             }
         };
         let name = e.name.clone();
+        let over = e.over.take();
         self.version_edit = None;
+        if let Some(o) = over {
+            return self.set_override_value(&o, format!("{prefix}{version}"));
+        }
         let Some(i) = self.rows.iter().position(|r| r.name == name) else {
             return;
         };
@@ -3757,6 +3818,29 @@ impl App {
         });
     }
 
+    /// The latest version of an overridden package, once looked up.
+    pub fn override_latest(&self, name: &str) -> Option<&Version> {
+        self.override_latest.get(name)
+    }
+    /// Writes `new` as the value of override `o` in `package.json` and runs the install.
+    fn set_override_value(&mut self, o: &Override, new: String) {
+        if o.value == new {
+            return self.push_log(format!("The override {} is already {new}.", o.describe()));
+        }
+        let key = o.key();
+        self.changed.insert(key.clone());
+        self.busy_overrides.insert(key.clone());
+        self.push_log(format!("… queued override {} → {new}", o.describe()));
+        let _ = self.jobs.send(Job {
+            edits: vec![Change::Set {
+                loc: o.loc.clone(),
+                old: o.value.clone(),
+                new,
+            }],
+            keys: vec![key],
+            ..Default::default()
+        });
+    }
     /// Shows what the registry refuses and what it hands out instead.
     fn on_blocked(
         &mut self,
@@ -6720,6 +6804,45 @@ mod tests {
         assert_eq!(specs(&settle(&mut app, &rx, "")), ["a@^1.5.0"]);
     }
 
+    #[test]
+    fn e_on_an_override_line_edits_its_version_and_pin_type() {
+        let (mut app, rx) = offline_app();
+        // a > qs ^6.0.3, listed under a.
+        let mut o = ovr("qs", "^6.0.3", "a");
+        o.path = vec!["a".into()];
+        o.loc = vec!["overrides".into(), "a".into(), "qs".into()];
+        app.overrides = vec![o.clone()];
+        app.rows.iter_mut().find(|r| r.name == "a").unwrap().overrides = vec![o];
+        app.rebuild_view();
+        cursor_to(&mut app, |it| matches!(it, Item::Detail { child: Child::Own(0), .. }));
+        assert!(app.hints().0.contains(&"e set override".to_string()));
+        edit_version(&mut app);
+        assert_eq!(version_field(&app), "^6.0.3");
+        assert!(render(&mut app, 100, 40).join("\n").contains("Override of qs"));
+        retype(&mut app, "6.0.9");
+        press(&mut app, KeyCode::Enter);
+        assert!(app.version_edit.is_some(), "not published");
+        retype(&mut app, "~6.0.4");
+        press(&mut app, KeyCode::Enter);
+        assert!(app.version_edit.is_none());
+        let jobs = settle(&mut app, &rx, "");
+        assert_eq!(
+            jobs[0].edits,
+            [Change::Set {
+                loc: vec!["overrides".into(), "a".into(), "qs".into()],
+                old: "^6.0.3".into(),
+                new: "~6.0.4".into()
+            }]
+        );
+        assert!(jobs[0].items.is_empty());
+    }
+    #[test]
+    fn npm_overrides_of_dependencies_are_edited_with_the_dependency() {
+        let (mut app, _rx) = offline_app();
+        app.ask_override_version(ovr("a", "^1.0.0", "a"));
+        assert!(app.version_edit.is_none());
+        assert!(app.log.last().unwrap().contains("npm needs its override to equal"), "{:?}", app.log.last());
+    }
     #[test]
     fn the_pin_type_can_be_changed_with_the_version() {
         let (mut app, rx) = offline_app();

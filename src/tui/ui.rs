@@ -434,8 +434,20 @@ fn draw_version_edit(f: &mut Frame, app: &App, e: &crate::tui::app::VersionEdit)
     let dim = Style::new().fg(Color::DarkGray);
     let label = |t: &str| Span::styled(format!("{t:<14}"), bold);
     let indent = || Span::raw(" ".repeat(14));
-    let row = app.rows.iter().find(|r| r.name == e.name);
+    let over = e.over.as_ref();
+    let row = app.rows.iter().find(|r| r.name == e.name).filter(|_| over.is_none());
     let mut lines: Vec<Line<'static>> = Vec::new();
+    if let Some(o) = over {
+        lines.extend(wrap(label("override"), indent(), vec![Span::raw(o.describe())], inner));
+        lines.push(Line::from(vec![
+            label("latest"),
+            match app.override_latest(&o.name) {
+                Some(v) => Span::raw(v.to_string()),
+                None => Span::styled("unknown", dim),
+            },
+        ]));
+        lines.push(Line::default());
+    }
     if let Some(r) = row {
         lines.push(Line::from(vec![label("package.json"), Span::raw(format!("{}{}", r.prefix, r.current))]));
         lines.push(Line::from(vec![
@@ -478,7 +490,13 @@ fn draw_version_edit(f: &mut Frame, app: &App, e: &crate::tui::app::VersionEdit)
                 r.installed.as_ref().unwrap_or(&r.current) == &version && r.current == version
             });
             let same_pin = row.is_some_and(|r| r.prefix == prefix);
+            // For an override: compared with its value now.
+            let (now, same_pin) = match over.and_then(|o| crate::deps::package::parse_spec(&o.value)) {
+                Some((p, v)) => (v == version, p == prefix),
+                None => (now, same_pin),
+            };
             let note = match (now, same_pin) {
+                (true, true) if over.is_some() => ", and is what the override has now".to_string(),
                 (true, true) => format!(", and is what {} has now", e.name),
                 (true, false) => ", only the pin type changes".to_string(),
                 _ => String::new(),
@@ -506,7 +524,8 @@ fn draw_version_edit(f: &mut Frame, app: &App, e: &crate::tui::app::VersionEdit)
     let mut keys = key("enter", "install");
     keys.extend(key("esc", "cancel"));
     lines.push(Line::from(keys));
-    draw_dialog(f, &format!("Version of {}", e.name), lines, width);
+    let title = if over.is_some() { format!("Override of {}", e.name) } else { format!("Version of {}", e.name) };
+    draw_dialog(f, &title, lines, width);
 }
 
 /// The ignore `x` adds to `.snyk`: reason, expiry and the paths it covers.
