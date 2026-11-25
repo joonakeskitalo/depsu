@@ -74,6 +74,22 @@ impl Cache {
             self.latest = disk.latest;
             self.projects = disk.projects;
         }
+        self.write(path)
+    }
+    /// Forgets the latest versions and the scan results of `project`, in the file. The scan
+    /// results of other projects that share the file stay. A file that doesn't exist stays
+    /// missing.
+    pub fn reset(path: &Path, project: &str) -> Result<()> {
+        if !path.exists() {
+            return Ok(());
+        }
+        let mut cache = Cache::load(path)?;
+        cache.latest.clear();
+        cache.projects.remove(project);
+        // Written as it is: saving would merge the old file back in.
+        cache.write(path)
+    }
+    fn write(&mut self, path: &Path) -> Result<()> {
         self.format = FORMAT;
         if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
             std::fs::create_dir_all(dir)
@@ -238,6 +254,25 @@ mod tests {
         let back = Cache::load(&path).unwrap();
         assert!(back.scans("/p").unwrap().findings("snyk", "a", "1.0.0").unwrap().vulns.is_empty());
         std::fs::remove_file(path).unwrap();
+    }
+    #[test]
+    fn reset_forgets_this_project_and_the_versions_but_not_other_projects() {
+        let path = std::env::temp_dir().join(format!("depsu-reset-cache-{}.json", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let mut c = Cache::default();
+        c.latest.insert("lodash".into(), "4.17.21".into());
+        c.scans_mut("/p/a").set_findings("snyk", "lodash", "4.17.15", Findings::default());
+        c.scans_mut("/p/b").set_findings("snyk", "react", "18.0.0", Findings::default());
+        c.save(&path).unwrap();
+        Cache::reset(&path, "/p/a").unwrap();
+        let back = Cache::load(&path).unwrap();
+        assert!(back.latest.is_empty());
+        assert!(back.scans("/p/a").is_none());
+        assert!(back.scans("/p/b").unwrap().findings("snyk", "react", "18.0.0").is_some());
+        std::fs::remove_file(&path).unwrap();
+        // Nothing to reset: no file is made.
+        Cache::reset(&path, "/p/a").unwrap();
+        assert!(!path.exists());
     }
     #[test]
     fn a_missing_file_is_an_empty_cache() {

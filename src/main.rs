@@ -28,6 +28,9 @@ OPTIONS:
         --proxy-cache <DIR>
                        Run npm through a caching registry proxy that depsu starts, and keep
                        the downloaded packages and metadata in DIR (npm only)
+        --reset-cache  Forget what --cache remembers about this project (its scan results and
+                       the latest versions) before starting. Other projects in the file stay.
+                       Needs --cache. The package manager and proxy caches are not touched.
         --cache <FILE> JSON file that remembers latest versions and scans between runs
     -h, --help         Print help
     -V, --version      Print version
@@ -75,6 +78,7 @@ fn main() -> Result<()> {
     let mut forced_pm = None;
     let mut cache_path: Option<PathBuf> = None;
     let mut proxy_dir: Option<PathBuf> = None;
+    let mut reset_cache = false;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -111,6 +115,7 @@ fn main() -> Result<()> {
                 Some(d) => proxy_dir = Some(std::path::absolute(&d)?),
                 None => bail!("{arg} requires a value"),
             },
+            "--reset-cache" => reset_cache = true,
             "--prefer-offline" => config::pm::set_prefer_offline(),
             "--pm" => {
                 let v = args.next().unwrap_or_default();
@@ -124,6 +129,12 @@ fn main() -> Result<()> {
     }
 
     let dir = dir.canonicalize()?;
+    if reset_cache {
+        let Some(path) = &cache_path else {
+            bail!("--reset-cache needs --cache <FILE>");
+        };
+        registry::cache::Cache::reset(path, &dir.display().to_string())?;
+    }
     let manifest = deps::package::read_manifest(&dir.join("package.json"))?;
     let pm = forced_pm.unwrap_or_else(|| config::pm::Pm::detect(&dir, manifest.package_manager.as_deref()));
     let overrides = deps::overrides::collect(&manifest.raw, pm);
