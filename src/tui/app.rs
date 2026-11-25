@@ -830,10 +830,9 @@ impl App {
                             }
                         }
                         TreeMsg::Analyze(name) => {
-                            if !analyzer.has_overrides() {
-                                continue;
-                            }
-                            let hits = analyzer.analyze(&name);
+                            // Without overrides there is nothing to find, but the answer still
+                            // goes out: it clears what was found before the last one was removed.
+                            let hits = if analyzer.has_overrides() { analyzer.analyze(&name) } else { Vec::new() };
                             if ev_tx.send(Event::Tree { name, hits }).is_err() {
                                 break;
                             }
@@ -1812,6 +1811,10 @@ impl App {
         // Keep the user's selections that still point at an existing override.
         let existing: HashSet<String> = self.overrides.iter().map(Override::key).collect();
         self.selected_overrides.retain(|k| existing.contains(k));
+        // Overrides that are gone leave the tree at once; the analysis below redoes the rest.
+        for r in &mut self.rows {
+            r.tree_hits.retain(|h| existing.contains(&h.over.key()));
+        }
         // Old verdicts are stale until the new analysis arrives.
         self.unneeded.clear();
         // A range change in `package.json` changes how a row's version is pinned.
