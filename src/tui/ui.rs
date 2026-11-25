@@ -1778,6 +1778,11 @@ fn row_line(app: &App, r: &AppRow, indent: usize, name_w: usize, width: usize) -
             Style::new().fg(Color::Yellow).add_modifier(Modifier::BOLD),
         ));
     }
+    if app.show_info
+        && let Some(o) = app.package_origin(&r.name)
+    {
+        spans.push(origin_span(o));
+    }
     // The engines the installed copy wants and the tools here don't have.
     let engines: Vec<String> = app
         .engine_problems(&r.name)
@@ -1803,6 +1808,11 @@ fn row_line(app: &App, r: &AppRow, indent: usize, name_w: usize, width: usize) -
     } else {
         line
     }
+}
+
+/// Who committed an item and when, for the list while the details panel is on.
+fn origin_span(o: &crate::deps::blame::Origin) -> Span<'static> {
+    Span::styled(format!("   {}", o.label()), Style::new().fg(Color::DarkGray))
 }
 
 /// E.g. `↻ npm audit hasn't scanned this version (n)`, naming the scanners and their keys.
@@ -2010,6 +2020,11 @@ fn detail_lines(
         spans.extend(override_spans(app, &r.vulns[i]));
         spans.extend(fix_spans(app, r, &r.vulns[i]));
     }
+    if app.show_info
+        && let Some(origin) = o.and_then(|o| app.override_origin(o))
+    {
+        spans.push(origin_span(origin));
+    }
     if let Some(reason) = unneeded {
         spans.push(Span::styled(
             format!("  ✂ may be removed: {reason}"),
@@ -2064,18 +2079,19 @@ fn policy_lines(app: &App, id: &str, path: &str, width: usize) -> Vec<Line<'stat
         ),
         PolicyStatus::Unknown => ("  ? run Snyk (s) to check", Style::new().fg(Color::DarkGray)),
     };
-    wrap(
-        Span::styled("  ⊘ ", Style::new().fg(color)),
-        Span::raw("    "),
-        vec![
-            Span::styled(
-                format!("{id}{title}  · on {path}  · {until}  · {reason}"),
-                Style::new().fg(color),
-            ),
-            Span::styled(note, note_style),
-        ],
-        width,
-    )
+    let mut spans = vec![
+        Span::styled(
+            format!("{id}{title}  · on {path}  · {until}  · {reason}"),
+            Style::new().fg(color),
+        ),
+        Span::styled(note, note_style),
+    ];
+    if app.show_info
+        && let Some(o) = app.policy_origin(id, path)
+    {
+        spans.push(origin_span(o));
+    }
+    wrap(Span::styled("  ⊘ ", Style::new().fg(color)), Span::raw("    "), spans, width)
 }
 /// `fixed by override` on a finding whose vulnerable package an override already pins to a
 /// fixed version. A scan that still lists it means the override isn't what is installed yet.
@@ -2234,6 +2250,12 @@ fn orphan_lines(app: &App, key: &str, width: usize) -> Vec<Line<'static>> {
         Span::raw(o.describe()),
         Span::styled(format!("   {reason}"), Style::new().fg(Color::DarkGray)),
     ];
+    let mut spans = spans;
+    if app.show_info
+        && let Some(origin) = app.override_origin(o)
+    {
+        spans.push(origin_span(origin));
+    }
     wrap(Span::raw("  "), Span::raw("      "), spans, width)
 }
 

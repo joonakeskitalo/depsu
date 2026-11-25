@@ -238,6 +238,11 @@ fn date(days: i64) -> String {
     format!("{y:04}-{m:02}-{d:02}")
 }
 
+/// The date (UTC) of a Unix time in seconds, as `YYYY-MM-DD`.
+pub fn date_of(secs: i64) -> String {
+    date(secs.div_euclid(86_400))
+}
+
 /// Today's date (UTC) as `YYYY-MM-DD`.
 pub fn today() -> String {
     date(secs().div_euclid(86_400))

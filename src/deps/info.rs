@@ -1,5 +1,6 @@
 //! Facts about an installed package, read from disk only: its copy in `node_modules`, the
 //! lockfile, and the lockfile of the last commit. Nothing is downloaded.
+use crate::deps::blame::{Blame, Origin};
 use semver::Version;
 use serde_json::Value;
 use std::collections::BTreeMap;
@@ -35,6 +36,9 @@ pub struct Info {
     pub missing_integrity: bool,
     /// The lockfile it was read from, or `None` when there is none.
     pub lockfile: Option<&'static str>,
+    /// Who committed the installed version to the lockfile, and when. `None` when git doesn't
+    /// say (no repository, or the lockfile is not tracked).
+    pub committed: Option<Origin>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -69,6 +73,8 @@ pub struct Reader {
     dir: PathBuf,
     now: Option<Option<Lock>>,
     head: Option<Option<Lock>>,
+    /// `git blame` of the lockfile, read when first needed.
+    blame: Option<Option<Blame>>,
 }
 
 /// A lockfile's entries by package name: the top-level copy, as Node resolves it.
@@ -79,13 +85,14 @@ struct Lock {
 
 impl Reader {
     pub fn new(dir: PathBuf) -> Reader {
-        Reader { dir, now: None, head: None }
+        Reader { dir, now: None, head: None, blame: None }
     }
 
     /// Forgets the lockfiles read so far: after an install or a commit.
     pub fn reset(&mut self) {
         self.now = None;
         self.head = None;
+        self.blame = None;
     }
 
     pub fn info(&mut self, name: &str) -> Info {
@@ -135,6 +142,7 @@ impl Reader {
             .collect();
         let dependencies = deps(source);
         let since_commit = self.since_commit(name, version.as_ref(), &dependencies);
+        let committed = self.committed(lockfile, name, version.as_ref());
         Info {
             deprecated: entry
                 .as_ref()
@@ -151,8 +159,22 @@ impl Reader {
             integrity: entry.as_ref().and_then(integrity),
             missing_integrity: entry.as_ref().is_some_and(|e| integrity(e).is_none() && !is_local(e)),
             lockfile,
+            committed,
             version,
         }
+    }
+
+    /// The origin of the line that says which version of `name` the lockfile has.
+    fn committed(&mut self, lockfile: Option<&'static str>, name: &str, version: Option<&Version>) -> Option<Origin> {
+        let file = lockfile?;
+        let dir = self.dir.clone();
+        let blame = self.blame.get_or_insert_with(|| Blame::of(&dir, file)).as_ref()?;
+        let line = if file == "package-lock.json" {
+            blame.npm_lock(name)?
+        } else {
+            blame.pnpm_lock(name, &version?.to_string())?
+        };
+        blame.origin(line)
     }
 
     fn since_commit(

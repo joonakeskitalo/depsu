@@ -2,6 +2,7 @@
 
 use crate::security::audit;
 use crate::registry::cache::{Cache, Findings};
+use crate::deps::blame::{Blame, Origin};
 use crate::deps::edit::{self, Change};
 use crate::config::npmrc::Npmrc;
 use crate::deps::overrides::{self, Compat, Override, Unneeded};
@@ -645,6 +646,10 @@ pub struct App {
     pub commit_prompt: Option<CommitPrompt>,
     /// The ignore rules in the project's `.snyk`.
     pub ignores: Vec<Ignore>,
+    /// Who committed each ignore rule (ID and path), and when.
+    policy_origins: HashMap<(String, String), Origin>,
+    /// Who committed each override (by key), and when.
+    override_origins: HashMap<String, Origin>,
     pub ignore_prompt: Option<IgnorePrompt>,
     /// What the last Snyk scan of this session said `.snyk` ignores (ID and path). `None`
     /// until a scan ran, and again after `.snyk` changed.
@@ -882,6 +887,8 @@ impl App {
             blocked_prompt: None,
             commit_prompt: None,
             ignores: Vec::new(),
+            policy_origins: HashMap::new(),
+            override_origins: HashMap::new(),
             ignore_prompt: None,
             policy_seen: None,
             policy_carried: HashMap::new(),
@@ -956,6 +963,7 @@ impl App {
         };
         app.add_placeholder_rows();
         app.reload_ignores();
+        app.read_override_origins();
         if let Some(path) = cache_path {
             match Cache::load(&path) {
                 Ok(c) => {
@@ -1799,6 +1807,7 @@ impl App {
             .collect();
         self.direct = manifest.deps.iter().map(|d| d.name.clone()).collect();
         self.overrides = overrides::collect(&manifest.raw, self.pm);
+        self.read_override_origins();
 
         // Keep the user's selections that still point at an existing override.
         let existing: HashSet<String> = self.overrides.iter().map(Override::key).collect();
@@ -2990,6 +2999,8 @@ impl App {
                     self.push_log(format!("✔ committed {hash}: {}", p.title.text().trim()));
                     // Dependency changes are counted from the last commit.
                     self.forget_info();
+                    self.read_override_origins();
+                    self.read_policy_origins();
                     // Committed fixes aren't listed again in the next commit.
                     self.session_fixes.retain(|f| !p.plan.fixes.contains(f));
                 }
@@ -4496,6 +4507,45 @@ impl App {
         self.ignores.iter().find(|r| r.covers(v) && !r.expired(&today))
     }
 
+    /// Asks git who committed each override in `package.json`.
+    fn read_override_origins(&mut self) {
+        let blame = Blame::of(&self.dir, "package.json");
+        self.override_origins = blame
+            .map(|b| {
+                self.overrides
+                    .iter()
+                    .filter_map(|o| Some((o.key(), b.origin(b.json_key(&o.loc)?)?)))
+                    .collect()
+            })
+            .unwrap_or_default();
+    }
+    pub fn override_origin(&self, o: &Override) -> Option<&Origin> {
+        self.override_origins.get(&o.key())
+    }
+    pub fn policy_origin(&self, id: &str, path: &str) -> Option<&Origin> {
+        self.policy_origins.get(&(id.to_string(), path.to_string()))
+    }
+    /// What the details panel knows about who committed the installed version of `name`.
+    pub fn package_origin(&self, name: &str) -> Option<&Origin> {
+        self.info.get(name)?.1.committed.as_ref()
+    }
+
+    /// Asks git who committed each rule in `.snyk`.
+    fn read_policy_origins(&mut self) {
+        let blame = Blame::of(&self.dir, ".snyk");
+        self.policy_origins = blame
+            .map(|b| {
+                self.ignores
+                    .iter()
+                    .filter_map(|r| {
+                        let lines = b.policy_rule(&r.id, &r.path)?;
+                        Some(((r.id.clone(), r.path.clone()), b.newest(lines)?))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+    }
+
     fn reload_ignores(&mut self) {
         match policy::load(&self.dir) {
             Ok(r) => self.ignores = r,
@@ -4504,6 +4554,7 @@ impl App {
                 self.push_log(format!("✘ .snyk: {e}"));
             }
         }
+        self.read_policy_origins();
     }
 
     /// `x` on a Snyk finding or on an ignore rule in the policy section: opens the dialog to
