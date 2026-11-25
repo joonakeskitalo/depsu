@@ -7759,7 +7759,7 @@ mod tests {
         let mut app = app_with_long_details();
         cursor_to_name(&mut app, "p01");
         let buf = buffer(&mut app, 100, 40);
-        let (x, y) = find(&buf, " selected: p01 · 1–6 of ");
+        let (x, y) = find(&buf, " selected: p01 · 1–12 of ");
         assert!(!find_row(&buf, y + 1, "user-"), "the panel starts at the top");
         // The wheel over the panel scrolls it; the list's cursor stays.
         let at = app.table.selected();
@@ -7768,20 +7768,20 @@ mod tests {
         }
         assert_eq!(app.table.selected(), at);
         let buf = buffer(&mut app, 100, 40);
-        find(&buf, " selected: p01 · 4–9 of ");
+        find(&buf, " selected: p01 · 4–15 of ");
         // So do shift+arrows, and it stops at the ends.
         for _ in 0..100 {
             app.on_key(KeyEvent::new(KeyCode::Up, KeyModifiers::SHIFT));
         }
         let buf = buffer(&mut app, 100, 40);
-        find(&buf, " selected: p01 · 1–6 of ");
+        find(&buf, " selected: p01 · 1–12 of ");
         app.on_key(KeyEvent::new(KeyCode::Down, KeyModifiers::SHIFT));
         for _ in 0..100 {
             wheel(&mut app, false, (x + 4, y + 2));
             buffer(&mut app, 100, 40);
         }
         let total = find_total(&buffer(&mut app, 100, 40));
-        assert_eq!(app.info_scroll, total - 6, "the last page");
+        assert_eq!(app.info_scroll, total - 12, "the last page");
         // Another package is shown from the top, and so is p01 again.
         cursor_to_name(&mut app, "p02");
         buffer(&mut app, 100, 40);

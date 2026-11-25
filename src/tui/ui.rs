@@ -198,8 +198,10 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         collapsed_h
     };
     // The details panel is boxed like the list and the log. It has the same height whatever
-    // the item, so the screen does not jump as the cursor moves; longer contents scroll.
-    let info_h = if info { INFO_LINES + 2 } else { 0 };
+    // the item, so the screen does not jump as the cursor moves; longer contents scroll. It
+    // takes a third of the screen, within limits.
+    let info_rows = (f.area().height / 3).clamp(INFO_MIN_LINES, INFO_LINES);
+    let info_h = if info { info_rows + 2 } else { 0 };
     let [header, list_area, info_area, log_area, keys_area] = Layout::vertical([
         Constraint::Length(header_lines.len() as u16),
         Constraint::Min(5),
@@ -296,7 +298,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
             app.info_for = app.table.selected();
             app.info_scroll = 0;
         }
-        let h = INFO_LINES as usize;
+        let h = info_area.height.saturating_sub(2) as usize;
         let total = info_lines.len();
         app.info_scroll = app.info_scroll.min(total.saturating_sub(h));
         let title = if total > h {
@@ -1770,6 +1772,37 @@ fn row_line(app: &App, r: &AppRow, indent: usize, name_w: usize, width: usize) -
             Style::new().fg(Color::Yellow).add_modifier(Modifier::BOLD),
         ));
     }
+    // Overrides in the tree that force a version outside what the parent asked for. The
+    // nested override lines say so when they are shown.
+    if app.show_overrides == Overrides::Off {
+        let conflicts: Vec<String> = r
+            .tree_hits
+            .iter()
+            .filter(|h| h.risk == Compat::Conflict)
+            .map(|h| {
+                let parent = match h.via.len() {
+                    0 | 1 => r.name.as_str(),
+                    n => h.via[n - 2].as_str(),
+                };
+                let have = match &h.installed {
+                    Some(v) => v.to_string(),
+                    None => h.over.value.clone(),
+                };
+                format!("{parent} wants {} {}, has {have}", h.over.name, h.requested)
+            })
+            .collect();
+        if !conflicts.is_empty() {
+            let used: usize = spans.iter().map(|s| s.width()).sum();
+            let full = format!("   ⚠ {}", conflicts.join(", "));
+            let text = if used + full.chars().count() < width {
+                full
+            } else {
+                let n = conflicts.len();
+                format!("   ⚠ {n} override{} outside the wanted range", if n == 1 { "" } else { "s" })
+            };
+            spans.push(Span::styled(text, Style::new().fg(Color::Yellow).add_modifier(Modifier::BOLD)));
+        }
+    }
     // A package the lockfile lists without a checksum can't be verified when installed. Shown
     // with the details panel, which says more about it.
     if app.show_info && app.info.get(&r.name).is_some_and(|(_, i)| i.missing_integrity) {
@@ -2293,8 +2326,10 @@ fn own_override_note(app: &App, r: &AppRow, o: &Override) -> (Compat, String) {
 }
 
 /// Lines reserved at the bottom for the override summary while the nested lists are hidden.
-/// Rows of content the details panel shows; more scroll.
-const INFO_LINES: u16 = 6;
+/// Rows of content the details panel shows at most; more scroll.
+const INFO_LINES: u16 = 12;
+/// Rows of content the details panel shows on a small screen.
+const INFO_MIN_LINES: u16 = 6;
 
 /// Text summary of the overrides of the highlighted package, wrapped to `width`. Shown in
 /// place of the nested lists when those are hidden.
