@@ -2140,7 +2140,7 @@ fn fix_spans(app: &App, r: &AppRow, v: &crate::security::vuln::Vuln) -> Vec<Span
     if let Some(to) = app.vuln_pin_fix(v) {
         return vec![
             Span::raw("  "),
-            Span::styled(format!("⬆ fix: p overrides {} to ^{to}", v.package), fixable),
+            Span::styled(format!("⬆ fix: p overrides {} to ^{to}{}", v.package, app.pin_where(v)), fixable),
             Span::styled(
                 format!("  (upgrading {} doesn't bring it in)", r.name),
                 Style::new().fg(Color::DarkGray),

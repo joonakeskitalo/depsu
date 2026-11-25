@@ -3277,7 +3277,7 @@ impl App {
                 },
             ),
             None => {
-                let loc = self.new_override_loc(name);
+                let loc = self.new_override_loc(None, name);
                 (loc.clone(), Change::Add { loc, new: new.clone() })
             }
         };
@@ -3510,24 +3510,15 @@ impl App {
     /// finding is in a transitive dependency and a fixed version is known.
     pub fn vuln_pin_fix(&self, v: &Vuln) -> Option<Version> {
         let fix = pin_target(v)?;
-        if self.direct.contains(&v.package) {
+        if self.direct.contains(&v.package) || self.vuln_override(v).is_some() {
             return None;
         }
-        // Already overridden to the fix or higher: nothing left to do.
-        let pinned = self
-            .overrides
-            .iter()
-            .find(|o| o.name == v.package && o.global() && o.range.is_none())
-            .and_then(|o| overrides::min_version(&o.value));
-        match pinned {
-            Some(p) if p >= fix => None,
-            _ => Some(fix),
-        }
+        Some(fix)
     }
 
     /// The override that already forces the vulnerable package of `v` to a fixed version, if
-    /// there is one: a global override of a transitive dependency at or above what `p` would
-    /// set.
+    /// there is one: an override of a transitive dependency, global or limited to the direct
+    /// dependency `v` is found under, at or above what `p` would set.
     pub fn vuln_override(&self, v: &Vuln) -> Option<&Override> {
         let fix = pin_target(v)?;
         if self.direct.contains(&v.package) {
@@ -3535,7 +3526,8 @@ impl App {
         }
         self.overrides
             .iter()
-            .filter(|o| o.name == v.package && o.global() && o.range.is_none())
+            .filter(|o| o.name == v.package && o.range.is_none())
+            .filter(|o| o.path_applies(&chain_of(v)))
             .find(|o| overrides::min_version(&o.value).is_some_and(|m| m >= fix))
     }
 
@@ -4412,12 +4404,47 @@ impl App {
 }
 /// An override that pins a vulnerable transitive package to a fixed version.
 struct Pin {
+    /// The package the override is limited to, `None` for everywhere.
+    scope: Option<Scope>,
     name: String,
     version: Version,
     /// An existing override of the package that is too old, to be raised instead of adding one.
     existing: Option<Override>,
 }
+/// Which part of the tree a package-specific override covers.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Scope {
+    /// The package it is limited to.
+    parent: String,
+    /// The package and everything below it (npm, yarn classic); else only its own dependency.
+    deep: bool,
+}
 impl App {
+    /// The package an override fixing `v` is limited to, as far as the package manager can
+    /// limit it: npm and yarn classic to everything below the direct dependency, pnpm and yarn
+    /// berry only to the package that depends on the vulnerable one, bun not at all (it has
+    /// no nested overrides).
+    fn pin_scope(&self, v: &Vuln) -> Option<Scope> {
+        let deep = Scope { parent: v.direct.clone(), deep: true };
+        let parent = || {
+            let p = match v.path.len() {
+                0 | 1 => v.direct.clone(),
+                n => v.path[n - 2].clone(),
+            };
+            Scope { parent: p, deep: false }
+        };
+        match self.pm {
+            Pm::Npm => Some(deep),
+            Pm::Bun => None,
+            Pm::Yarn if crate::config::yarnrc::is_yarn_modern(&self.dir) => Some(parent()),
+            Pm::Yarn => Some(deep),
+            Pm::Pnpm => Some(parent()),
+        }
+    }
+    /// Where `p` would pin the fix of `v`, e.g. ` (only below express)`.
+    pub fn pin_where(&self, v: &Vuln) -> String {
+        pin_where(self.pin_scope(v).as_ref())
+    }
     /// The version of a vulnerable package to pin: the lowest fix in the installed major
     /// release (or the lowest newer one), and the highest of those over all its findings.
     fn pin_plan(&mut self, idx: &[usize]) -> Vec<Pin> {
@@ -4429,46 +4456,54 @@ impl App {
     }
 
     fn pin_plan_for(&mut self, vulns: &[Vuln]) -> Vec<Pin> {
-        let mut want: Vec<(String, Version)> = Vec::new();
+        // An override is limited to the package the finding is found under, so other users of
+        // the vulnerable package keep what they have.
+        let mut want: Vec<(String, Option<Scope>, Version)> = Vec::new();
         for v in vulns {
             let Some(fix) = pin_target(v) else {
                 continue;
             };
-            match want.iter_mut().find(|(n, _)| *n == v.package) {
-                Some((_, cur)) => *cur = (*cur).clone().max(fix),
-                None => want.push((v.package.clone(), fix)),
+            let scope = self.pin_scope(v);
+            match want.iter_mut().find(|(n, s, _)| *n == v.package && *s == scope) {
+                Some((_, _, cur)) => *cur = (*cur).clone().max(fix),
+                None => want.push((v.package.clone(), scope, fix)),
             }
         }
         let mut plan = Vec::new();
-        for (name, version) in want {
+        for (name, scope, version) in want {
             if self.direct.contains(&name) {
                 self.push_log(format!(
                     "{name} is also a direct dependency: update it instead of overriding it."
                 ));
                 continue;
             }
+            let path: Vec<String> = scope.iter().map(|s| s.parent.clone()).collect();
             let existing = self
                 .overrides
                 .iter()
-                .find(|o| o.name == name && o.global() && o.range.is_none())
+                .find(|o| o.name == name && o.range.is_none() && o.path == path)
                 .cloned();
-            if let Some(o) = &existing {
-                match overrides::min_version(&o.value) {
-                    Some(v) if v >= version => {
-                        self.push_log(format!("{name} is already overridden to {}.", o.value));
-                        continue;
-                    }
-                    Some(_) => {}
-                    None => {
-                        self.push_log(format!(
-                            "{name} has an override ({}) I can't compare: edit it by hand.",
-                            o.value
-                        ));
-                        continue;
-                    }
-                }
+            let covering = existing.iter().chain(self.overrides.iter().filter(|o| {
+                o.name == name && o.range.is_none() && (o.global() || o.path == path)
+            }));
+            if let Some(o) = covering
+                .clone()
+                .find(|o| overrides::min_version(&o.value).is_some_and(|m| m >= version))
+            {
+                self.push_log(format!("{name} is already overridden to {}.", o.value));
+                continue;
+            }
+            if let Some(o) = &existing
+                && overrides::min_version(&o.value).is_none()
+            {
+                self.push_log(format!(
+                    "{name} has an override ({}) I can't compare: edit it by hand.",
+                    o.value
+                ));
+                continue;
             }
             plan.push(Pin {
+                scope,
                 name,
                 version,
                 existing,
@@ -4476,15 +4511,32 @@ impl App {
         }
         plan
     }
-    /// Where a new override of `name` goes in `package.json` for the package manager.
-    fn new_override_loc(&self, name: &str) -> Vec<String> {
-        let (root, nested): (&[&str], bool) = match self.pm {
-            Pm::Npm | Pm::Bun => (&["overrides"], true),
-            Pm::Yarn => (&["resolutions"], false),
-            Pm::Pnpm => (&["pnpm", "overrides"], false),
+    /// Where a new override of `name` goes in `package.json` for the package manager: for
+    /// everything, or, with `scope`, only below that package.
+    fn new_override_loc(&self, scope: Option<&Scope>, name: &str) -> Vec<String> {
+        let (root, nested, sep): (&[&str], bool, char) = match self.pm {
+            Pm::Npm | Pm::Bun => (&["overrides"], true, '>'),
+            Pm::Yarn => (&["resolutions"], false, '/'),
+            Pm::Pnpm => (&["pnpm", "overrides"], false, '>'),
         };
         let mut loc: Vec<String> = root.iter().map(|s| s.to_string()).collect();
-        loc.push(name.to_string());
+        let n = loc.len();
+        // npm nests the override in an object named after the package. When the package is
+        // itself overridden with a plain string, there is no room for that object.
+        let string_override = |parent: &str| {
+            self.overrides.iter().any(|o| o.loc.len() == n + 1 && o.loc[n] == parent && o.loc[..n] == loc[..])
+        };
+        match scope {
+            Some(s) if nested && !string_override(&s.parent) => {
+                loc.push(s.parent.clone());
+                loc.push(name.to_string());
+            }
+            Some(_) if nested => loc.push(name.to_string()),
+            // yarn classic: `parent/**/name` is any depth below the parent.
+            Some(s) if s.deep && sep == '/' => loc.push(format!("{}/**/{name}", s.parent)),
+            Some(s) => loc.push(format!("{}{sep}{name}", s.parent)),
+            None => loc.push(name.to_string()),
+        }
         // npm keeps the override of a package that has nested overrides under `.`.
         if nested
             && self
@@ -4792,7 +4844,7 @@ impl App {
             self.confirm_pin = true;
             let names: Vec<String> = plan
                 .iter()
-                .map(|p| format!("{} → ^{}", p.name, p.version))
+                .map(|p| format!("{} → ^{}{}", p.name, p.version, pin_where(p.scope.as_ref())))
                 .collect();
             self.push_log(format!(
                 "📌 will set in package.json {key_name}: {}. Press p again to confirm, any other key cancels.",
@@ -4818,7 +4870,7 @@ impl App {
                     },
                 ),
                 None => {
-                    let loc = self.new_override_loc(&p.name);
+                    let loc = self.new_override_loc(p.scope.as_ref(), &p.name);
                     (loc.clone(), Change::Add { loc, new })
                 }
             };
@@ -4827,7 +4879,7 @@ impl App {
                 .rows
                 .iter()
                 .flat_map(|r| &r.vulns)
-                .filter(|v| v.package == p.name && pin_target(v).is_some_and(|t| t <= p.version))
+                .filter(|v| v.package == p.name && self.pin_scope(v) == p.scope && pin_target(v).is_some_and(|t| t <= p.version))
                 .map(|v| fixed(&p.name, v))
                 .collect();
             self.queued_fixes.extend(fixes.into_iter().map(|f| (key.clone(), f)));
@@ -4836,7 +4888,8 @@ impl App {
             keys.push(key);
             edits.push(change);
         }
-        let what: Vec<String> = plan.iter().map(|p| format!("{}@^{}", p.name, p.version)).collect();
+        let what: Vec<String> =
+            plan.iter().map(|p| format!("{}@^{}{}", p.name, p.version, pin_where(p.scope.as_ref()))).collect();
         self.push_log(format!("… queued override {}", what.join(", ")));
         let _ = self.jobs.send(Job {
             items: Vec::new(),
@@ -4845,6 +4898,20 @@ impl App {
             ..Default::default()
         });
     }
+}
+/// Where a pin applies, for the log: ` (only below express)`, or ` (everywhere)`.
+fn pin_where(scope: Option<&Scope>) -> String {
+    match scope {
+        Some(s) if s.deep => format!(" (only below {})", s.parent),
+        Some(s) => format!(" (only for {})", s.parent),
+        None => " (everywhere: nested overrides aren't supported)".to_string(),
+    }
+}
+/// The packages above the vulnerable one in `v`, from the direct dependency down.
+fn chain_of(v: &Vuln) -> Vec<String> {
+    let mut chain = vec![v.direct.clone()];
+    chain.extend(v.path.iter().take(v.path.len().saturating_sub(1)).cloned());
+    chain
 }
 /// `v`, fixed by changing `package`, as the commit lists it.
 fn fixed(package: &str, v: &Vuln) -> crate::deps::commit::Fixed {
@@ -6382,7 +6449,7 @@ mod tests {
         assert_eq!(
             job.edits,
             [Change::Add {
-                loc: vec!["overrides".into(), "qs".into()],
+                loc: vec!["overrides".into(), "a".into(), "qs".into()],
                 new: "^6.0.4".into()
             }]
         );
@@ -8330,10 +8397,17 @@ mod tests {
         let mut app = app_with_three_findings();
         app.overrides.push(override_of("other", "^9.0.0"));
         assert!(app.vuln_override(&nested(&app)).is_none());
-        let mut limited = override_of("qs", "^6.0.4");
-        limited.path = vec!["mid".into()];
-        app.overrides = vec![limited];
-        assert!(app.vuln_override(&nested(&app)).is_none());
+        let mut elsewhere = override_of("qs", "^6.0.4");
+        elsewhere.path = vec!["other".into()];
+        app.overrides = vec![elsewhere];
+        assert!(app.vuln_override(&nested(&app)).is_none(), "limited to a package not on the path");
+        // Limited to a package the finding is found under (a > mid > qs): it applies.
+        for parent in ["a", "mid"] {
+            let mut limited = override_of("qs", "^6.0.4");
+            limited.path = vec![parent.into()];
+            app.overrides = vec![limited];
+            assert!(app.vuln_override(&nested(&app)).is_some(), "{parent}");
+        }
     }
 
     #[test]
