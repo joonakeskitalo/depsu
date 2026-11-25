@@ -1627,7 +1627,7 @@ fn header_line(app: &App, label: &str, members: &[usize]) -> Line<'static> {
             .filter(|i| matches!(i, Item::Override { .. }))
             .count();
         return Line::from(format!("✂ {label} ({n}), press d to remove"))
-            .style(Style::new().fg(Color::Magenta).add_modifier(Modifier::BOLD));
+            .style(override_style(true));
     }
     let sel = members.iter().filter(|&&i| app.rows[i].selected).count();
     let mark = if sel == 0 {
@@ -1802,7 +1802,7 @@ fn row_line(app: &App, r: &AppRow, indent: usize, name_w: usize, width: usize) -
                 let n = conflicts.len();
                 format!("   ⚠ {n} override{} outside the wanted range", if n == 1 { "" } else { "s" })
             };
-            spans.push(Span::styled(text, Style::new().fg(Color::Yellow).add_modifier(Modifier::BOLD)));
+            spans.push(Span::styled(text, override_style(true)));
         }
     }
     // A package the lockfile lists without a checksum can't be verified when installed. Shown
@@ -1869,12 +1869,15 @@ fn severity_color(s: Severity) -> Color {
     }
 }
 
-fn compat_color(c: Compat) -> Color {
-    match c {
-        Compat::Ok => Color::Cyan,
-        Compat::Unknown => Color::Yellow,
-        Compat::Conflict => Color::Red,
-    }
+/// Overrides are cyan, so they aren't taken for vulnerabilities (magenta, red, yellow and
+/// blue by severity). A conflict is bold, and its symbol (⚠) says it is a problem.
+const OVERRIDE: Color = Color::Cyan;
+fn override_style(conflict: bool) -> Style {
+    let s = Style::new().fg(OVERRIDE);
+    if conflict { s.add_modifier(Modifier::BOLD) } else { s }
+}
+fn compat_style(c: Compat) -> Style {
+    override_style(c == Compat::Conflict)
 }
 
 fn compat_symbol(c: Compat) -> &'static str {
@@ -1894,14 +1897,13 @@ fn override_marker(r: &AppRow) -> (Vec<Span<'static>>, usize) {
     if !r.overrides.is_empty() && r.lists_own_overrides() {
         spans.push(Span::styled(
             compat_symbol(r.compat),
-            Style::new().fg(compat_color(r.compat)),
+            compat_style(r.compat),
         ));
         width += 1;
     }
     if !r.tree_hits.is_empty() {
         let risky = r.tree_hits.iter().any(|h| h.risk == Compat::Conflict);
-        let color = if risky { Color::Yellow } else { Color::Cyan };
-        spans.push(Span::styled("↳", Style::new().fg(color)));
+        spans.push(Span::styled("↳", override_style(risky)));
         width += 1;
     }
     // ✱: Snyk found vulnerabilities, coloured by the worst severity.
@@ -1965,16 +1967,12 @@ fn detail_lines(
             (
                 format!("{} {}", compat_symbol(c), o.describe()),
                 tail,
-                compat_color(c),
+                compat_style(c),
             )
         }
         Child::Tree(i) => {
             let h = &r.tree_hits[i];
-            let color = if h.risk == Compat::Conflict {
-                Color::Yellow
-            } else {
-                Color::Cyan
-            };
+            let color = override_style(h.risk == Compat::Conflict);
             // Would the new override value still satisfy the parent's declared range?
             let mut tail = String::new();
             if let Some(u) = &update {
@@ -2005,7 +2003,7 @@ fn detail_lines(
             if let Some(cve) = v.cve.first() {
                 t.push_str(&format!("  · {cve}"));
             }
-            (t, String::new(), severity_color(v.severity))
+            (t, String::new(), Style::new().fg(severity_color(v.severity)))
         }
         Child::Ignored(i) => {
             let v = &r.ignored[i];
@@ -2027,7 +2025,7 @@ fn detail_lines(
                 }
                 None => String::new(),
             };
-            (t, format!("  · ignored in .snyk{why}"), Color::DarkGray)
+            (t, format!("  · ignored in .snyk{why}"), Style::new().fg(Color::DarkGray))
         }
     };
 
@@ -2043,13 +2041,10 @@ fn detail_lines(
     };
     let mut spans = vec![
         Span::styled(mark.to_string(), Style::new().fg(Color::White)),
-        Span::styled(head, Style::new().fg(color)),
+        Span::styled(head, color),
     ];
     spans.extend(new_value);
-    spans.push(Span::styled(
-        format!("{rest}{tail}"),
-        Style::new().fg(color),
-    ));
+    spans.push(Span::styled(format!("{rest}{tail}"), color));
     if let Child::Vuln(i) = child {
         spans.extend(ignore_spans(app, &r.vulns[i]));
         spans.extend(override_spans(app, &r.vulns[i]));
@@ -2063,7 +2058,7 @@ fn detail_lines(
     if let Some(reason) = unneeded {
         spans.push(Span::styled(
             format!("  ✂ may be removed: {reason}"),
-            Style::new().fg(Color::Magenta),
+            override_style(false),
         ));
     }
 
@@ -2142,7 +2137,7 @@ fn override_spans(app: &App, v: &crate::security::vuln::Vuln) -> Vec<Span<'stati
     } else {
         (
             format!("  ⚠ override {} → {} is set, but the last scan still lists this: reinstall, then scan again", o.name, o.value),
-            Style::new().fg(Color::Yellow),
+            override_style(true),
         )
     };
     vec![Span::styled(text, style)]
@@ -2281,8 +2276,8 @@ fn orphan_lines(app: &App, key: &str, width: usize) -> Vec<Line<'static>> {
     let reason = app.unneeded(o).map(|u| u.reason(o)).unwrap_or_default();
     let spans = vec![
         Span::raw(mark),
-        Span::styled("✂ ", Style::new().fg(Color::Magenta)),
-        Span::raw(o.describe()),
+        Span::styled("✂ ", override_style(false)),
+        Span::styled(o.describe(), override_style(false)),
         Span::styled(format!("   {reason}"), Style::new().fg(Color::DarkGray)),
     ];
     let mut spans = spans;
@@ -2354,7 +2349,7 @@ fn summary_lines(app: &App, width: usize) -> Vec<Line<'static>> {
             text.push_str(&format!(" ✂ may be removed: {}", u.reason(o)));
         }
         text.push_str("   ");
-        spans.push(Span::styled(text, Style::new().fg(compat_color(c))));
+        spans.push(Span::styled(text, compat_style(c)));
     }
     if !r.tree_hits.is_empty() {
         // Risky hits come first.
@@ -2367,12 +2362,8 @@ fn summary_lines(app: &App, width: usize) -> Vec<Line<'static>> {
             })
             .collect();
         let text = format!("↳ overrides in dependency tree: {}", shown.join(", "));
-        let color = if r.tree_hits.iter().any(|h| h.risk == Compat::Conflict) {
-            Color::Yellow
-        } else {
-            Color::Cyan
-        };
-        spans.push(Span::styled(text, Style::new().fg(color)));
+        let risky = r.tree_hits.iter().any(|h| h.risk == Compat::Conflict);
+        spans.push(Span::styled(text, override_style(risky)));
     }
     if spans.is_empty() {
         return Vec::new();

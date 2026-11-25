@@ -178,8 +178,11 @@ Only the field your package manager honours is read. They are listed under each 
 | `⚑` | The package itself is overridden, and the update is compatible |
 | `⚠` | The update conflicts with its override |
 | `?` | The override can't be interpreted (URL, alias, odd range) |
-| `↳` | An override applies somewhere in the package's installed dependency tree (yellow if it forces a version outside what the parent declares) |
+| `↳` | An override applies somewhere in the package's installed dependency tree (bold if it forces a version outside what the parent declares) |
 | `✱` | A scan found vulnerabilities (coloured by worst severity) |
+
+Overrides are always cyan, bold when they conflict, so they can't be mistaken for vulnerabilities,
+which are coloured by severity: critical magenta, high red, medium yellow, low blue.
 
 **Compatibility.** npm requires an override on a direct dependency to have the exact same spec as
 the dependency (or be `$name`), otherwise it fails with `EOVERRIDE`. yarn, pnpm and bun let the
