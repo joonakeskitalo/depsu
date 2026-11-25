@@ -2436,7 +2436,7 @@ impl App {
     fn selectable(&self, i: usize) -> bool {
         match self.view.get(i) {
             Some(Item::Detail {
-                child: Child::Vuln(_),
+                child: Child::Vuln(_) | Child::Ignored(_),
                 ..
             }) => true,
             Some(item @ (Item::Detail { .. } | Item::Override { .. })) => self
@@ -2531,8 +2531,12 @@ impl App {
                 "x ignore in .snyk".into()
             });
         }
-        if matches!(self.cursor_item(), Some(Item::Policy { .. })) {
+        if matches!(self.cursor_item(), Some(Item::Policy { .. }))
+            || matches!(self.cursor_item(), Some(Item::Detail { child: Child::Ignored(_), .. }))
+        {
             item.push("x edit ignore".into());
+        }
+        if self.cursor_rule().is_some() {
             item.push("d remove ignore".into());
         }
         if let Some((_, v)) = self.cursor_vuln()
@@ -3892,6 +3896,26 @@ impl App {
         Some((*idx, self.rows[*idx].vulns.get(*i)?))
     }
 
+    /// The finding under the cursor, ignored by a `.snyk` rule or not.
+    pub fn cursor_finding(&self) -> Option<(usize, &Vuln)> {
+        match self.cursor_item()? {
+            Item::Detail { idx, child: Child::Vuln(i), .. } => Some((*idx, self.rows[*idx].vulns.get(*i)?)),
+            Item::Detail { idx, child: Child::Ignored(i), .. } => Some((*idx, self.rows[*idx].ignored.get(*i)?)),
+            _ => None,
+        }
+    }
+    /// The `.snyk` rule under the cursor: the rule itself, or the one that covers the finding
+    /// there (an ignored finding, or one the rule covers but the last scan still lists).
+    fn cursor_rule(&self) -> Option<Ignore> {
+        if let Some(Item::Policy { id, path }) = self.cursor_item() {
+            return self.policy_rule(id, path).cloned();
+        }
+        let (_, v) = self.cursor_finding()?;
+        if v.source != Source::Snyk {
+            return None;
+        }
+        self.ignores.iter().find(|r| r.covers(v)).cloned()
+    }
     fn cursor_vuln_fix(&self) -> Option<Result<(usize, Version), String>> {
         let Some(Item::Detail {
             idx,
@@ -4039,8 +4063,8 @@ impl App {
 
     /// Asks before deleting the checked packages and overrides (or the item under the cursor).
     fn delete_selected(&mut self) {
-        if matches!(self.cursor_item(), Some(Item::Policy { .. })) {
-            return self.remove_policy_cursor();
+        if let Some(rule) = self.cursor_rule() {
+            return self.remove_policy_cursor(&rule.id, &rule.path);
         }
         let (packages, overrides, _) = self.delete_targets();
         if packages.is_empty() && overrides.is_empty() {
@@ -4981,6 +5005,14 @@ impl App {
                 .unwrap_or_default();
             return self.open_ignore(&rule.id, &title, &rule.path, Some(&rule));
         }
+        // An ignored finding edits the rule that ignores it.
+        if let Some(Item::Detail { child: Child::Ignored(_), .. }) = self.cursor_item()
+            && let Some(rule) = self.cursor_rule()
+            && let Some((_, v)) = self.cursor_finding()
+        {
+            let title = v.title.clone();
+            return self.open_ignore(&rule.id, &title, &rule.path, Some(&rule));
+        }
         let Some((_, v)) = self.cursor_vuln() else {
             self.push_log("Put the cursor on a Snyk finding to ignore it in .snyk.");
             return;
@@ -5012,11 +5044,9 @@ impl App {
         });
     }
 
-    /// `d` on an ignore rule: removes it from `.snyk` after a second press.
-    fn remove_policy_cursor(&mut self) {
-        let Some(Item::Policy { id, path }) = self.cursor_item().cloned() else {
-            return;
-        };
+    /// `d` on an ignore rule, or on a finding one covers: removes the rule from `.snyk` after a second press.
+    fn remove_policy_cursor(&mut self, id: &str, path: &str) {
+        let (id, path) = (id.to_string(), path.to_string());
         let key = (id.clone(), path.clone());
         if self.confirm_unignore.as_ref() != Some(&key) {
             self.push_log(format!(
@@ -8842,10 +8872,19 @@ mod tests {
         let (line, colour) = line_and_colour(&mut app, "IGN  Hidden", "⊘");
         assert!(line.contains("ignored in .snyk: old"), "{line}");
         assert_eq!(colour, Some(ratatui::style::Color::DarkGray));
-        // Informational: the cursor skips it.
-        assert!(!app.view.iter().enumerate().any(|(i, it)| {
-            matches!(it, Item::Detail { child: Child::Ignored(_), .. }) && app.selectable(i)
-        }));
+        // The cursor can stop on it, and d (twice) removes the rule that ignores it.
+        let at = app
+            .view
+            .iter()
+            .position(|it| matches!(it, Item::Detail { child: Child::Ignored(_), .. }))
+            .unwrap();
+        assert!(app.selectable(at));
+        app.table.select(Some(at));
+        app.on_key(key('d'));
+        assert_eq!(app.ignores.len(), 1, "the first press only asks");
+        app.on_key(key('d'));
+        assert!(app.ignores.is_empty());
+        app.table.select(None);
         // Changing the policy drops the list: it needs a new scan.
         app.after_policy_change(false);
         assert!(row(&app, "a").ignored.is_empty());

@@ -166,7 +166,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         let details = app.cursor_info().cloned();
         let mut lines = if on_package {
             package_lines(details.as_ref(), &app.tools, panel_width(f) as usize)
-        } else if let Some((idx, v)) = app.cursor_vuln() {
+        } else if let Some((idx, v)) = app.cursor_finding() {
             vuln_lines(app, &app.rows[idx], v, panel_width(f) as usize)
         } else {
             Vec::new()
@@ -287,7 +287,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         Some(Item::Row { idx, .. }) => format!("selected: {}", app.rows[*idx].name),
         Some(Item::Removed { name }) => format!("selected: {name}"),
         Some(Item::Policy { id, .. }) => format!("selected: {id}"),
-        _ => match app.cursor_vuln() {
+        _ => match app.cursor_finding() {
             Some((_, v)) => format!("selected: {} in {}", v.id, v.package),
             None => "selected".to_string(),
         },

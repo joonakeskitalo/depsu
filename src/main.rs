@@ -54,6 +54,7 @@ KEYS:
     o              show / hide the override lines under each package
     d              delete: uninstall the checked packages and remove the checked
                    overrides, or the package / override under the cursor (asks first)
+                   on an ignored finding or a .snyk rule: remove the rule (press twice)
     s              scan with Snyk
     n              run npm audit / bun audit (by the project's package manager)
     e              edit the version of the highlighted package (and its pin type)
