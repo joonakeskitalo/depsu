@@ -161,10 +161,13 @@ pub fn check(plan: &[(String, Version)], p: &Project) -> Report {
     report
 }
 
-/// One way to fix a package's unmet peers: the packages to install.
+/// One way to fix a package's unmet peers: the packages to install, and the overrides to
+/// remove from `package.json`.
 #[derive(Clone, Debug, PartialEq)]
 pub struct FixOption {
     pub plan: Vec<(String, Version)>,
+    /// Overrides that force a peer outside the range the package asks for.
+    pub remove: Vec<crate::deps::overrides::Override>,
     /// E.g. `update b to 2.1.0` or `downgrade a to 0.9.0`.
     pub label: String,
 }
@@ -231,7 +234,7 @@ pub fn fix_options(
             })
             .collect::<Vec<_>>()
             .join(", ");
-        options.push(FixOption { plan, label });
+        options.push(FixOption { plan, label, remove: Vec::new() });
     }
 
     // 2. The package itself.
@@ -248,6 +251,7 @@ pub fn fix_options(
                     Some(v) => options.push(FixOption {
                         label: format!("{} {package} to {v}", verb(Some(have), &v)),
                         plan: vec![(package.to_string(), v)],
+                        remove: Vec::new(),
                     }),
                     None => notes.push(format!(
                         "no release of {package} accepts the installed {}",
@@ -447,11 +451,13 @@ mod tests {
             [
                 FixOption {
                     plan: vec![("react".into(), v("19.0.0"))],
-                    label: "update react to 19.0.0".into()
+                    label: "update react to 19.0.0".into(),
+                    remove: Vec::new(),
                 },
                 FixOption {
                     plan: vec![("plugin".into(), v("0.9.0"))],
-                    label: "downgrade plugin to 0.9.0".into()
+                    label: "downgrade plugin to 0.9.0".into(),
+                    remove: Vec::new(),
                 },
             ]
         );

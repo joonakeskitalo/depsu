@@ -2422,7 +2422,13 @@ impl App {
             match pick.and_then(|i| p.options.get(i)) {
                 Some(o) => {
                     self.push_log(format!("… fixing the peers of {}: {}", p.name, o.label));
-                    self.start_install(o.plan.clone(), Vec::new());
+                    let o = o.clone();
+                    if !o.remove.is_empty() {
+                        self.remove_overrides(&o.remove);
+                    }
+                    if !o.plan.is_empty() {
+                        self.start_install(o.plan, Vec::new());
+                    }
                 }
                 None => self.push_log("Peers unchanged."),
             }
@@ -2767,6 +2773,86 @@ impl App {
 
     // ---- choosing a version, adding a package -------------------------------------------
 
+    /// The overrides that force an unmet peer of `r` outside the range `r` asks for: an
+    /// override of the peer that applies to `r` (everywhere, or limited to `r`) and whose
+    /// version doesn't fit the range.
+    pub fn peer_culprits(&self, r: &Row) -> Vec<&Override> {
+        let chain = [r.name.clone()];
+        let mut out: Vec<&Override> = Vec::new();
+        for p in r.peers.iter().filter(|p| p.met() == Some(false)) {
+            for o in &self.overrides {
+                let forced = overrides::min_version(&o.value);
+                if o.name == p.name
+                    && o.path_applies(&chain)
+                    && forced.is_some_and(|v| overrides::satisfies(&p.range, &v) == Some(false))
+                    && !out.iter().any(|x| x.key() == o.key())
+                {
+                    out.push(o);
+                }
+            }
+        }
+        out
+    }
+    /// The way to fix the peers of `r` by removing the overrides that cause the conflict, if
+    /// an override does. Says which findings the override fixes, since they come back.
+    fn culprit_option(&self, r: &Row) -> Option<peers::FixOption> {
+        let culprits = self.peer_culprits(r);
+        if culprits.is_empty() {
+            return None;
+        }
+        let mut parts = Vec::new();
+        for o in &culprits {
+            let mut ids: Vec<&str> = self
+                .rows
+                .iter()
+                .flat_map(|r| &r.vulns)
+                .filter(|v| self.vuln_override(v).is_some_and(|x| x.key() == o.key()))
+                .map(|v| v.id.as_str())
+                .collect();
+            ids.sort();
+            ids.dedup();
+            let back = if ids.is_empty() {
+                String::new()
+            } else {
+                format!(" (⚠ brings back {})", ids.join(", "))
+            };
+            parts.push(format!("{}{back}", o.describe()));
+        }
+        Some(peers::FixOption {
+            plan: Vec::new(),
+            remove: culprits.into_iter().cloned().collect(),
+            label: format!("remove the override that forces it: {}", parts.join("; ")),
+        })
+    }
+    /// Removes `list` from `package.json` and installs.
+    fn remove_overrides(&mut self, list: &[Override]) {
+        let mut edits = Vec::new();
+        let mut keys = Vec::new();
+        for o in list {
+            if self.override_busy(o) {
+                continue;
+            }
+            keys.push(o.key());
+            self.changed.insert(o.key());
+            self.selected_overrides.remove(&o.key());
+            self.busy_overrides.insert(o.key());
+            edits.push(Change::Remove {
+                loc: o.loc.clone(),
+                old: o.value.clone(),
+            });
+        }
+        if edits.is_empty() {
+            return;
+        }
+        let what: Vec<String> = keys.iter().map(|k| override_label(k)).collect();
+        self.push_log(format!("… queued removing {}", what.join(", ")));
+        let _ = self.jobs.send(Job {
+            edits,
+            keys,
+            ..Default::default()
+        });
+    }
+
     /// Looks up the ways to fix the unmet peers of the package under the cursor, then asks.
     fn fix_unmet_peers(&mut self) {
         let Some(Item::Row { idx, .. }) = self.cursor_item() else {
@@ -2834,6 +2920,11 @@ impl App {
         options: Vec<peers::FixOption>,
         notes: Vec<String>,
     ) {
+        let mut options = options;
+        // Removing the override that causes the conflict comes first: it undoes the cause.
+        if let Some(o) = self.rows.iter().find(|r| r.name == name && r.kind != Kind::Override).and_then(|r| self.culprit_option(r)) {
+            options.insert(0, o);
+        }
         if options.is_empty() {
             self.push_log(format!("✘ Can't fix the peers of {name}: {}.", notes.join("; ")));
             return;

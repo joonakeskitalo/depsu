@@ -1761,11 +1761,13 @@ fn row_line(app: &App, r: &AppRow, indent: usize, name_w: usize, width: usize) -
     if !unmet.is_empty() {
         let used: usize = spans.iter().map(|s| s.width()).sum();
         let s = if unmet.len() == 1 { "" } else { "s" };
-        let full = format!("   ⚠ unmet peer{s}: {}", unmet.join(", "));
+        // An override forcing the peer is the cause, and `f` offers to remove it.
+        let forced = if app.peer_culprits(r).is_empty() { "" } else { " (forced by an override, f to fix)" };
+        let full = format!("   ⚠ unmet peer{s}: {}{forced}", unmet.join(", "));
         let text = if used + full.chars().count() < width {
             full
         } else {
-            format!("   ⚠ {} unmet peer{s}", unmet.len())
+            format!("   ⚠ {} unmet peer{s}{forced}", unmet.len())
         };
         spans.push(Span::styled(
             text,
@@ -2635,10 +2637,12 @@ fn peer_lines(app: &App, width: u16) -> Vec<Line<'static>> {
     let Some(Item::Row { idx, .. }) = app.cursor_item() else {
         return Vec::new();
     };
-    let peers = &app.rows[*idx].peers;
+    let row = &app.rows[*idx];
+    let peers = &row.peers;
     if peers.is_empty() {
         return Vec::new();
     }
+    let culprits = app.peer_culprits(row);
     let (cyan, yellow) = (Style::new().fg(Color::Cyan), Style::new().fg(Color::Yellow));
     let label = format!(
         "{} peer dependenc{}: ",
@@ -2649,10 +2653,13 @@ fn peer_lines(app: &App, width: u16) -> Vec<Line<'static>> {
         .iter()
         .map(|p| {
             vec![match (p.met(), &p.installed) {
-                (Some(false), Some(have)) => Span::styled(
-                    format!("{} {}, but {have} is installed", p.name, p.range),
-                    yellow,
-                ),
+                (Some(false), Some(have)) => {
+                    let by = match culprits.iter().find(|o| o.name == p.name) {
+                        Some(o) => format!(", forced by {} (f removes it)", o.describe()),
+                        None => String::new(),
+                    };
+                    Span::styled(format!("{} {}, but {have} is installed{by}", p.name, p.range), yellow)
+                }
                 (_, Some(have)) => Span::styled(format!("{} {} ({have})", p.name, p.range), cyan),
                 (_, None) => Span::styled(format!("{} {} (not installed)", p.name, p.range), cyan),
             }]
