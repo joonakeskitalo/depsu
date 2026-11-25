@@ -21,6 +21,10 @@ pub struct Cache {
     /// Latest version of each package, by name.
     #[serde(default)]
     pub latest: BTreeMap<String, String>,
+    /// When the newest stable releases of each package were published (Unix seconds), for
+    /// the release cooldown. A package with an empty map was looked up and has no times.
+    #[serde(default)]
+    pub published: BTreeMap<String, BTreeMap<String, i64>>,
     /// Scan results of each project, by the project's directory.
     #[serde(default)]
     pub projects: BTreeMap<String, Scans>,
@@ -68,10 +72,12 @@ impl Cache {
     pub fn save(&mut self, path: &Path) -> Result<()> {
         if let Ok(mut disk) = Cache::load(path) {
             disk.latest.append(&mut self.latest.clone());
+            disk.published.append(&mut self.published.clone());
             for (project, scans) in std::mem::take(&mut self.projects) {
                 disk.projects.entry(project).or_default().merge(scans);
             }
             self.latest = disk.latest;
+            self.published = disk.published;
             self.projects = disk.projects;
         }
         self.write(path)
@@ -85,6 +91,7 @@ impl Cache {
         }
         let mut cache = Cache::load(path)?;
         cache.latest.clear();
+        cache.published.clear();
         cache.projects.remove(project);
         // Written as it is: saving would merge the old file back in.
         cache.write(path)

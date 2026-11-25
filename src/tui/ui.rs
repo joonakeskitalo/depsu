@@ -1216,6 +1216,10 @@ fn header_lines(app: &App, width: u16) -> (Vec<Line<'static>>, Vec<Placed>) {
     if app.group_by != GroupBy::None {
         info.push((format!("group: {}", app.group_by.label()), Some('g')));
     }
+    match crate::registry::registry::cooldown_days() {
+        0 => info.push(("cooldown off".to_string(), None)),
+        d => info.push((format!("cooldown {d}d"), None)),
+    }
     if !app.show_vulns {
         info.push(("vulns hidden".to_string(), Some('v')));
     }

@@ -34,6 +34,10 @@ OPTIONS:
         --clear-npm-cache
                        Empty npm's cache before starting: the one given with --pm-cache,
                        or else npm's own, and the one given with --proxy-cache. npm only.
+        --cooldown <DAYS>
+                       Only offer a version as the latest once it has been published for
+                       DAYS days (default 3, 0 turns it off). [ and ] change it while
+                       depsu runs. Needs the full package document, which is larger.
         --cache <FILE> JSON file that remembers latest versions and scans between runs
     -h, --help         Print help
     -V, --version      Print version
@@ -60,6 +64,7 @@ KEYS:
                    commit of the changes (e.g. 'chore: upgrade eslint 8.57.0 to 9.0.0')
     +              add a package as a dependency, dev dependency or override
     R              fetch the latest versions again (ignoring the cache)
+    [ ]            shorten / lengthen the release cooldown by a day
     ?              show / hide the details panel
     shift+up/down  scroll the details panel
     P              ask how to pin the selected packages (e exact, c ^, t ~, m >=)
@@ -119,6 +124,13 @@ fn main() -> Result<()> {
                 Some(d) => proxy_dir = Some(std::path::absolute(&d)?),
                 None => bail!("{arg} requires a value"),
             },
+            "--cooldown" => {
+                let v = args.next().unwrap_or_default();
+                match v.parse::<u32>() {
+                    Ok(d) if d <= 365 => registry::registry::set_cooldown_days(d),
+                    _ => bail!("--cooldown needs a number of days from 0 to 365, not `{v}`"),
+                }
+            }
             "--reset-cache" => reset_cache = true,
             "--clear-npm-cache" => clear_npm_cache = true,
             "--prefer-offline" => config::pm::set_prefer_offline(),

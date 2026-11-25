@@ -19,7 +19,7 @@ use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, Mo
 use ratatui::layout::Rect;
 use ratatui::widgets::ListState;
 use semver::Version;
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::mpsc::{self, Receiver, Sender};
@@ -29,7 +29,7 @@ use std::thread;
 pub enum Event {
     Fetched {
         name: String,
-        result: Result<Version, String>,
+        result: Result<registry::Latest, String>,
     },
     Tree {
         name: String,
@@ -720,6 +720,10 @@ pub struct App {
     overrides: Vec<Override>,
     /// Latest published version of each overridden package.
     override_latest: HashMap<String, Version>,
+    /// What the registry said about each package's newest releases, for the release cooldown.
+    releases: HashMap<String, registry::Latest>,
+    /// The cooldown the shown latest versions were computed with.
+    applied_cooldown: u32,
     /// Registry settings and HTTP agent, to look up packages that show up after the start.
     rc: Arc<Npmrc>,
     agent: ureq::Agent,
@@ -933,6 +937,8 @@ impl App {
             direct,
             overrides,
             override_latest: HashMap::new(),
+            releases: HashMap::new(),
+            applied_cooldown: registry::cooldown_days(),
             rc: rc.clone(),
             agent: agent.clone(),
             selected_overrides: HashSet::new(),
@@ -987,12 +993,26 @@ impl App {
         let mut queue = VecDeque::new();
         let mut cached = 0;
         for name in names {
+            let timed = registry::cooldown_days() > 0;
             let hit = use_cache
                 .then(|| {
-                    self.cache
+                    let tag = self
+                        .cache
                         .latest
                         .get(&name)
-                        .and_then(|v| Version::parse(v).ok())
+                        .and_then(|v| Version::parse(v).ok())?;
+                    let published = self.cache.published.get(&name);
+                    // Publish times are needed while a cooldown is on.
+                    if timed && published.is_none() {
+                        return None;
+                    }
+                    Some(registry::Latest {
+                        tag,
+                        published: published
+                            .map(|p| p.iter().filter_map(|(v, t)| Some((Version::parse(v).ok()?, *t))).collect())
+                            .unwrap_or_default(),
+                        timed,
+                    })
                 })
                 .flatten();
             match hit {
@@ -1009,6 +1029,8 @@ impl App {
         if cached > 0 {
             self.push_log(format!("… {cached} latest version(s) loaded from the cache, R fetches them again"));
         }
+        self.applied_cooldown = registry::cooldown_days();
+        let with_times = self.applied_cooldown > 0;
         let workers = registry::CONCURRENCY.min(queue.len());
         let queue = Arc::new(Mutex::new(queue));
         for _ in 0..workers {
@@ -1025,7 +1047,7 @@ impl App {
                     let Some(name) = queue.lock().unwrap().pop_front() else {
                         break;
                     };
-                    let result = registry::latest_version(&rc, &agent, &name);
+                    let result = registry::latest_release(&rc, &agent, &name, with_times);
                     if tx.send(Event::Fetched { name, result }).is_err() {
                         break;
                     }
@@ -1060,14 +1082,75 @@ impl App {
 
     // ---- cache -------------------------------------------------------------------------
 
-    fn cache_latest(&mut self, name: &str, latest: &Version) {
-        let v = latest.to_string();
+    fn cache_latest(&mut self, name: &str, latest: &registry::Latest) {
+        let v = latest.tag.to_string();
         if self.cache.latest.get(name) != Some(&v) {
             self.cache.latest.insert(name.to_string(), v);
             self.cache_dirty = true;
         }
+        if latest.timed {
+            let times: BTreeMap<String, i64> =
+                latest.published.iter().map(|(v, t)| (v.to_string(), *t)).collect();
+            if self.cache.published.get(name) != Some(&times) {
+                self.cache.published.insert(name.to_string(), times);
+                self.cache_dirty = true;
+            }
+        }
     }
-
+    /// The version to offer as the latest: the newest release that is at least the cooldown
+    /// old. When all of them are younger, the package stays where it is.
+    fn available(&self, name: &str, rel: &registry::Latest) -> Version {
+        let days = if rel.timed { registry::cooldown_days() } else { 0 };
+        let pick = rel.at(days, registry::now());
+        if days == 0 {
+            return rel.tag.clone();
+        }
+        let cur = self.current.get(name).map(|(_, _, c)| c.clone());
+        match (pick, cur) {
+            (Some(p), Some(c)) if p < c && c <= rel.tag => c,
+            (Some(p), _) => p,
+            (None, Some(c)) if c <= rel.tag => c,
+            (None, _) => rel.tag.clone(),
+        }
+    }
+    /// Changes the release cooldown by `by` days and applies it to the versions already known.
+    fn step_cooldown(&mut self, by: i32) {
+        let days = registry::cooldown_days().saturating_add_signed(by).min(365);
+        self.set_cooldown(days);
+    }
+    pub fn set_cooldown(&mut self, days: u32) {
+        if days == registry::cooldown_days() {
+            return;
+        }
+        registry::set_cooldown_days(days);
+        if days == 0 {
+            self.push_log("Release cooldown off: the latest version is the registry's `latest`");
+        } else {
+            self.push_log(format!("Release cooldown {days} day(s): versions published since then are not offered"));
+        }
+        self.apply_cooldown();
+    }
+    /// Recomputes the latest version of every package from what the registry said. Packages
+    /// looked up without publish times are fetched again when a cooldown is on.
+    fn apply_cooldown(&mut self) {
+        if self.loading() {
+            // Versions that arrive meanwhile use the new cooldown; the rest is redone then.
+            return;
+        }
+        if registry::cooldown_days() > 0 && self.releases.values().any(|r| !r.timed) {
+            self.refetch_latest();
+            return;
+        }
+        self.applied_cooldown = registry::cooldown_days();
+        let known: Vec<(String, Version)> = self
+            .releases
+            .iter()
+            .map(|(n, r)| (n.clone(), self.available(n, r)))
+            .collect();
+        for (name, latest) in known {
+            self.on_fetched(name, latest);
+        }
+    }
     /// Records what a scan found for each listed package, under the version the scanner
     /// looked at: the one it names in its findings, or else the resolved version. Packages
     /// whose version is unknown are not recorded, since a result under a guessed version
@@ -1457,12 +1540,15 @@ impl App {
             match ev {
                 Event::Fetched { name, result } => {
                     self.pending = self.pending.saturating_sub(1);
-                    if self.pending == 0 {
+                    let done = self.pending == 0;
+                    if done {
                         self.finish_fetch_log();
                     }
                     match result {
-                        Ok(latest) => {
-                            self.cache_latest(&name, &latest);
+                        Ok(rel) => {
+                            self.cache_latest(&name, &rel);
+                            let latest = self.available(&name, &rel);
+                            self.releases.insert(name.clone(), rel);
                             self.on_fetched(name, latest);
                         }
                         Err(e) => {
@@ -1473,6 +1559,10 @@ impl App {
                             self.push_log(format!("! {name}: {e}"));
                             self.rebuild_view();
                         }
+                    }
+                    // The cooldown was changed while the versions were coming in.
+                    if done && self.applied_cooldown != registry::cooldown_days() {
+                        self.apply_cooldown();
                     }
                 }
                 Event::Tree { name, hits } => self.on_tree(name, hits),
@@ -1932,8 +2022,9 @@ impl App {
                 self.current
                     .insert(name.clone(), (Kind::Override, prefix, cur));
                 let (rc, agent, tx) = (self.rc.clone(), self.agent.clone(), self.events_tx.clone());
+                let with_times = registry::cooldown_days() > 0;
                 thread::spawn(move || {
-                    let result = registry::latest_version(&rc, &agent, &name);
+                    let result = registry::latest_release(&rc, &agent, &name, with_times);
                     let _ = tx.send(Event::Fetched { name, result });
                 });
             }
@@ -2717,6 +2808,8 @@ impl App {
             KeyCode::Char('n') => self.start_scan(self.audit_source()),
             KeyCode::Char('?') => self.show_info = !self.show_info,
             KeyCode::Char('R') => self.refetch_latest(),
+            KeyCode::Char(']') => self.step_cooldown(1),
+            KeyCode::Char('[') => self.step_cooldown(-1),
             KeyCode::Char('r') => self.revert_selected(),
             KeyCode::Char('e') => self.ask_version(),
             KeyCode::Char('I') => self.add_integrity(),

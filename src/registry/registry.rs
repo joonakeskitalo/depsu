@@ -13,6 +13,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::collections::HashSet;
 use std::io::{BufReader, Read};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
 /// Number of parallel requests.
@@ -66,6 +67,144 @@ const UNAUTHORIZED: &str = "unauthorized (401): check the registry credentials i
 /// A 403: the registry refuses the request, e.g. a security policy blocking the package.
 const FORBIDDEN: &str = "forbidden (403): the registry refuses it";
 
+/// Default number of days a release must have been published before it counts as the latest.
+pub const DEFAULT_COOLDOWN_DAYS: u32 = 3;
+/// How many of the newest stable releases (and their publish times) are kept per package.
+const KEPT_RELEASES: usize = 50;
+/// Tests start without a cooldown, so they don't depend on when a version was published.
+static COOLDOWN_DAYS: AtomicU32 = AtomicU32::new(if cfg!(test) { 0 } else { DEFAULT_COOLDOWN_DAYS });
+pub fn cooldown_days() -> u32 {
+    COOLDOWN_DAYS.load(Ordering::Relaxed)
+}
+pub fn set_cooldown_days(days: u32) {
+    COOLDOWN_DAYS.store(days, Ordering::Relaxed);
+}
+/// Seconds since the Unix epoch now.
+pub fn now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs() as i64)
+}
+/// What the registry says about the newest versions of a package.
+#[derive(Clone, Debug)]
+pub struct Latest {
+    /// The `latest` dist-tag.
+    pub tag: Version,
+    /// When the newest stable releases up to `tag` were published (Unix seconds).
+    pub published: BTreeMap<Version, i64>,
+    /// Whether the publish times were asked for. They need the full package document, so
+    /// they are not fetched while the cooldown is off.
+    pub timed: bool,
+}
+impl Latest {
+    pub fn untimed(tag: Version) -> Latest {
+        Latest { tag, published: BTreeMap::new(), timed: false }
+    }
+    /// The newest release published at least `days` days before `now`. The `latest` tag when
+    /// there is no cooldown or no publish time is known. `None` when every release known is
+    /// younger than the cooldown.
+    pub fn at(&self, days: u32, now: i64) -> Option<Version> {
+        if days == 0 || self.published.is_empty() {
+            return Some(self.tag.clone());
+        }
+        let cutoff = now - i64::from(days) * 86_400;
+        self.published
+            .iter()
+            .rev()
+            .find(|(_, t)| **t <= cutoff)
+            .map(|(v, _)| v.clone())
+    }
+}
+/// Unix seconds of an ISO 8601 UTC timestamp like `2023-05-01T12:34:56.789Z`.
+fn parse_time(s: &str) -> Option<i64> {
+    let (date, time) = s.split_once('T')?;
+    let mut d = date.splitn(3, '-').map(|p| p.parse::<i64>().ok());
+    let (y, m, day) = (d.next()??, d.next()??, d.next()??);
+    let time = time.trim_end_matches('Z');
+    let time = time.split(['.', '+']).next()?;
+    let mut t = time.splitn(3, ':').map(|p| p.parse::<i64>().ok());
+    let (h, mi, sec) = (t.next()??, t.next()??, t.next()??);
+    if !(1..=12).contains(&m) || !(1..=31).contains(&day) {
+        return None;
+    }
+    // Days since 1970-01-01 (Howard Hinnant's civil-from-days, inverted).
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = y.div_euclid(400);
+    let yoe = y.rem_euclid(400);
+    let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + day - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146_097 + doe - 719_468;
+    Some(days * 86_400 + h * 3600 + mi * 60 + sec)
+}
+/// The newest stable releases up to `tag` with their publish times, from a `time` object.
+fn recent_releases(tag: &Version, time: &HashMap<String, String>) -> BTreeMap<Version, i64> {
+    let mut all: BTreeMap<Version, i64> = time
+        .iter()
+        .filter_map(|(v, t)| Some((Version::parse(v).ok()?, parse_time(t)?)))
+        .filter(|(v, _)| v.pre.is_empty() && v <= tag)
+        .collect();
+    while all.len() > KEPT_RELEASES {
+        all.pop_first();
+    }
+    all
+}
+/// The full package document's `dist-tags` and `time`. The abbreviated document has no
+/// publish times, so this one is much larger.
+fn tags_and_times(
+    agent: &ureq::Agent,
+    url: &str,
+    auth: Option<&str>,
+) -> Result<(HashMap<String, String>, HashMap<String, String>), Failure> {
+    #[derive(serde::Deserialize)]
+    struct Doc {
+        #[serde(rename = "dist-tags", default)]
+        tags: HashMap<String, String>,
+        #[serde(default)]
+        time: HashMap<String, serde_json::Value>,
+    }
+    let mut req = agent
+        .get(url)
+        .set("Accept", FULL)
+        .set("User-Agent", concat!("depsu/", env!("CARGO_PKG_VERSION")));
+    if let Some(auth) = auth {
+        req = req.set("Authorization", auth);
+    }
+    match req.call() {
+        Ok(resp) => {
+            let doc: Doc = serde_json::from_reader(BufReader::new(resp.into_reader()))
+                .map_err(|e| Failure::Other(format!("invalid response: {e}")))?;
+            let time = doc
+                .time
+                .into_iter()
+                .filter_map(|(k, v)| Some((k, v.as_str()?.to_string())))
+                .collect();
+            Ok((doc.tags, time))
+        }
+        Err(ureq::Error::Status(404, _)) => Err(Failure::NotFound),
+        Err(ureq::Error::Status(401, _)) => Err(Failure::Other(UNAUTHORIZED.into())),
+        Err(ureq::Error::Status(403, _)) => Err(Failure::Other(FORBIDDEN.into())),
+        Err(ureq::Error::Status(code, _)) => Err(Failure::Other(format!("HTTP {code}"))),
+        Err(e) => Err(Failure::Other(e.to_string())),
+    }
+}
+/// The latest version of `name`, with the publish times of its newest releases when
+/// `with_times` (this reads the full package document).
+pub fn latest_release(rc: &Npmrc, agent: &ureq::Agent, name: &str, with_times: bool) -> Result<Latest, String> {
+    if !with_times {
+        return latest_version(rc, agent, name).map(Latest::untimed);
+    }
+    let registry = rc.registry_for(name);
+    let url = format!("{registry}{}", name.replacen('/', "%2f", 1));
+    let auth = rc.auth_for(name, &registry);
+    let (tags, time) = tags_and_times(agent, &url, auth.as_deref()).map_err(|f| match f {
+        Failure::NotFound => format!("not found in {registry}"),
+        Failure::Other(e) => e,
+    })?;
+    let latest = tags.get("latest").ok_or("no `latest` dist-tag")?;
+    let tag = Version::parse(latest).map_err(|e| format!("bad version {latest}: {e}"))?;
+    let published = recent_releases(&tag, &time);
+    Ok(Latest { tag, published, timed: true })
+}
 pub fn latest_version(rc: &Npmrc, agent: &ureq::Agent, name: &str) -> Result<Version, String> {
     let registry = rc.registry_for(name);
     // Scoped names need the slash encoded, keeping the leading @: @scope%2fname
@@ -314,6 +453,42 @@ mod tests {
             p.best(|_, i| i.peers.get("react").is_some_and(|r| r.starts_with("^18"))),
             Some(Version::new(18, 2, 0))
         );
+    }
+    #[test]
+    fn parses_publish_times() {
+        assert_eq!(parse_time("1970-01-01T00:00:00.000Z"), Some(0));
+        assert_eq!(parse_time("2024-03-01T00:00:00.000Z"), Some(1_709_251_200));
+        assert_eq!(parse_time("2023-05-01T12:34:56.789Z"), Some(1_682_944_496));
+        assert_eq!(parse_time("garbage"), None);
+    }
+    #[test]
+    fn the_cooldown_picks_the_newest_release_old_enough() {
+        let day = 86_400;
+        let now = 100 * day;
+        let mut l = Latest { tag: Version::new(3, 0, 0), published: BTreeMap::new(), timed: true };
+        l.published.insert(Version::new(1, 0, 0), now - 30 * day);
+        l.published.insert(Version::new(2, 0, 0), now - 4 * day);
+        l.published.insert(Version::new(3, 0, 0), now - day);
+        assert_eq!(l.at(0, now), Some(Version::new(3, 0, 0)));
+        assert_eq!(l.at(3, now), Some(Version::new(2, 0, 0)));
+        assert_eq!(l.at(4, now), Some(Version::new(2, 0, 0)));
+        assert_eq!(l.at(5, now), Some(Version::new(1, 0, 0)));
+        assert_eq!(l.at(60, now), None);
+    }
+    #[test]
+    fn times_are_read_from_the_full_document() {
+        let (url, _c, paths) = server(|_| {
+            (
+                200,
+                r#"{"dist-tags":{"latest":"2.0.0"},"time":{"created":"2020-01-01T00:00:00.000Z","1.0.0":"2020-01-01T00:00:00.000Z","2.0.0":"2020-02-01T00:00:00.000Z","3.0.0-rc.1":"2020-03-01T00:00:00.000Z"},"versions":{}}"#
+                    .into(),
+            )
+        });
+        let l = latest_release(&rc_for(&url), &agent(), "x", true).unwrap();
+        assert!(l.timed);
+        assert_eq!(l.tag, Version::new(2, 0, 0));
+        assert_eq!(l.published.len(), 2);
+        assert_eq!(paths.lock().unwrap().as_slice(), ["/x"]);
     }
     #[test]
     fn missing_dist_tags_is_an_error() {
