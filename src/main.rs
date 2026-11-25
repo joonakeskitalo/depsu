@@ -65,6 +65,8 @@ KEYS:
                    commit of the changes (e.g. 'chore: upgrade eslint 8.57.0 to 9.0.0')
     +              add a package as a dependency, dev dependency or override
     R              fetch the latest versions again (ignoring the cache)
+    T              installed tab: every package in node_modules with its size, install
+                   date and why it is there (s sort, / filter, r reread)
     [ ]            shorten / lengthen the release cooldown by a day
     ?              show / hide the details panel
     shift+up/down  scroll the details panel

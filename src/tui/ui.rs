@@ -145,6 +145,12 @@ fn panel_width(f: &Frame) -> u16 {
 }
 
 pub fn draw(f: &mut Frame, app: &mut App) {
+    if app.installed_open {
+        let header = format!("{} ({})", app.project_name(), app.pm.name());
+        app.targets = Default::default();
+        app.installed.draw(f, &header);
+        return;
+    }
     let log_h = (app.log.len() as u16).clamp(1, 5);
     app.targets = Default::default();
     let focus = focus(app);

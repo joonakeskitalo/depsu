@@ -341,7 +341,7 @@ fn strings(v: &Value) -> Vec<String> {
 }
 
 /// The directory Node resolves `name` to from `dir`, symlinks (pnpm) followed.
-fn package_dir(dir: &Path, name: &str) -> Option<PathBuf> {
+pub fn package_dir(dir: &Path, name: &str) -> Option<PathBuf> {
     dir.ancestors()
         .map(|a| a.join("node_modules").join(name))
         .find(|p| p.join("package.json").is_file())
@@ -349,7 +349,7 @@ fn package_dir(dir: &Path, name: &str) -> Option<PathBuf> {
 }
 
 /// Bytes and files under `dir`, leaving out nested `node_modules` and not following links.
-fn dir_size(dir: &Path) -> (u64, u64) {
+pub fn dir_size(dir: &Path) -> (u64, u64) {
     let (mut bytes, mut files) = (0, 0);
     let mut stack = vec![dir.to_path_buf()];
     while let Some(d) = stack.pop() {

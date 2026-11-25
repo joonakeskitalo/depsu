@@ -39,6 +39,8 @@ pub enum Event {
     Unneeded(Vec<(String, Unneeded)>),
     /// Installed packages that depend on each package, by name.
     Dependents(HashMap<String, Vec<Dependent>>),
+    /// Every installed package, for the installed tab.
+    Installed(Vec<crate::tui::installed::Entry>),
     /// What `node_modules` and the lockfile say about a package (`generation` tells answers
     /// from before an install apart).
     Info {
@@ -651,6 +653,9 @@ pub struct App {
     /// Who committed each override (by key), and when.
     override_origins: HashMap<String, Origin>,
     pub ignore_prompt: Option<IgnorePrompt>,
+    /// The installed tab (`T`) replaces the package list while it is open.
+    pub installed: crate::tui::installed::View,
+    pub installed_open: bool,
     /// The reason of the last ignore saved, offered again in the next new ignore. Not stored.
     last_ignore_reason: String,
     /// What the last Snyk scan of this session said `.snyk` ignores (ID and path). `None`
@@ -895,6 +900,8 @@ impl App {
             policy_origins: HashMap::new(),
             override_origins: HashMap::new(),
             ignore_prompt: None,
+            installed: Default::default(),
+            installed_open: false,
             last_ignore_reason: String::new(),
             policy_seen: None,
             policy_carried: HashMap::new(),
@@ -1059,6 +1066,45 @@ impl App {
         }
     }
 
+    /// Opens the installed tab, reading the packages when they haven't been or changed.
+    fn open_installed(&mut self) {
+        self.installed_open = true;
+        if self.installed.entries.is_none() || self.installed.stale {
+            self.read_installed();
+        }
+    }
+    fn read_installed(&mut self) {
+        if self.installed.loading {
+            return;
+        }
+        self.installed.loading = true;
+        let direct: HashMap<String, String> = self
+            .root_deps
+            .iter()
+            .filter_map(|(name, spec)| {
+                let kind = match self.current.get(name)?.0 {
+                    Kind::Prod => "dependency",
+                    Kind::Dev => "dev dependency",
+                    Kind::Optional => "optional dependency",
+                    Kind::Override => return None,
+                };
+                Some((name.clone(), format!("{kind} ({spec})")))
+            })
+            .collect();
+        let (dir, tx) = (self.dir.clone(), self.events_tx.clone());
+        thread::spawn(move || {
+            let _ = tx.send(Event::Installed(crate::tui::installed::collect(&dir, &direct)));
+        });
+    }
+    fn on_installed_key(&mut self, key: KeyEvent) {
+        use crate::tui::installed::Action;
+        match self.installed.on_key(key) {
+            Action::None => {}
+            Action::Close => self.installed_open = false,
+            Action::Refresh => self.read_installed(),
+            Action::Quit => self.quit = true,
+        }
+    }
     /// Looks the latest versions up again, ignoring the cache.
     fn refetch_latest(&mut self) {
         if self.loading() {
@@ -1511,6 +1557,7 @@ impl App {
     /// `node_modules`, the lockfile or HEAD changed: reads the details again. The old ones
     /// stay on screen until the new ones replace them.
     fn forget_info(&mut self) {
+        self.installed.stale = self.installed.entries.is_some();
         self.info_pending.clear();
         self.info_generation += 1;
         let _ = self.info_tx.send(InfoMsg::Reset { generation: self.info_generation });
@@ -1570,6 +1617,7 @@ impl App {
                 }
                 Event::Tree { name, hits } => self.on_tree(name, hits),
                 Event::Dependents(map) => self.dependents = map,
+                Event::Installed(entries) => self.installed.set(entries),
                 Event::IntegrityAdded(result, problems) => {
                     for p in problems {
                         self.push_log(format!("! {p}"));
@@ -2515,6 +2563,7 @@ impl App {
         global.push("g group".into());
         global.push("o overrides".into());
         global.push("U reinstall all".into());
+        global.push("T installed packages".into());
         scan.push("s snyk".into());
         if let Some(src) = audit::source_for(self.pm) {
             scan.push(format!("n {}", src.label()));
@@ -2610,6 +2659,10 @@ impl App {
         }
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
             self.quit = true;
+            return;
+        }
+        if self.installed_open {
+            self.on_installed_key(key);
             return;
         }
         if self.input.is_some() {
@@ -2815,6 +2868,7 @@ impl App {
             KeyCode::Char('n') => self.start_scan(self.audit_source()),
             KeyCode::Char('?') => self.show_info = !self.show_info,
             KeyCode::Char('R') => self.refetch_latest(),
+            KeyCode::Char('T') => self.open_installed(),
             KeyCode::Char(']') => self.step_cooldown(1),
             KeyCode::Char('[') => self.step_cooldown(-1),
             KeyCode::Char('r') => self.revert_selected(),
@@ -2852,6 +2906,14 @@ impl App {
     /// keys they name. Clicks on the list move the cursor, or check the item when they hit its
     /// mark. The wheel scrolls the list or the expanded log.
     pub fn on_mouse(&mut self, m: MouseEvent) {
+        if self.installed_open {
+            match m.kind {
+                MouseEventKind::ScrollUp => self.installed.scroll(true),
+                MouseEventKind::ScrollDown => self.installed.scroll(false),
+                _ => {}
+            }
+            return;
+        }
         let focus = crate::tui::ui::focus(self);
         let over_list = self.targets.list_panel.contains((m.column, m.row).into());
         let over_info = self.targets.info_panel.contains((m.column, m.row).into());
@@ -8671,6 +8733,29 @@ mod tests {
         app.on_key(key('x'));
         assert_eq!(app.ignore_prompt.as_ref().unwrap().reason.text(), "dev tool only");
         press(&mut app, KeyCode::Esc);
+    }
+    #[test]
+    fn the_installed_tab_lists_the_packages_and_goes_back() {
+        let mut app = app_with_cache("1.0.0", |_| {});
+        let p = app.dir.join("node_modules/a");
+        std::fs::create_dir_all(&p).unwrap();
+        std::fs::write(p.join("package.json"), r#"{"name":"a","version":"1.0.0"}"#).unwrap();
+        app.on_key(key('T'));
+        assert!(app.installed_open);
+        for _ in 0..100 {
+            app.drain_events();
+            if app.installed.entries.is_some() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let screen = render(&mut app, 120, 20).join("\n");
+        assert!(screen.contains("Installed") && screen.contains("Why"), "{screen}");
+        assert!(screen.contains("direct dependency"), "{screen}");
+        app.on_key(key('s'));
+        assert_eq!(app.installed.sort, crate::tui::installed::Sort::Size);
+        press(&mut app, KeyCode::Esc);
+        assert!(!app.installed_open);
     }
     fn cursor_on_policy(app: &mut App, id: &str) {
         let pos = app
