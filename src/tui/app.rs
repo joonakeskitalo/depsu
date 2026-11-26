@@ -617,6 +617,18 @@ pub struct Targets {
     pub items: Vec<(u16, u16, usize)>,
     /// Text areas the mouse can select from: inside the details and the log panels.
     pub selectable: Vec<Rect>,
+    /// The box of the context menu (empty when closed), and where each entry is: its index
+    /// in `ContextMenu::entries`.
+    pub menu_rect: Rect,
+    pub menu: Vec<(Rect, usize)>,
+}
+/// The menu a right click opens on a list item: the actions its footer hints offer there.
+pub struct ContextMenu {
+    /// The pointer position it opened at.
+    pub at: (u16, u16),
+    /// The key each action presses, and its label.
+    pub entries: Vec<(char, String)>,
+    pub choice: usize,
 }
 /// Text being selected with the mouse, in one of `Targets::selectable`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -667,6 +679,8 @@ pub struct App {
     pub peer_prompt: Option<PeerPrompt>,
     /// The fixes for a package's unmet peers (`f`), waiting for a choice.
     pub peer_fix: Option<PeerFix>,
+    /// The right-click menu of the item under the pointer.
+    pub context_menu: Option<ContextMenu>,
     /// What `d` is about to delete.
     pub delete_prompt: Option<DeletePrompt>,
     /// Versions the registry refuses, and what can be installed instead.
@@ -927,6 +941,7 @@ impl App {
             pin_prompt: false,
             peer_prompt: None,
             peer_fix: None,
+            context_menu: None,
             delete_prompt: None,
             blocked_prompt: None,
             commit_prompt: None,
@@ -2711,6 +2726,10 @@ impl App {
             self.on_installed_key(key);
             return;
         }
+        if self.context_menu.is_some() {
+            self.on_menu_key(key);
+            return;
+        }
         if self.input.is_some() {
             self.on_input_key(key);
             return;
@@ -2963,6 +2982,36 @@ impl App {
             }
             return;
         }
+        if self.context_menu.is_some() {
+            let MouseEventKind::Down(button) = m.kind else {
+                // The entry under the pointer is the chosen one.
+                if matches!(m.kind, MouseEventKind::Moved | MouseEventKind::Drag(_)) {
+                    let at = (m.column, m.row).into();
+                    let hover = self.targets.menu.iter().find(|(r, _)| r.contains(at)).map(|(_, i)| *i);
+                    if let (Some(i), Some(menu)) = (hover, &mut self.context_menu) {
+                        menu.choice = i;
+                    }
+                }
+                // Drops the menu when the wheel turns; the rest of a click is not its business.
+                if matches!(m.kind, MouseEventKind::ScrollUp | MouseEventKind::ScrollDown) {
+                    self.context_menu = None;
+                }
+                return;
+            };
+            let at = (m.column, m.row).into();
+            let entry = self.targets.menu.iter().find(|(r, _)| r.contains(at)).map(|(_, i)| *i);
+            if let (MouseButton::Left, Some(i)) = (button, entry) {
+                self.run_menu_entry(i);
+                return;
+            }
+            let inside = self.targets.menu_rect.contains(at);
+            self.context_menu = None;
+            // A click away closes the menu and does nothing else. A right click elsewhere
+            // goes on to open that item's menu.
+            if inside || button != MouseButton::Right {
+                return;
+            }
+        }
         let focus = crate::tui::ui::focus(self);
         let over_list = self.targets.list_panel.contains((m.column, m.row).into());
         let over_info = self.targets.info_panel.contains((m.column, m.row).into());
@@ -3014,6 +3063,11 @@ impl App {
                         self.click(m.column, m.row, focus);
                         self.selection = None;
                     }
+                }
+            }
+            MouseEventKind::Down(MouseButton::Right) => {
+                if focus == crate::tui::ui::Focus::List && self.select_at(m.column, m.row) {
+                    self.open_context_menu((m.column, m.row));
                 }
             }
             MouseEventKind::Drag(MouseButton::Left) => {
@@ -3071,28 +3125,89 @@ impl App {
             self.log_focus = false;
             focus = crate::tui::ui::Focus::List;
         }
-        if focus != crate::tui::ui::Focus::List || !inside(&self.targets.list) {
+        if focus != crate::tui::ui::Focus::List || !self.select_at(x, y) {
             return;
         }
-        let row = y - self.targets.list.y;
+        let Some(i) = self.table.selected() else {
+            return;
+        };
+        // The mark in front of a package or group checks it, like space does.
+        let on_mark = x - self.targets.list.x < 2;
+        if on_mark && matches!(self.view[i], Item::Row { .. } | Item::Header { .. }) {
+            self.toggle_cursor();
+            self.table.select(Some(i));
+        }
+    }
+    /// Moves the cursor to the list item drawn at (`x`, `y`). False when there is none there, or
+    /// the cursor can't rest on it.
+    fn select_at(&mut self, x: u16, y: u16) -> bool {
+        let list = self.targets.list;
+        if x < list.x || x >= list.x + list.width || y < list.y || y >= list.y + list.height {
+            return false;
+        }
+        let row = y - list.y;
         let Some(&(_, _, i)) = self
             .targets
             .items
             .iter()
             .find(|(top, h, _)| row >= *top && row < top + h)
         else {
-            return;
+            return false;
         };
         if !self.selectable(i) {
-            return;
+            return false;
         }
         self.cursor_moved = true;
         self.table.select(Some(i));
-        // The mark in front of a package or group checks it, like space does.
-        let on_mark = x - self.targets.list.x < 2;
-        if on_mark && matches!(self.view[i], Item::Row { .. } | Item::Header { .. }) {
-            self.toggle_cursor();
-            self.table.select(Some(i));
+        true
+    }
+    /// Opens the menu of the actions the cursor item offers, at the pointer.
+    fn open_context_menu(&mut self, at: (u16, u16)) {
+        let mut entries: Vec<(char, String)> = Vec::new();
+        let checkable = match self.cursor_item() {
+            Some(Item::Row { .. } | Item::Header { .. }) => true,
+            Some(item) => self.detail_override(item).is_some_and(|o| self.override_actionable(o)),
+            None => false,
+        };
+        if checkable {
+            entries.push((' ', "select".into()));
+        }
+        for hint in self.hints().0 {
+            let mut chars = hint.chars();
+            if let Some(key) = chars.next() {
+                entries.push((key, chars.as_str().trim_start().to_string()));
+            }
+        }
+        if entries.is_empty() {
+            return;
+        }
+        self.context_menu = Some(ContextMenu { at, entries, choice: 0 });
+    }
+    fn run_menu_entry(&mut self, i: usize) {
+        let Some(menu) = self.context_menu.take() else {
+            return;
+        };
+        if let Some(&(key, _)) = menu.entries.get(i) {
+            self.on_key(KeyEvent::new(KeyCode::Char(key), KeyModifiers::NONE));
+        }
+    }
+    fn on_menu_key(&mut self, key: KeyEvent) {
+        let Some(menu) = &mut self.context_menu else {
+            return;
+        };
+        let n = menu.entries.len();
+        match key.code {
+            KeyCode::Up | KeyCode::Char('k') => menu.choice = (menu.choice + n - 1) % n,
+            KeyCode::Down | KeyCode::Char('j') | KeyCode::Tab => menu.choice = (menu.choice + 1) % n,
+            KeyCode::Enter => {
+                let i = menu.choice;
+                self.run_menu_entry(i);
+            }
+            KeyCode::Char(c) => match menu.entries.iter().position(|(k, _)| *k == c) {
+                Some(i) => self.run_menu_entry(i),
+                None => self.context_menu = None,
+            },
+            _ => self.context_menu = None,
         }
     }
     fn on_log_key(&mut self, key: KeyEvent) {
@@ -8437,6 +8552,61 @@ mod tests {
         let Some(Item::Row { idx, .. }) = app.cursor_item() else { panic!("not on a package") };
         assert_eq!(app.rows[*idx].name, "p03");
         assert!(!app.rows[*idx].selected, "a click on the name does not check it");
+    }
+    #[test]
+    fn right_clicking_a_package_opens_a_menu_of_its_actions() {
+        let mut app = app_with_packages(5);
+        let buf = buffer(&mut app, 120, 30);
+        let (x, y) = find(&buf, "p03");
+        mouse(&mut app, MouseEventKind::Down(MouseButton::Right), x, y);
+        let Some(Item::Row { idx, .. }) = app.cursor_item() else { panic!("not on a package") };
+        assert_eq!(app.rows[*idx].name, "p03", "the cursor moves to the package");
+        let menu = app.context_menu.as_ref().expect("a menu");
+        assert!(menu.entries.iter().any(|(k, _)| *k == ' '), "{:?}", menu.entries);
+        assert!(menu.entries.iter().any(|(k, _)| *k == 'i'), "{:?}", menu.entries);
+        // Clicking an entry presses its key and closes the menu.
+        let buf = buffer(&mut app, 120, 30);
+        let (sx, sy) = find(&buf, "select");
+        mouse(&mut app, MouseEventKind::Down(MouseButton::Left), sx, sy);
+        assert!(app.context_menu.is_none());
+        assert!(app.rows.iter().find(|r| r.name == "p03").unwrap().selected);
+    }
+    #[test]
+    fn hovering_an_entry_of_the_context_menu_chooses_it() {
+        let mut app = app_with_packages(5);
+        let buf = buffer(&mut app, 120, 30);
+        let (x, y) = find(&buf, "p02");
+        mouse(&mut app, MouseEventKind::Down(MouseButton::Right), x, y);
+        let buf = buffer(&mut app, 120, 30);
+        let last = app.targets.menu.last().map(|(r, i)| (*r, *i)).unwrap();
+        assert!(last.1 > 0);
+        mouse(&mut app, MouseEventKind::Moved, last.0.x + 1, last.0.y);
+        assert_eq!(app.context_menu.as_ref().unwrap().choice, last.1);
+        // Outside the entries, the choice stays.
+        mouse(&mut app, MouseEventKind::Moved, 0, 0);
+        assert_eq!(app.context_menu.as_ref().unwrap().choice, last.1);
+        let _ = buf;
+    }
+    #[test]
+    fn the_context_menu_takes_keys_and_closes_on_a_click_away() {
+        let mut app = app_with_packages(5);
+        let buf = buffer(&mut app, 120, 30);
+        let (x, y) = find(&buf, "p02");
+        mouse(&mut app, MouseEventKind::Down(MouseButton::Right), x, y);
+        assert!(app.context_menu.is_some());
+        app.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(app.context_menu.is_none() && !app.quit);
+        // Down and Enter choose an entry.
+        mouse(&mut app, MouseEventKind::Down(MouseButton::Right), x, y);
+        app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(app.context_menu.is_none());
+        assert!(app.rows.iter().find(|r| r.name == "p02").unwrap().selected, "the first entry is select");
+        // A click elsewhere only closes it.
+        buffer(&mut app, 120, 30);
+        mouse(&mut app, MouseEventKind::Down(MouseButton::Right), x, y);
+        buffer(&mut app, 120, 30);
+        mouse(&mut app, MouseEventKind::Down(MouseButton::Left), 0, 0);
+        assert!(app.context_menu.is_none());
     }
     #[test]
     fn clicking_the_mark_of_a_package_checks_and_unchecks_it() {

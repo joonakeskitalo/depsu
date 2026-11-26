@@ -117,6 +117,7 @@ deprecation message and the checksum. Dependency changes compare with the lockfi
 (`git show`). The size is that of the installed copy, its own `node_modules` left out.
 ### Mouse
 - Click an item in the list to move the cursor to it. Click the mark (`○`, `●`) in front of a package or group to check it.
+- Right-click a package, an override line or a vulnerability finding to open a menu of the actions the footer offers for it (install, edit, delete, ignore, pin, select, and so on). Click an entry, or use `↑` `↓` with `Enter`, or press its key. `Esc` or a click elsewhere closes it.
 - Click a key hint in the footer to press that key. Click a header item (`group: …`, `vulns hidden`, `overrides hidden`, a scan result) to run its key. Click the `selected:` heading to toggle the details panel.
 - Click the log at the bottom to expand it. The list stays visible above it: click a package to give the keys back to the list, click the log to return to it. The wheel scrolls whichever the pointer is over.
 - In dialogs, click the footer hints, a peer fix option or an `Add as` choice.

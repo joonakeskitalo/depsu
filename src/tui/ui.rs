@@ -389,6 +389,70 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         let clicks = draw_add_dialog(f, app, input, *add_as, pin);
         app.targets.keys.extend(clicks);
     }
+    if let Some(menu) = &app.context_menu {
+        let (rect, entries) = draw_context_menu(f, menu);
+        app.targets.menu_rect = rect;
+        app.targets.menu = entries;
+    }
+}
+/// The right-click menu, next to the pointer. Returns its box and where each entry is.
+fn draw_context_menu(f: &mut Frame, menu: &crate::tui::app::ContextMenu) -> (Rect, Vec<(Rect, usize)>) {
+    let area = f.area();
+    let key_name = |k: char| if k == ' ' { "space".to_string() } else { k.to_string() };
+    let key_w = menu.entries.iter().map(|(k, _)| key_name(*k).chars().count()).max().unwrap_or(1);
+    let text_w = menu
+        .entries
+        .iter()
+        .map(|(_, l)| key_w + 2 + l.chars().count())
+        .max()
+        .unwrap_or(0);
+    let width = ((text_w + 4) as u16).min(area.width);
+    let height = (menu.entries.len() as u16 + 2).min(area.height);
+    let rect = Rect {
+        x: menu.at.0.min(area.x + area.width - width),
+        y: menu.at.1.min(area.y + area.height - height),
+        width,
+        height,
+    };
+    let lines: Vec<Line<'static>> = menu
+        .entries
+        .iter()
+        .enumerate()
+        .map(|(i, (k, label))| {
+            let line = Line::from(vec![
+                Span::styled(
+                    format!("{:<key_w$}", key_name(*k)),
+                    Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                ),
+                Span::raw(format!("  {label}")),
+            ]);
+            if i == menu.choice {
+                line.style(Style::new().add_modifier(Modifier::REVERSED))
+            } else {
+                line
+            }
+        })
+        .collect();
+    f.render_widget(Clear, rect);
+    f.render_widget(
+        Paragraph::new(lines).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
+                .border_style(Style::new().fg(Color::Cyan))
+                .padding(ratatui::widgets::Padding::horizontal(1)),
+        ),
+        rect,
+    );
+    let entries = (0..menu.entries.len().min(height.saturating_sub(2) as usize))
+        .map(|i| {
+            (
+                Rect { x: rect.x + 1, y: rect.y + 1 + i as u16, width: width.saturating_sub(2), height: 1 },
+                i,
+            )
+        })
+        .collect();
+    (rect, entries)
 }
 
 /// The lines of `field` as spans, with the cursor shown when `active`: the character under
