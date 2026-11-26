@@ -252,7 +252,9 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     let items: Vec<ListItem> = app
         .view
         .iter()
-        .map(|item| match item {
+        .enumerate()
+        .map(|(i, item)| (app.is_highlighted(i), item))
+        .map(|(lit, item)| (lit, match item {
             Item::Header { label, members } => ListItem::new(header_line(app, label, members)),
             Item::Row { idx, .. } => ListItem::new(row_line(app, &app.rows[*idx], indent, name_w, body.width as usize)),
             Item::Removed { name } => ListItem::new(removed_line(app, name)),
@@ -272,7 +274,9 @@ pub fn draw(f: &mut Frame, app: &mut App) {
                 indent,
                 body.width as usize,
             ))),
-        })
+        }))
+        // Highlighted items (drag, Shift-click) get a background, unlike checked ones (●).
+        .map(|(lit, li)| if lit { li.style(Style::new().bg(Color::DarkGray)) } else { li })
         .collect();
     let heights: Vec<u16> = items.iter().map(|i| i.height() as u16).collect();
     let list = List::new(items)

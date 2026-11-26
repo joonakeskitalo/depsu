@@ -681,6 +681,13 @@ pub struct App {
     pub peer_fix: Option<PeerFix>,
     /// The right-click menu of the item under the pointer.
     pub context_menu: Option<ContextMenu>,
+    /// The list item a left-button drag started on, for highlighting the range it covers.
+    drag_start: Option<usize>,
+    /// The highlighted list items, by `anchor_of`, so they survive list rebuilds. Actions that
+    /// otherwise take the item under the cursor take these instead.
+    highlight: HashSet<(u8, String)>,
+    /// Where the highlighted range starts, in `view`.
+    highlight_from: Option<usize>,
     /// What `d` is about to delete.
     pub delete_prompt: Option<DeletePrompt>,
     /// Versions the registry refuses, and what can be installed instead.
@@ -942,6 +949,9 @@ impl App {
             peer_prompt: None,
             peer_fix: None,
             context_menu: None,
+            drag_start: None,
+            highlight: HashSet::new(),
+            highlight_from: None,
             delete_prompt: None,
             blocked_prompt: None,
             commit_prompt: None,
@@ -2577,12 +2587,16 @@ impl App {
             .filter(|&i| self.rows[i].selected && ok(&self.rows[i]))
             .collect();
         if idx.is_empty() {
-            match self.cursor_item() {
-                Some(Item::Row { idx: i, .. }) => idx.push(*i),
-                Some(Item::Header { members, .. }) => idx.extend(members.iter().copied()),
-                _ => {}
+            for item in self.cursor_items() {
+                match item {
+                    Item::Row { idx: i, .. } => idx.push(i),
+                    Item::Header { members, .. } => idx.extend(members),
+                    _ => {}
+                }
             }
             idx.retain(|&i| ok(&self.rows[i]));
+            let mut seen = HashSet::new();
+            idx.retain(|i| seen.insert(*i));
         }
         idx
     }
@@ -2656,6 +2670,10 @@ impl App {
         }
         if !self.acting_rows(|r| !r.busy()).is_empty() {
             item.push("P pin type".into());
+        }
+        if !self.highlight.is_empty() {
+            item.push(format!("space check {} highlighted", self.cursor_items().len()));
+            item.push("esc unhighlight".into());
         }
         if self.cursor_vuln().is_none()
             && !self.acting_rows(|r| !r.busy() && !r.vulns.is_empty()).is_empty()
@@ -2875,11 +2893,19 @@ impl App {
         if key.code != KeyCode::Char('U') {
             self.confirm_reinstall = false;
         }
+        // Moving the cursor with the keys drops the highlight.
+        if matches!(
+            key.code,
+            KeyCode::Up | KeyCode::Down | KeyCode::Char('j' | 'k' | ',' | '.') | KeyCode::PageUp | KeyCode::PageDown | KeyCode::Home | KeyCode::End
+        ) {
+            self.clear_highlight();
+        }
         match key.code {
             KeyCode::Esc if !self.filter.is_empty() => {
                 self.filter.clear();
                 self.rebuild_view();
             }
+            KeyCode::Esc if !self.highlight.is_empty() => self.clear_highlight(),
             KeyCode::Char('q') | KeyCode::Esc => {
                 if self.installing() && !self.quit_warned {
                     self.quit_warned = true;
@@ -3041,6 +3067,21 @@ impl App {
                     _ => {}
                 }
             }
+            MouseEventKind::Down(MouseButton::Left)
+                if m.modifiers.intersects(KeyModifiers::SHIFT | KeyModifiers::ALT | KeyModifiers::CONTROL)
+                    && focus == crate::tui::ui::Focus::List
+                    && !self.targets.keys.iter().any(|(r, _)| r.contains((m.column, m.row).into()))
+                    && self.targets.list.contains((m.column, m.row).into()) =>
+            {
+                // The range starts where the last one started, or at the cursor.
+                let from = self.highlight_from.or(self.table.selected());
+                if self.select_at(m.column, m.row)
+                    && let (Some(a), Some(b)) = (from, self.table.selected())
+                {
+                    self.set_highlight(a, b);
+                    self.highlight_from = Some(a);
+                }
+            }
             MouseEventKind::Down(MouseButton::Left) => {
                 let at = (m.column, m.row);
                 let area = matches!(focus, crate::tui::ui::Focus::List | crate::tui::ui::Focus::Log)
@@ -3060,14 +3101,42 @@ impl App {
                     // The selection is dropped after the click, so the `y copy selection` hint
                     // still has it to copy.
                     None => {
+                        // A plain click on the list drops the highlight.
+                        if focus == crate::tui::ui::Focus::List
+                            && self.targets.list.contains(at.into())
+                        {
+                            self.clear_highlight();
+                        }
                         self.click(m.column, m.row, focus);
                         self.selection = None;
+                        // Dragging on from the item, but not from its mark, checks a range.
+                        let list = self.targets.list;
+                        self.drag_start = (focus == crate::tui::ui::Focus::List
+                            && list.contains(at.into())
+                            && m.column - list.x >= 2)
+                            .then(|| self.table.selected())
+                            .flatten();
                     }
                 }
             }
             MouseEventKind::Down(MouseButton::Right) => {
                 if focus == crate::tui::ui::Focus::List && self.select_at(m.column, m.row) {
+                    // The menu acts on the highlight when opened on it, else on this item.
+                    if let Some(i) = self.table.selected()
+                        && !self.is_highlighted(i)
+                    {
+                        self.clear_highlight();
+                    }
                     self.open_context_menu((m.column, m.row));
+                }
+            }
+            MouseEventKind::Drag(MouseButton::Left) if self.drag_start.is_some() => {
+                // The cursor follows the pointer, and the range with it.
+                if self.select_at(m.column, m.row)
+                    && let (Some(a), Some(b)) = (self.drag_start, self.table.selected())
+                {
+                    self.set_highlight(a, b);
+                    self.highlight_from = Some(a);
                 }
             }
             MouseEventKind::Drag(MouseButton::Left) => {
@@ -3079,6 +3148,9 @@ impl App {
                     );
                     s.dragged |= s.end != s.start;
                 }
+            }
+            MouseEventKind::Up(MouseButton::Left) if self.drag_start.is_some() => {
+                self.drag_start = None;
             }
             MouseEventKind::Up(MouseButton::Left) => match self.selection {
                 // The text stays selected; `y` copies it.
@@ -3161,6 +3233,80 @@ impl App {
         self.table.select(Some(i));
         true
     }
+    /// Highlights the packages and override lines listed from `view[a]` to `view[b]`, both
+    /// included. A range of one item is just the cursor, so nothing is highlighted.
+    fn set_highlight(&mut self, a: usize, b: usize) {
+        self.highlight.clear();
+        if a == b {
+            return;
+        }
+        let (lo, hi) = (a.min(b), a.max(b));
+        for item in self.view.iter().take(hi + 1).skip(lo) {
+            let take = match item {
+                Item::Row { .. } => true,
+                Item::Detail { .. } | Item::Override { .. } => self.detail_override(item).is_some(),
+                _ => false,
+            };
+            if take {
+                self.highlight.insert(anchor_of(item));
+            }
+        }
+    }
+    /// Checks the highlighted packages and override lines, or unchecks them when they are
+    /// all checked already.
+    fn check_highlight(&mut self) {
+        let mut rows: Vec<usize> = Vec::new();
+        let mut keys: Vec<String> = Vec::new();
+        for item in self.cursor_items() {
+            match &item {
+                Item::Row { idx, .. } if self.rows[*idx].can_select() => rows.push(*idx),
+                Item::Detail { .. } | Item::Override { .. } => {
+                    if let Some(o) = self.detail_override(&item)
+                        && !self.override_busy(o)
+                        && self.override_actionable(o)
+                    {
+                        keys.push(o.key());
+                    }
+                }
+                _ => {}
+            }
+        }
+        let all = rows.iter().all(|&i| self.rows[i].selected)
+            && keys.iter().all(|k| self.selected_overrides.contains(k));
+        for i in rows {
+            self.rows[i].selected = !all;
+        }
+        for k in keys {
+            if all {
+                self.selected_overrides.remove(&k);
+            } else {
+                self.selected_overrides.insert(k);
+            }
+        }
+    }
+    fn clear_highlight(&mut self) {
+        self.highlight.clear();
+        self.highlight_from = None;
+    }
+    /// Whether `view[i]` is highlighted.
+    pub fn is_highlighted(&self, i: usize) -> bool {
+        !self.highlight.is_empty() && self.view.get(i).is_some_and(|it| self.highlight.contains(&anchor_of(it)))
+    }
+    /// What an action takes when nothing is checked: the highlighted items, or else the item
+    /// under the cursor.
+    fn cursor_items(&self) -> Vec<Item> {
+        let lit: Vec<Item> = self
+            .view
+            .iter()
+            .filter(|it| !self.highlight.is_empty() && self.highlight.contains(&anchor_of(it)))
+            .cloned()
+            .collect();
+        if lit.is_empty() {
+            self.cursor_item().cloned().into_iter().collect()
+        } else {
+            lit
+        }
+    }
     /// Opens the menu of the actions the cursor item offers, at the pointer.
     fn open_context_menu(&mut self, at: (u16, u16)) {
         let mut entries: Vec<(char, String)> = Vec::new();
@@ -3173,6 +3319,10 @@ impl App {
             entries.push((' ', "select".into()));
         }
         for hint in self.hints().0 {
+            // The menu has its own entry for space; Esc closes it anyway.
+            if hint.starts_with("space ") || hint.starts_with("esc ") {
+                continue;
+            }
             let mut chars = hint.chars();
             if let Some(key) = chars.next() {
                 entries.push((key, chars.as_str().trim_start().to_string()));
@@ -4107,6 +4257,9 @@ impl App {
     /// Space on a package toggles it and moves down; on a group header it toggles the whole
     /// group; on an updatable override line it toggles that override.
     fn toggle_cursor(&mut self) {
+        if !self.highlight.is_empty() {
+            return self.check_highlight();
+        }
         let Some(item) = self.cursor_item().cloned() else {
             return;
         };
@@ -4284,20 +4437,25 @@ impl App {
             .collect();
 
         if idx.is_empty() && ovr.is_empty() {
-            match self.cursor_item().cloned() {
-                Some(Item::Row { idx: i, .. }) => idx.push(i),
-                Some(Item::Header { members, .. }) => idx.extend(members),
-                Some(item @ (Item::Detail { .. } | Item::Override { .. })) => {
-                    if let Some(o) = self.detail_override(&item)
-                        && !self.override_busy(o)
-                        && let Some(u) = self.update_target(o)
-                    {
-                        ovr.push((o.clone(), u.value));
+            for item in self.cursor_items() {
+                match item {
+                    Item::Row { idx: i, .. } => idx.push(i),
+                    Item::Header { members, .. } => idx.extend(members),
+                    item @ (Item::Detail { .. } | Item::Override { .. }) => {
+                        if let Some(o) = self.detail_override(&item)
+                            && !self.override_busy(o)
+                            && !ovr.iter().any(|(p, _)| p.key() == o.key())
+                            && let Some(u) = self.update_target(o)
+                        {
+                            ovr.push((o.clone(), u.value));
+                        }
                     }
+                    Item::Removed { .. } | Item::Policy { .. } => {}
                 }
-                Some(Item::Removed { .. } | Item::Policy { .. }) | None => {}
             }
             idx.retain(|&i| self.rows[i].actionable());
+            let mut seen = HashSet::new();
+            idx.retain(|i| seen.insert(*i));
         }
         // Rows of overridden packages are updated by editing their overrides.
         let (over_rows, idx): (Vec<usize>, Vec<usize>) = idx
@@ -4358,24 +4516,25 @@ impl App {
         }
         let checked = !packages.is_empty() || !overrides.is_empty();
         if !checked {
-            match self.cursor_item() {
-                Some(Item::Row { idx, .. }) => {
-                    let r = &self.rows[*idx];
-                    if r.busy() {
-                    } else if r.kind == Kind::Override {
-                        for o in &r.overrides {
+            for item in self.cursor_items() {
+                match &item {
+                    Item::Row { idx, .. } => {
+                        let r = &self.rows[*idx];
+                        if r.busy() || packages.contains(&r.name) {
+                        } else if r.kind == Kind::Override {
+                            for o in &r.overrides {
+                                add_override(&mut overrides, o);
+                            }
+                        } else {
+                            packages.push(r.name.clone());
+                        }
+                    }
+                    item => {
+                        if let Some(o) = self.detail_override(item) {
                             add_override(&mut overrides, o);
                         }
-                    } else {
-                        packages.push(r.name.clone());
                     }
                 }
-                Some(item) => {
-                    if let Some(o) = self.detail_override(item) {
-                        add_override(&mut overrides, o);
-                    }
-                }
-                None => {}
             }
         }
         (packages, overrides, checked)
@@ -4491,11 +4650,15 @@ impl App {
             .filter(|&i| self.rows[i].selected && can(self, i))
             .collect();
         if idx.is_empty() {
-            match self.cursor_item().cloned() {
-                Some(Item::Row { idx: i, .. }) => idx.push(i),
-                Some(Item::Header { members, .. }) => idx.extend(members),
-                _ => {}
+            for item in self.cursor_items() {
+                match item {
+                    Item::Row { idx: i, .. } => idx.push(i),
+                    Item::Header { members, .. } => idx.extend(members),
+                    _ => {}
+                }
             }
+            let mut seen = HashSet::new();
+            idx.retain(|i| seen.insert(*i));
             idx.retain(|&i| can(self, i));
         }
         if idx.is_empty() {
@@ -4996,11 +5159,15 @@ impl App {
             .filter(|&i| self.rows[i].selected)
             .collect();
         if idx.is_empty() {
-            match self.cursor_item().cloned() {
-                Some(Item::Row { idx: i, .. }) => idx.push(i),
-                Some(Item::Header { members, .. }) => idx.extend(members),
-                _ => {}
+            for item in self.cursor_items() {
+                match item {
+                    Item::Row { idx: i, .. } => idx.push(i),
+                    Item::Header { members, .. } => idx.extend(members),
+                    _ => {}
+                }
             }
+            let mut seen = HashSet::new();
+            idx.retain(|i| seen.insert(*i));
         }
         idx.retain(|&i| !self.rows[i].busy());
         idx
@@ -5525,11 +5692,15 @@ impl App {
             .filter(|&i| self.rows[i].selected && !self.rows[i].busy())
             .collect();
         if idx.is_empty() {
-            match self.cursor_item().cloned() {
-                Some(Item::Row { idx: i, .. }) => idx.push(i),
-                Some(Item::Header { members, .. }) => idx.extend(members),
-                _ => {}
+            for item in self.cursor_items() {
+                match item {
+                    Item::Row { idx: i, .. } => idx.push(i),
+                    Item::Header { members, .. } => idx.extend(members),
+                    _ => {}
+                }
             }
+            let mut seen = HashSet::new();
+            idx.retain(|i| seen.insert(*i));
             idx.retain(|&i| !self.rows[i].busy());
         }
         let plan = self.pin_plan(&idx);
@@ -8586,6 +8757,63 @@ mod tests {
         mouse(&mut app, MouseEventKind::Moved, 0, 0);
         assert_eq!(app.context_menu.as_ref().unwrap().choice, last.1);
         let _ = buf;
+    }
+    fn highlighted(app: &App) -> Vec<String> {
+        (0..app.view.len())
+            .filter(|&i| app.is_highlighted(i))
+            .filter_map(|i| match &app.view[i] {
+                Item::Row { idx, .. } => Some(app.rows[*idx].name.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+    #[test]
+    fn shift_clicking_highlights_from_the_cursor_to_the_click() {
+        let mut app = app_with_packages(6);
+        let buf = buffer(&mut app, 120, 30);
+        let (x, y) = find(&buf, "p01");
+        click(&mut app, x, y);
+        let buf = buffer(&mut app, 120, 30);
+        let (x4, y4) = find(&buf, "p04");
+        let (x2, y2) = find(&buf, "p02");
+        let shift = |x, y| MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: x,
+            row: y,
+            modifiers: KeyModifiers::SHIFT,
+        };
+        app.on_mouse(shift(x4, y4));
+        assert_eq!(highlighted(&app), ["p01", "p02", "p03", "p04"]);
+        assert!(app.rows.iter().all(|r| !r.selected), "nothing is checked");
+        // Another shift-click moves the end of the same range.
+        app.on_mouse(shift(x2, y2));
+        assert_eq!(highlighted(&app), ["p01", "p02"]);
+        // Actions take the highlighted packages.
+        let names: Vec<_> = app.acting_rows(|_| true).iter().map(|&i| app.rows[i].name.clone()).collect();
+        assert_eq!(names, ["p01", "p02"]);
+        // Space checks them; Esc drops the highlight without quitting.
+        app.on_key(key(' '));
+        let checked: Vec<_> = app.rows.iter().filter(|r| r.selected).map(|r| r.name.clone()).collect();
+        assert_eq!(checked, ["p01", "p02"]);
+        app.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(highlighted(&app).is_empty() && !app.quit);
+    }
+    #[test]
+    fn dragging_over_packages_highlights_them() {
+        let mut app = app_with_packages(6);
+        let buf = buffer(&mut app, 120, 30);
+        let (x, y) = find(&buf, "p01");
+        let (_, y2) = find(&buf, "p03");
+        mouse(&mut app, MouseEventKind::Down(MouseButton::Left), x, y);
+        buffer(&mut app, 120, 30);
+        mouse(&mut app, MouseEventKind::Drag(MouseButton::Left), x, y2);
+        mouse(&mut app, MouseEventKind::Up(MouseButton::Left), x, y2);
+        assert_eq!(highlighted(&app), ["p01", "p02", "p03"]);
+        assert!(app.rows.iter().all(|r| !r.selected));
+        // A plain click drops it, and so does moving with the keys.
+        buffer(&mut app, 120, 30);
+        click(&mut app, x, y);
+        assert!(highlighted(&app).is_empty());
     }
     #[test]
     fn the_context_menu_takes_keys_and_closes_on_a_click_away() {
