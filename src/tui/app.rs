@@ -2893,8 +2893,10 @@ impl App {
         if key.code != KeyCode::Char('U') {
             self.confirm_reinstall = false;
         }
-        // Moving the cursor with the keys drops the highlight.
-        if matches!(
+        // Moving the cursor with the keys drops the highlight, unless Shift extends it or Ctrl
+        // scrolls the details.
+        if !key.modifiers.intersects(KeyModifiers::SHIFT | KeyModifiers::CONTROL)
+            && matches!(
             key.code,
             KeyCode::Up | KeyCode::Down | KeyCode::Char('j' | 'k' | ',' | '.') | KeyCode::PageUp | KeyCode::PageDown | KeyCode::Home | KeyCode::End
         ) {
@@ -2923,8 +2925,17 @@ impl App {
                 self.group_by = self.group_by.next();
                 self.rebuild_view();
             }
-            KeyCode::Down | KeyCode::Up if key.modifiers.contains(KeyModifiers::SHIFT) => {
+            KeyCode::Down | KeyCode::Up if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.scroll_info(key.code == KeyCode::Up)
+            }
+            KeyCode::Down | KeyCode::Up if key.modifiers.contains(KeyModifiers::SHIFT) => {
+                // The range starts where the cursor was when Shift-moving began.
+                let from = self.highlight_from.or(self.table.selected());
+                self.move_cursor(if key.code == KeyCode::Up { -1 } else { 1 });
+                if let (Some(a), Some(b)) = (from, self.table.selected()) {
+                    self.set_highlight(a, b);
+                    self.highlight_from = Some(a);
+                }
             }
             KeyCode::Down | KeyCode::Char('j') => self.move_cursor(1),
             KeyCode::Up | KeyCode::Char('k') => self.move_cursor(-1),
@@ -8799,6 +8810,25 @@ mod tests {
         assert!(highlighted(&app).is_empty() && !app.quit);
     }
     #[test]
+    fn shift_arrows_highlight_from_where_they_started() {
+        let mut app = app_with_packages(6);
+        buffer(&mut app, 120, 30);
+        cursor_to_name(&mut app, "p02");
+        let shift = |c| KeyEvent::new(c, KeyModifiers::SHIFT);
+        app.on_key(shift(KeyCode::Down));
+        app.on_key(shift(KeyCode::Down));
+        assert_eq!(highlighted(&app), ["p02", "p03", "p04"]);
+        // Back past the start, the range turns around it.
+        for _ in 0..3 {
+            app.on_key(shift(KeyCode::Up));
+        }
+        assert_eq!(highlighted(&app), ["p01", "p02"]);
+        assert!(app.rows.iter().all(|r| !r.selected));
+        // A plain arrow drops it.
+        app.on_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        assert!(highlighted(&app).is_empty());
+    }
+    #[test]
     fn dragging_over_packages_highlights_them() {
         let mut app = app_with_packages(6);
         let buf = buffer(&mut app, 120, 30);
@@ -9094,13 +9124,13 @@ mod tests {
         assert_eq!(app.table.selected(), at);
         let buf = buffer(&mut app, 100, 40);
         find(&buf, " selected: p01 · 4–15 of ");
-        // So do shift+arrows, and it stops at the ends.
+        // So do ctrl+arrows, and it stops at the ends.
         for _ in 0..100 {
-            app.on_key(KeyEvent::new(KeyCode::Up, KeyModifiers::SHIFT));
+            app.on_key(KeyEvent::new(KeyCode::Up, KeyModifiers::CONTROL));
         }
         let buf = buffer(&mut app, 100, 40);
         find(&buf, " selected: p01 · 1–12 of ");
-        app.on_key(KeyEvent::new(KeyCode::Down, KeyModifiers::SHIFT));
+        app.on_key(KeyEvent::new(KeyCode::Down, KeyModifiers::CONTROL));
         for _ in 0..100 {
             wheel(&mut app, false, (x + 4, y + 2));
             buffer(&mut app, 100, 40);

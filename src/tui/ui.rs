@@ -313,7 +313,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         app.info_scroll = app.info_scroll.min(total.saturating_sub(h));
         let title = if total > h {
             format!(
-                "{info_title} · {}–{} of {total} · shift+↑↓ scroll · ? to hide",
+                "{info_title} · {}–{} of {total} · ctrl+↑↓ scroll · ? to hide",
                 app.info_scroll + 1,
                 (app.info_scroll + h).min(total)
             )
