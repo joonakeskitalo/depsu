@@ -12,7 +12,7 @@ use crate::config::pm::Pm;
 use crate::registry::registry;
 use crate::security::policy::{self, Ignore};
 use crate::security::snyk;
-use crate::deps::tree::{Analyzer, Dependent, Hit};
+use crate::deps::tree::{Analyzer, Dependent, Hit, Invalid};
 use crate::tui::view::{self, Child, GroupBy, Item, Overrides, POLICY, REMOVED, Release, UNNEEDED};
 use crate::security::vuln::{Report, Severity, Source, Vuln};
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
@@ -34,6 +34,7 @@ pub enum Event {
     Tree {
         name: String,
         hits: Vec<Hit>,
+        invalid: Vec<Invalid>,
     },
     /// Overrides that look unnecessary, by key. Empty when it can't be determined.
     Unneeded(Vec<(String, Unneeded)>),
@@ -440,6 +441,9 @@ pub struct Row {
     pub compat: Compat,
     /// Overrides applying anywhere in the installed dependency tree of this package.
     pub tree_hits: Vec<Hit>,
+    /// Installed dependencies in its tree that don't match the range their dependent declares,
+    /// or are missing, as `npm ls` reports them.
+    pub invalid: Vec<Invalid>,
     /// Vulnerabilities (Snyk, npm audit, bun audit) in this dependency or anything it brings
     /// in, worst first.
     pub vulns: Vec<Vuln>,
@@ -873,7 +877,8 @@ impl App {
                             // Without overrides there is nothing to find, but the answer still
                             // goes out: it clears what was found before the last one was removed.
                             let hits = if analyzer.has_overrides() { analyzer.analyze(&name) } else { Vec::new() };
-                            if ev_tx.send(Event::Tree { name, hits }).is_err() {
+                            let invalid = analyzer.invalid(&name);
+                            if ev_tx.send(Event::Tree { name, hits, invalid }).is_err() {
                                 break;
                             }
                         }
@@ -1468,6 +1473,7 @@ impl App {
                 overrides: self.own_overrides(name),
                 compat: Compat::Ok,
                 tree_hits: Vec::new(),
+                invalid: Vec::new(),
                 vulns: Vec::new(),
                 ignored: Vec::new(),
                 snyk_fix: None,
@@ -1646,7 +1652,7 @@ impl App {
                         self.apply_cooldown();
                     }
                 }
-                Event::Tree { name, hits } => self.on_tree(name, hits),
+                Event::Tree { name, hits, invalid } => self.on_tree(name, hits, invalid),
                 Event::Dependents(map) => self.dependents = map,
                 Event::Installed(entries) => self.installed.set(entries),
                 Event::IntegrityAdded(result, problems) => {
@@ -1796,6 +1802,7 @@ impl App {
             overrides: own,
             compat,
             tree_hits: Vec::new(),
+            invalid: Vec::new(),
             vulns: Vec::new(),
             ignored: Vec::new(),
             snyk_fix: None,
@@ -1820,11 +1827,12 @@ impl App {
         self.insert_row(r);
     }
 
-    fn on_tree(&mut self, name: String, mut hits: Vec<Hit>) {
+    fn on_tree(&mut self, name: String, mut hits: Vec<Hit>, invalid: Vec<Invalid>) {
         // Risky hits first, so they come first in the list.
         hits.sort_by_key(|h| std::cmp::Reverse(h.risk));
         if let Some(r) = self.rows.iter_mut().find(|r| r.name == name) {
             r.tree_hits = hits;
+            r.invalid = invalid;
             self.rebuild_view();
         }
     }
@@ -2458,7 +2466,7 @@ impl App {
         match child {
             Child::Own(i) => r.overrides.get(*i),
             Child::Tree(i) => r.tree_hits.get(*i).map(|h| &h.over),
-            Child::Vuln(_) | Child::Ignored(_) => None,
+            Child::Vuln(_) | Child::Ignored(_) | Child::Invalid(_) => None,
         }
     }
 
@@ -2522,7 +2530,7 @@ impl App {
     fn selectable(&self, i: usize) -> bool {
         match self.view.get(i) {
             Some(Item::Detail {
-                child: Child::Vuln(_) | Child::Ignored(_),
+                child: Child::Vuln(_) | Child::Ignored(_) | Child::Invalid(_),
                 ..
             }) => true,
             Some(item @ (Item::Detail { .. } | Item::Override { .. })) => self

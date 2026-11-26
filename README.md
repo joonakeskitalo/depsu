@@ -36,6 +36,10 @@ Illustrative output:
   they accept.
 - **Vulnerabilities.** Lists vulnerabilities per dependency from Snyk, `npm audit` or `bun audit`,
   and installs the version they suggest.
+- **Invalid dependencies.** Like `npm ls`, flags with a red `✗` a dependency whose installed copy, or one
+  below it, doesn't satisfy the range its dependent declares, or a required one that isn't installed. Each
+  problem is listed under the dependency that brings it in, with the packages that require it. Git, URL and
+  alias ranges are not compared.
 
 ## Install
 

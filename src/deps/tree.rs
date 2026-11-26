@@ -34,6 +34,10 @@ struct Pkg {
     deps: Vec<(String, String)>,
     /// (name, declared range) from `peerDependencies`, which npm 7+ installs too.
     peers: Vec<(String, String)>,
+    /// Names listed in `optionalDependencies`, which may be absent without it being a problem.
+    optional: HashSet<String>,
+    /// Peers marked optional in `peerDependenciesMeta`.
+    optional_peers: HashSet<String>,
 }
 
 pub struct Analyzer {
@@ -86,8 +90,25 @@ impl Analyzer {
                     .and_then(|v| v.as_object())
                     .map(|m| m.iter().map(|(k, v)| (k.clone(), v.as_str().unwrap_or("").to_string())).collect())
                     .unwrap_or_default();
+                let optional = json
+                    .get("optionalDependencies")
+                    .and_then(|v| v.as_object())
+                    .map(|m| m.keys().cloned().collect())
+                    .unwrap_or_default();
+                let optional_peers = json
+                    .get("peerDependenciesMeta")
+                    .and_then(|v| v.as_object())
+                    .map(|m| {
+                        m.iter()
+                            .filter(|(_, v)| v.get("optional").and_then(|o| o.as_bool()) == Some(true))
+                            .map(|(k, _)| k.clone())
+                            .collect()
+                    })
+                    .unwrap_or_default();
                 Pkg {
                     peers,
+                    optional,
+                    optional_peers,
                     version: json
                         .get("version")
                         .and_then(|v| v.as_str())
@@ -187,6 +208,129 @@ impl Analyzer {
     }
 }
 
+/// A dependency whose installed copy doesn't match what its dependent declares, as
+/// `npm ls` reports it (`invalid`) or a required one that isn't installed (`missing`).
+#[derive(Clone, Debug, PartialEq)]
+pub struct Invalid {
+    pub name: String,
+    /// The range the dependent declares.
+    pub range: String,
+    /// The installed version, `None` when the dependency is missing.
+    pub installed: Option<Version>,
+    /// The packages from the project's dependency down to the one declaring the range. Just
+    /// `["<project>"]` for a problem with the project's own dependency.
+    pub by: Vec<String>,
+    /// The range is a peer dependency of the dependent.
+    pub peer: bool,
+}
+/// Ranges that can't be compared with a version: URLs, paths, aliases, workspaces.
+fn comparable(range: &str) -> bool {
+    !range.contains([':', '/', '#'])
+}
+impl Analyzer {
+    /// The installed dependencies of `name` (and of everything below it) that don't satisfy the
+    /// range their dependent declares, plus required ones that are missing. Also checks `name`
+    /// itself against the range in the project's `package.json`.
+    pub fn invalid(&mut self, name: &str) -> Vec<Invalid> {
+        let dir = self.dir.clone();
+        let mut out = Vec::new();
+        let spec = std::fs::read_to_string(dir.join("package.json"))
+            .ok()
+            .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
+            .and_then(|j| {
+                ["dependencies", "devDependencies", "optionalDependencies"]
+                    .iter()
+                    .find_map(|f| Some((*f, j.get(f)?.get(name)?.as_str()?.to_string())))
+            });
+        let root = self.resolve(&dir, name);
+        if let Some((field, spec)) = spec {
+            let installed = root.as_ref().and_then(|r| self.pkg(r).version.clone());
+            let bad = match &installed {
+                Some(v) => comparable(&spec) && satisfies(&spec, v) == Some(false),
+                None => field != "optionalDependencies",
+            };
+            if bad {
+                out.push(Invalid {
+                    name: name.to_string(),
+                    range: spec,
+                    installed,
+                    by: vec!["<project>".into()],
+                    peer: false,
+                });
+            }
+        }
+        let Some(root) = root else {
+            return out;
+        };
+        let mut visited = HashSet::from([root.clone()]);
+        let mut budget = MAX_EDGES;
+        self.invalid_walk(&root, &mut vec![name.to_string()], &mut visited, &mut budget, &mut out);
+        out
+    }
+    fn invalid_walk(
+        &mut self,
+        dir: &Path,
+        chain: &mut Vec<String>,
+        visited: &mut HashSet<PathBuf>,
+        budget: &mut usize,
+        out: &mut Vec<Invalid>,
+    ) {
+        if chain.len() > MAX_DEPTH {
+            return;
+        }
+        let pkg = self.pkg(dir);
+        // Peers are only checked, not walked into: whoever provides them is walked on its own.
+        for (dep, range) in &pkg.peers {
+            if *budget == 0 {
+                return;
+            }
+            *budget -= 1;
+            let child = self.resolve(dir, dep);
+            let installed = child.as_ref().and_then(|c| self.pkg(c).version.clone());
+            let bad = match &installed {
+                Some(v) => comparable(range) && satisfies(range, v) == Some(false),
+                None => !pkg.optional_peers.contains(dep),
+            };
+            if bad {
+                out.push(Invalid {
+                    name: dep.clone(),
+                    range: range.clone(),
+                    installed,
+                    by: chain.clone(),
+                    peer: true,
+                });
+            }
+        }
+        for (dep, range) in &pkg.deps {
+            if *budget == 0 {
+                return;
+            }
+            *budget -= 1;
+            let child = self.resolve(dir, dep);
+            let installed = child.as_ref().and_then(|c| self.pkg(c).version.clone());
+            let bad = match &installed {
+                Some(v) => comparable(range) && satisfies(range, v) == Some(false),
+                None => child.is_none() && !pkg.optional.contains(dep),
+            };
+            if bad {
+                out.push(Invalid {
+                    name: dep.clone(),
+                    range: range.clone(),
+                    installed,
+                    by: chain.clone(),
+                    peer: false,
+                });
+            }
+            if let Some(c) = child
+                && visited.insert(c.clone())
+            {
+                chain.push(dep.clone());
+                self.invalid_walk(&c, chain, visited, budget, out);
+                chain.pop();
+            }
+        }
+    }
+}
 impl Analyzer {
     /// Finds overrides that probably no longer change anything. Walks the whole installed tree
     /// starting from the project's own dependencies (`root_deps`: name and declared range),
@@ -653,6 +797,52 @@ mod tests {
         assert_eq!(risk_with(&o("^5"), "^6.0.0", None), Compat::Unknown);
     }
 
+    #[test]
+    fn finds_invalid_and_missing_dependencies() {
+        let dir = tmp("invalid");
+        std::fs::write(
+            dir.join("package.json"),
+            r#"{"dependencies":{"x":"^1","w":"^3","git":"github:a/b"},"devDependencies":{"gone":"^1"},"optionalDependencies":{"opt":"^1"}}"#,
+        )
+        .unwrap();
+        write(
+            &dir,
+            "node_modules/x",
+            r#"{"version":"1.0.0","dependencies":{"y":"^2","lost":"^1","url":"https://a/b.tgz"},"optionalDependencies":{"maybe":"^1"}}"#,
+        );
+        write(&dir, "node_modules/y", r#"{"version":"1.2.0"}"#);
+        write(&dir, "node_modules/w", r#"{"version":"2.0.0"}"#);
+        write(&dir, "node_modules/git", r#"{"version":"0.0.1"}"#);
+        write(&dir, "node_modules/url", r#"{"version":"1.0.0"}"#);
+        write(
+            &dir,
+            "node_modules/y",
+            r#"{"version":"1.2.0","peerDependencies":{"w":"^3","absent":"^1","soft":"^1"},"peerDependenciesMeta":{"soft":{"optional":true}}}"#,
+        );
+        let mut a = Analyzer::new(dir.clone(), Vec::new());
+        let found: Vec<_> = a
+            .invalid("x")
+            .into_iter()
+            .map(|i| (i.name, i.installed.map(|v| v.to_string()), i.by.join(">"), i.peer))
+            .collect();
+        let s = |v: &str| Some(v.to_string());
+        assert_eq!(
+            found,
+            vec![
+                ("y".to_string(), s("1.2.0"), "x".to_string(), false),
+                ("w".to_string(), s("2.0.0"), "x>y".to_string(), true),
+                ("absent".to_string(), None, "x>y".to_string(), true),
+                ("lost".to_string(), None, "x".to_string(), false),
+            ]
+        );
+        // The project's own dependency is checked against `package.json`.
+        let w = a.invalid("w");
+        assert_eq!(w.len(), 1);
+        assert_eq!(w[0].by, vec!["<project>".to_string()]);
+        assert!(a.invalid("git").is_empty());
+        assert!(a.invalid("opt").is_empty());
+        assert!(a.invalid("gone")[0].installed.is_none());
+    }
     #[test]
     fn finds_transitive_overrides_with_scoping() {
         let dir = tmp("flat");

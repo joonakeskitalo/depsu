@@ -2021,6 +2021,11 @@ fn override_marker(r: &AppRow, conflict: bool) -> (Vec<Span<'static>>, usize) {
         spans.push(Span::styled("↳", if risky { conflict_style() } else { override_style(false) }));
         width += 1;
     }
+    // ✗: `npm ls` would report this package or something below it as invalid or missing.
+    if !r.invalid.is_empty() {
+        spans.push(Span::styled("✗", Style::new().fg(Color::Red).add_modifier(Modifier::BOLD)));
+        width += 1;
+    }
     // ✱: Snyk found vulnerabilities, coloured by the worst severity.
     if let Some(sev) = r.worst_severity() {
         spans.push(Span::styled(
@@ -2049,7 +2054,7 @@ fn detail_lines(
     let o = match child {
         Child::Own(i) => r.overrides.get(i),
         Child::Tree(i) => r.tree_hits.get(i).map(|h| &h.over),
-        Child::Vuln(_) | Child::Ignored(_) => None,
+        Child::Vuln(_) | Child::Ignored(_) | Child::Invalid(_) => None,
     };
     let update = o.and_then(|o| app.update_target(o));
     // Selection mark, only on override lines that can be updated.
@@ -2125,6 +2130,15 @@ fn detail_lines(
             // A finding a `.snyk` rule covers is dimmed, even before a scan moves it away.
             let color = if app.ignore_for(v).is_some() { Color::DarkGray } else { severity_color(v.severity) };
             (t, String::new(), Style::new().fg(color))
+        }
+        Child::Invalid(i) => {
+            let inv = &r.invalid[i];
+            let peer = if inv.peer { "peer " } else { "" };
+            let t = match &inv.installed {
+                Some(v) => format!("✗ invalid {peer}dependency: {}@{v} (wants {})", inv.name, inv.range),
+                None => format!("✗ missing {peer}dependency: {}@{}", inv.name, inv.range),
+            };
+            (t, format!("  required by {}", inv.by.join(" > ")), Style::new().fg(Color::Red))
         }
         Child::Ignored(i) => {
             let v = &r.ignored[i];

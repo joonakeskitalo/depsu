@@ -63,6 +63,8 @@ pub enum Child {
     Vuln(usize),
     /// `Row::ignored[i]`: a finding the `.snyk` policy ignores. Informational only.
     Ignored(usize),
+    /// `Row::invalid[i]`: a dependency that doesn't match what its dependent declares.
+    Invalid(usize),
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -142,6 +144,7 @@ fn children(r: &Row, idx: usize, mode: Overrides, vulns: bool, repeat: bool) -> 
         }
         return nest(r, idx, kids, repeat);
     }
+    kids.extend((0..r.invalid.len()).map(Child::Invalid));
     // Security findings first: they matter more than where overrides apply.
     if vulns {
         kids.extend((0..r.vulns.len()).map(Child::Vuln));
@@ -169,6 +172,7 @@ fn nest(r: &Row, idx: usize, kids: Vec<Child>, repeat: bool) -> Vec<Item> {
                 Child::Tree(i) => r.tree_hits[i].over.key(),
                 Child::Vuln(i) => format!("vuln:{}", r.vulns[i].id),
                 Child::Ignored(i) => format!("ignored:{}", r.ignored[i].id),
+                Child::Invalid(i) => format!("invalid:{}:{}", r.invalid[i].name, r.invalid[i].by.join(">")),
             },
             repeat,
         })
@@ -347,6 +351,7 @@ mod tests {
             overrides: Vec::new(),
             compat: Compat::Ok,
             tree_hits: Vec::new(),
+            invalid: Vec::new(),
             outdated: true,
             vulns: Vec::new(),
             ignored: Vec::new(),
